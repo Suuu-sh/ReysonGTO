@@ -290,6 +290,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sizing"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cards",
+ "cfr",
+ "clap",
+ "ranges",
+ "serde",
+ "serde_json",
+ "solver",
+ "tree",
+]
+
+[[package]]
 name = "solver"
 version = "0.1.0"
 dependencies = [
