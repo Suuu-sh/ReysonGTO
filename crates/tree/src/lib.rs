@@ -8,6 +8,9 @@ pub const DEFAULT_NODE_LIMIT: usize = 1_000_000;
 fn default_node_limit() -> usize {
     DEFAULT_NODE_LIMIT
 }
+fn default_allin_merge_enabled() -> bool {
+    true
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Street {
     Flop,
@@ -55,6 +58,10 @@ pub struct TreeConfig {
     pub oop_can_lead_flop: bool,
     pub bet_size: SizeRule,
     pub raise_multiplier: f64,
+    /// Disable for reference trees that cap wagers only at the stack limit.
+    /// Missing fields in M1 JSON preserve the original merge behavior.
+    #[serde(default = "default_allin_merge_enabled")]
+    pub allin_merge_enabled: bool,
     pub allin_merge_ratio: f64,
     pub rake_rate: f64,
     pub rake_cap: i64,
@@ -68,6 +75,7 @@ impl Default for TreeConfig {
             oop_can_lead_flop: false,
             bet_size: SizeRule::Fixed(0.33),
             raise_multiplier: 2.5,
+            allin_merge_enabled: true,
             allin_merge_ratio: 0.67,
             rake_rate: 0.05,
             rake_cap: 3 * BB,
@@ -86,6 +94,7 @@ pub enum Action {
     Fold,
     Call,
     Bet(i64),
+    /// Additional chips paid, not the total wager on this street.
     Raise(i64),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -216,7 +225,9 @@ impl GameTree {
         s.pot += n;
     }
     fn merged(&self, n: i64, stack: i64) -> i64 {
-        if n as f64 >= stack as f64 * self.config.allin_merge_ratio {
+        if self.config.allin_merge_enabled
+            && n as f64 >= stack as f64 * self.config.allin_merge_ratio
+        {
             stack
         } else {
             n.min(stack)
@@ -353,6 +364,37 @@ mod tests {
         cfg.effective_stack = 700;
         let t = GameTree::build(vec![0, 5, 10, 15, 20], cfg).unwrap();
         assert_eq!(actions(&t, 0).0[1], Action::Bet(700));
+    }
+    #[test]
+    fn reference_merge_disabled_preserves_raise_totals_until_stack_cap() {
+        let cfg = TreeConfig {
+            starting_pot: 360_448,      // 5.5 BB at the reference's 65,536 units/BB
+            effective_stack: 6_389_760, // 97.5 BB
+            allin_merge_enabled: false,
+            ..config()
+        };
+        let t = GameTree::build(vec![0, 5, 10, 15, 20], cfg).unwrap();
+        let mut id = actions(&t, t.root).1[1];
+        let mut totals = vec![180_224];
+        loop {
+            let (a, c) = actions(&t, id);
+            let Some(i) = a.iter().position(|a| matches!(a, Action::Raise(_))) else {
+                break;
+            };
+            id = c[i];
+            totals.push(t.nodes[id].invested.iter().copied().max().unwrap());
+        }
+        assert_eq!(
+            totals,
+            vec![180_224, 450_560, 1_126_400, 2_816_000, 6_389_760]
+        );
+        // Disabling merging retains wagers below the stack limit, even when
+        // their incremental payment would cross the default 67% threshold.
+        let mut cfg = config();
+        cfg.effective_stack = 700;
+        cfg.allin_merge_enabled = false;
+        let t = GameTree::build(vec![0, 5, 10, 15, 20], cfg).unwrap();
+        assert_eq!(actions(&t, t.root).0[1], Action::Bet(500));
     }
     #[test]
     fn no_donk_and_fold_only_facing_wager() {

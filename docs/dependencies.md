@@ -75,3 +75,10 @@ Windows-only packages even though the verification machine is macOS.
 | `windows-link` | 0.2.1 | Transitive | `MIT OR Apache-2.0` |
 | `windows-sys` | 0.61.2 | Transitive | `MIT OR Apache-2.0` |
 | `zmij` | 1.0.23 | Transitive | `MIT` |
+
+## M2 changes
+
+Tree merge configuration and benchmark-range export add no external dependencies.
+`tools/export_benchmark_ranges.py` and its synthetic tests use only Python standard
+library modules; the exporter reads saved JSON, never product/OSS source code.
+The existing locked-package license audit remains unchanged.
