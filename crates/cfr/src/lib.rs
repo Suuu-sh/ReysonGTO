@@ -5,9 +5,14 @@
 //! ranges. Dense combo permutations map representative values back to physical cards.
 //! Persistent regret/average slabs are f32 or per-node scaled i16; traversal scratch
 //! is depth-local (and independent only at the first parallel chance boundary).
+mod diagnostics;
 use cards::{evaluate7, Card, SuitPermutation};
+pub use diagnostics::{KernelDiagnostics, KernelWorkload};
+use diagnostics::{KernelIteration, RunDiagnostics};
 use ranges::DenseRange;
 use serde::{Deserialize, Serialize};
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -30,6 +35,9 @@ pub struct EngineConfig {
     pub memory_limit_bytes: usize,
     pub suit_isomorphism: bool,
     pub profiling: bool,
+    /// Opt-in per-phase workload, worker timers and parallel task diagnostics.
+    #[serde(default)]
+    pub kernel_diagnostics: bool,
     #[serde(default)]
     pub storage_mode: StorageMode,
     #[serde(default = "default_alpha")]
@@ -72,6 +80,7 @@ impl Default for EngineConfig {
             memory_limit_bytes: 2 * 1024 * 1024 * 1024,
             suit_isomorphism: false,
             profiling: false,
+            kernel_diagnostics: false,
             storage_mode: StorageMode::F32,
             dcfr_alpha: 1.5,
             dcfr_beta: 0.0,
@@ -382,6 +391,7 @@ struct RankGroup {
 struct RankTable {
     sorted: [Vec<SortedHand>; 2],
     groups: [Vec<RankGroup>; 2],
+    blocked: [Vec<u16>; 2],
 }
 impl RankTable {
     fn new(
@@ -390,7 +400,11 @@ impl RankTable {
         same: &[Vec<Option<usize>>; 2],
     ) -> Self {
         let order: [Vec<usize>; 2] = std::array::from_fn(|p| {
-            let mut order: Vec<_> = (0..ranks[p].len()).collect();
+            // Rank zero is the engine's board-blocked sentinel. Public dense
+            // IDs remain stable while all showdown computation uses this pack.
+            let mut order = Vec::with_capacity(ranks[p].len());
+            order.extend((0..ranks[p].len()).filter(|&i| ranks[p][i] != 0));
+            order.shrink_to_fit();
             order.sort_unstable_by_key(|&i| (ranks[p][i], i));
             order
         });
@@ -433,7 +447,20 @@ impl RankTable {
                 })
                 .collect()
         });
-        Self { sorted, groups }
+        let blocked = std::array::from_fn(|p| {
+            let mut blocked = Vec::with_capacity(ranks[p].len() - order[p].len());
+            blocked.extend(
+                (0..ranks[p].len())
+                    .filter(|&i| ranks[p][i] == 0)
+                    .map(|i| i as u16),
+            );
+            blocked
+        });
+        Self {
+            sorted,
+            groups,
+            blocked,
+        }
     }
 }
 struct Context<'a> {
@@ -450,6 +477,7 @@ struct Context<'a> {
     initial_reach: &'a [Vec<f64>; 2],
     discounts: [f64; 3],
     iteration: usize,
+    run_start: Instant,
 }
 #[derive(Clone, Copy)]
 enum Mode {
@@ -482,6 +510,7 @@ pub struct Engine {
     permutations: Vec<ComboPermutation>,
     alias_perms: Vec<u32>,
     wall_profile: WorkProfile,
+    kernel_diagnostics: Option<KernelDiagnostics>,
 }
 
 /// Conservative owned solver payload estimate, including per-node traversal
@@ -808,7 +837,7 @@ impl Engine {
             .stack_size(1024 * 1024)
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self {
+        let mut engine = Self {
             tree,
             ranges,
             config,
@@ -832,13 +861,32 @@ impl Engine {
             permutations,
             alias_perms,
             wall_profile: WorkProfile::default(),
-        })
+            kernel_diagnostics: None,
+        };
+        if engine.config.kernel_diagnostics {
+            let [training, average, best_response] = diagnostics::workload(&engine);
+            engine.kernel_diagnostics = Some(KernelDiagnostics {
+                per_iteration_workload: training,
+                per_average_evaluation_workload: average,
+                per_best_response_evaluation_workload: best_response,
+                ..Default::default()
+            });
+        }
+        Ok(engine)
     }
     /// One iteration is an OOP update followed by an IP update. No engine-owned
-    /// heap buffers are allocated here; Rayon uses its initialized worker pool.
+    /// heap buffers are allocated here with kernel diagnostics disabled; Rayon
+    /// uses its initialized worker pool. Opt-in diagnostics retain task records.
     pub fn iterate(&mut self) {
         let start = Instant::now();
         self.iterations += 1;
+        if let Some(d) = &mut self.kernel_diagnostics {
+            d.latest_training_tasks.clear();
+            d.iterations.push(KernelIteration {
+                iteration: self.iterations,
+                ..Default::default()
+            });
+        }
         for player in 0..2 {
             self.run(player, Mode::Train);
         }
@@ -871,11 +919,13 @@ impl Engine {
                 ]
             },
             iteration: self.iterations,
+            run_start: start,
         };
         let buffers = Buffers {
             regret: self.regret.slice(),
             average: self.average.slice(),
         };
+        let mut diagnostics = RunDiagnostics::default();
         if self.config.threads == 1 || self.pool.current_thread_index().is_some() {
             traverse(
                 &context,
@@ -885,6 +935,7 @@ impl Engine {
                 player,
                 mode,
                 true,
+                &mut diagnostics,
             );
         } else {
             self.pool.install(|| {
@@ -896,8 +947,30 @@ impl Engine {
                     player,
                     mode,
                     true,
+                    &mut diagnostics,
                 )
             });
+        }
+        if let Some(d) = &mut self.kernel_diagnostics {
+            diagnostics.times.wall_ns = start.elapsed().as_nanos();
+            diagnostics.times.traversals = 1;
+            match mode {
+                Mode::Train => {
+                    d.training.add(diagnostics.times);
+                    let iteration = d.iterations.last_mut().expect("training iteration");
+                    iteration.times.add(diagnostics.times);
+                    iteration.chance_batches.append(&mut diagnostics.batches);
+                    d.latest_training_tasks.append(&mut diagnostics.tasks);
+                }
+                Mode::Average => {
+                    d.average_evaluation.add(diagnostics.times);
+                    d.latest_metrics_tasks.append(&mut diagnostics.tasks);
+                }
+                Mode::BestResponse => {
+                    d.best_response_evaluation.add(diagnostics.times);
+                    d.latest_metrics_tasks.append(&mut diagnostics.tasks);
+                }
+            }
         }
         if matches!(mode, Mode::BestResponse) {
             self.wall_profile.best_response_seconds += start.elapsed().as_secs_f64();
@@ -910,6 +983,9 @@ impl Engine {
             / self.joint_mass
     }
     pub fn metrics(&mut self) -> Metrics {
+        if let Some(d) = &mut self.kernel_diagnostics {
+            d.latest_metrics_tasks.clear();
+        }
         let average_ev = [self.run(0, Mode::Average), self.run(1, Mode::Average)];
         let best_response_ev = [
             self.run(0, Mode::BestResponse),
@@ -1001,6 +1077,9 @@ impl Engine {
         p.regret_seconds = w[2] as f64 * 1e-9;
         p.chance_seconds = w[3] as f64 * 1e-9;
         p
+    }
+    pub fn kernel_diagnostics(&self) -> Option<&KernelDiagnostics> {
+        self.kernel_diagnostics.as_ref()
     }
     pub fn persistent_storage_bytes(&self) -> usize {
         self.state.span
@@ -1189,15 +1268,34 @@ fn alias_subtree(
 
 trait PolicyValue: Copy {
     fn positive(self) -> f64;
+    #[cfg(target_arch = "aarch64")]
+    fn positive_pair(input: &[Self]) -> float64x2_t;
 }
 impl PolicyValue for f32 {
     fn positive(self) -> f64 {
         self.max(0.0) as f64
     }
+    #[cfg(target_arch = "aarch64")]
+    fn positive_pair(input: &[Self]) -> float64x2_t {
+        assert!(input.len() >= 2);
+        // aarch64 provides NEON. The validated slice makes this exact two-f32
+        // load safe, including the last even pair (no full-width overread).
+        unsafe { vcvt_f64_f32(vmaxnm_f32(vld1_f32(input.as_ptr()), vdup_n_f32(0.0))) }
+    }
 }
 impl PolicyValue for i16 {
     fn positive(self) -> f64 {
         self.max(0) as f64
+    }
+    #[cfg(target_arch = "aarch64")]
+    fn positive_pair(input: &[Self]) -> float64x2_t {
+        // Read exactly two checked scalar lanes. Packing their bit patterns
+        // does not rely on alignment, pointer casts, or adjacent readable data.
+        let bits = input[0] as u16 as u64 | ((input[1] as u16 as u64) << 16);
+        unsafe {
+            let signed = vget_low_s32(vmovl_s16(vcreate_s16(bits)));
+            vcvtq_f64_s64(vmovl_s32(vmax_s32(signed, vdup_n_s32(0))))
+        }
     }
 }
 fn normalize(
@@ -1254,7 +1352,162 @@ fn normalize_policy<T: PolicyValue>(
         }
     }
 }
+// NEON is part of the aarch64 baseline; all other architectures keep the
+// portable scalar/vectorizable path. Neither changes the precision or order.
 fn normalize_fixed<T: PolicyValue, const A: usize>(
+    input: &[T],
+    output: &mut [f32],
+    n: usize,
+    masks: &[u64],
+    board: u64,
+) {
+    #[cfg(target_arch = "aarch64")]
+    neon_normalize_fixed::<T, A>(input, output, n, masks, board);
+    #[cfg(not(target_arch = "aarch64"))]
+    normalize_fixed_portable::<T, A>(input, output, n, masks, board);
+}
+#[cfg(target_arch = "aarch64")]
+fn neon_normalize_fixed<T: PolicyValue, const A: usize>(
+    input: &[T],
+    output: &mut [f32],
+    n: usize,
+    masks: &[u64],
+    board: u64,
+) {
+    assert!(A == 2 || A == 3);
+    assert_eq!(input.len(), A * n);
+    assert_eq!(output.len(), A * n);
+    assert_eq!(masks.len(), n);
+    let pairs = n & !1;
+    // All loads/stores below address two elements within already validated
+    // action slices. Odd tails never reach these instructions.
+    unsafe {
+        let zero = vdupq_n_f64(0.0);
+        let one = vdupq_n_f64(1.0);
+        let uniform = vdupq_n_f64((1.0 / A as f32) as f64);
+        let board = vdupq_n_u64(board);
+        for i in (0..pairs).step_by(2) {
+            let positive: [float64x2_t; A] =
+                std::array::from_fn(|a| T::positive_pair(&input[a * n + i..(a + 1) * n]));
+            let mut sum = zero;
+            // No reassociation/FMA: same 0+x+y(+z) as the scalar oracle.
+            for &x in &positive {
+                sum = vaddq_f64(sum, x);
+            }
+            let nonzero = vcgtq_f64(sum, zero);
+            // Avoid division by zero for uniform-policy lanes. Selecting the
+            // denominator does not alter any nonzero-policy lane.
+            let inverse = vdivq_f64(one, vbslq_f64(nonzero, sum, one));
+            let active = vceqq_u64(
+                vandq_u64(vld1q_u64(masks.as_ptr().add(i)), board),
+                vdupq_n_u64(0),
+            );
+            for (a, &positive) in positive.iter().enumerate() {
+                let normalized = vmulq_f64(positive, inverse);
+                let policy = vbslq_f64(active, vbslq_f64(nonzero, normalized, uniform), zero);
+                vst1_f32(output.as_mut_ptr().add(a * n + i), vcvt_f32_f64(policy));
+            }
+        }
+    }
+    for i in pairs..n {
+        if masks[i] & board != 0 {
+            for a in 0..A {
+                output[a * n + i] = 0.0;
+            }
+            continue;
+        }
+        let positive: [f64; A] = std::array::from_fn(|a| input[a * n + i].positive());
+        let sum: f64 = positive.iter().sum();
+        let inverse = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+        for a in 0..A {
+            output[a * n + i] = if sum > 0.0 {
+                (positive[a] * inverse) as f32
+            } else {
+                1.0 / A as f32
+            };
+        }
+    }
+}
+#[cfg(any(not(target_arch = "aarch64"), test))]
+// Disjoint action slices and zipped exact-length streams remove per-combo
+// dynamic indexing. LLVM can use packed operations without fast-math, FMA,
+// architecture-specific intrinsics, or a changed reduction order.
+fn normalize_fixed_portable<T: PolicyValue, const A: usize>(
+    input: &[T],
+    output: &mut [f32],
+    n: usize,
+    masks: &[u64],
+    board: u64,
+) {
+    assert_eq!(input.len(), A * n);
+    assert_eq!(output.len(), A * n);
+    assert_eq!(masks.len(), n);
+    let (i0, input) = input.split_at(n);
+    let (o0, output) = output.split_at_mut(n);
+    if A == 2 {
+        let i1 = input;
+        let o1 = output;
+        for ((((&mask, &x), &y), o0), o1) in masks.iter().zip(i0).zip(i1).zip(o0).zip(o1) {
+            let x = x.positive();
+            let y = y.positive();
+            // Keep the original Iterator::sum accumulation (0 + x + y).
+            let sum = (0.0 + x) + y;
+            let inverse = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            *o0 = if mask & board != 0 {
+                0.0
+            } else if sum > 0.0 {
+                (x * inverse) as f32
+            } else {
+                0.5
+            };
+            *o1 = if mask & board != 0 {
+                0.0
+            } else if sum > 0.0 {
+                (y * inverse) as f32
+            } else {
+                0.5
+            };
+        }
+    } else if A == 3 {
+        let (i1, i2) = input.split_at(n);
+        let (o1, o2) = output.split_at_mut(n);
+        for ((((((&mask, &x), &y), &z), o0), o1), o2) in
+            masks.iter().zip(i0).zip(i1).zip(i2).zip(o0).zip(o1).zip(o2)
+        {
+            let x = x.positive();
+            let y = y.positive();
+            let z = z.positive();
+            let sum = ((0.0 + x) + y) + z;
+            let inverse = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            let uniform = 1.0 / 3.0;
+            *o0 = if mask & board != 0 {
+                0.0
+            } else if sum > 0.0 {
+                (x * inverse) as f32
+            } else {
+                uniform
+            };
+            *o1 = if mask & board != 0 {
+                0.0
+            } else if sum > 0.0 {
+                (y * inverse) as f32
+            } else {
+                uniform
+            };
+            *o2 = if mask & board != 0 {
+                0.0
+            } else if sum > 0.0 {
+                (z * inverse) as f32
+            } else {
+                uniform
+            };
+        }
+    } else {
+        unreachable!("fixed normalization is used for 2/3 actions only");
+    }
+}
+#[cfg(test)]
+fn scalar_normalize_fixed<T: PolicyValue, const A: usize>(
     input: &[T],
     output: &mut [f32],
     n: usize,
@@ -1302,6 +1555,9 @@ impl<'a> Buffers<'a> {
         )
     }
 }
+// Traversal borrows independent slabs/scratch and a worker-local opt-in report;
+// keeping these explicit avoids shared locks or additional per-node metadata.
+#[allow(clippy::too_many_arguments)]
 fn traverse(
     ctx: &Context<'_>,
     state: &mut State,
@@ -1310,6 +1566,7 @@ fn traverse(
     target: usize,
     mode: Mode,
     parallel: bool,
+    diagnostics: &mut RunDiagnostics,
 ) {
     let (level, desc_scratch) = scratch.split_first_mut().expect("depth scratch");
     let node = &ctx.tree.nodes[state.id];
@@ -1317,21 +1574,41 @@ fn traverse(
     let (mut own, mut descendants) = buffers.split(state.own_len);
     match &node.kind {
         NodeKind::Terminal { winner } => {
-            let start = ctx.config.profiling.then(Instant::now);
-            terminal(ctx, state.id, level, target, *winner);
+            let start = (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
+            terminal(
+                ctx,
+                state.id,
+                level,
+                target,
+                *winner,
+                ctx.config
+                    .kernel_diagnostics
+                    .then_some(&mut diagnostics.times),
+            );
             if let Some(t) = start {
-                state.work[if winner.is_none() { 0 } else { 1 }] += t.elapsed().as_nanos() as u64;
+                let ns = t.elapsed().as_nanos();
+                state.work[if winner.is_none() { 0 } else { 1 }] += ns as u64;
+                if ctx.config.kernel_diagnostics {
+                    diagnostics
+                        .times
+                        .section(if winner.is_none() { 0 } else { 1 }, ns);
+                }
             }
         }
         NodeKind::Chance { .. } => {
-            let start = ctx.config.profiling.then(Instant::now);
+            let start = (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
             level.value[..n].fill(0.0);
             let probability = 1.0 / (52 - node.board.len() - 4) as f64;
             if let Some(t) = start {
-                state.work[3] += t.elapsed().as_nanos() as u64;
+                let ns = t.elapsed().as_nanos();
+                state.work[3] += ns as u64;
+                if ctx.config.kernel_diagnostics {
+                    diagnostics.times.section(3, ns);
+                }
             }
             if parallel && ctx.config.threads > 1 {
-                visit_parallel_chance(
+                let batch_start = ctx.config.kernel_diagnostics.then(Instant::now);
+                let mut child_diagnostics = visit_parallel_chance(
                     ctx,
                     &mut state.children,
                     &mut state.parallel_scratch,
@@ -1340,8 +1617,14 @@ fn traverse(
                     target,
                     mode,
                     probability,
+                    state.id,
                 );
-                let start = ctx.config.profiling.then(Instant::now);
+                if let Some(t) = batch_start {
+                    child_diagnostics.batch(state.id, target, t.elapsed().as_nanos());
+                }
+                diagnostics.merge(child_diagnostics);
+                let start =
+                    (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
                 for ((child_scratch, orbit), _) in state
                     .parallel_scratch
                     .iter()
@@ -1356,11 +1639,16 @@ fn traverse(
                     }
                 }
                 if let Some(t) = start {
-                    state.work[3] += t.elapsed().as_nanos() as u64;
+                    let ns = t.elapsed().as_nanos();
+                    state.work[3] += ns as u64;
+                    if ctx.config.kernel_diagnostics {
+                        diagnostics.times.section(3, ns);
+                    }
                 }
             } else {
                 for (child, orbit) in state.children.iter_mut().zip(&state.orbits) {
-                    let start = ctx.config.profiling.then(Instant::now);
+                    let start =
+                        (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
                     let card = *ctx.tree.nodes[child.id]
                         .board
                         .last()
@@ -1374,12 +1662,26 @@ fn traverse(
                         probability,
                     );
                     if let Some(t) = start {
-                        state.work[3] += t.elapsed().as_nanos() as u64;
+                        let ns = t.elapsed().as_nanos();
+                        state.work[3] += ns as u64;
+                        if ctx.config.kernel_diagnostics {
+                            diagnostics.times.section(3, ns);
+                        }
                     }
                     let (child_buffers, rest) = descendants.split(child.span);
                     descendants = rest;
-                    traverse(ctx, child, desc_scratch, child_buffers, target, mode, false);
-                    let start = ctx.config.profiling.then(Instant::now);
+                    traverse(
+                        ctx,
+                        child,
+                        desc_scratch,
+                        child_buffers,
+                        target,
+                        mode,
+                        false,
+                        diagnostics,
+                    );
+                    let start =
+                        (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
                     for &permutation in orbit {
                         let map = &ctx.permutations[permutation].indices[target];
                         for (i, &j) in map.iter().enumerate() {
@@ -1387,7 +1689,11 @@ fn traverse(
                         }
                     }
                     if let Some(t) = start {
-                        state.work[3] += t.elapsed().as_nanos() as u64;
+                        let ns = t.elapsed().as_nanos();
+                        state.work[3] += ns as u64;
+                        if ctx.config.kernel_diagnostics {
+                            diagnostics.times.section(3, ns);
+                        }
                     }
                 }
             }
@@ -1398,7 +1704,7 @@ fn traverse(
             let actor = *player;
             let na = ctx.ranges[actor].combos.len();
             let len = state.own_len;
-            let start = ctx.config.profiling.then(Instant::now);
+            let start = (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
             let own_best_response = actor == target && matches!(mode, Mode::BestResponse);
             if !own_best_response {
                 let source = if matches!(mode, Mode::Train) {
@@ -1415,18 +1721,22 @@ fn traverse(
                 );
             }
             if let Some(t) = start {
-                state.work[2] += t.elapsed().as_nanos() as u64;
+                let ns = t.elapsed().as_nanos();
+                state.work[2] += ns as u64;
+                if ctx.config.kernel_diagnostics {
+                    diagnostics.times.section(2, ns);
+                }
             }
             for (a, child) in state.children.iter_mut().enumerate() {
-                for p in 0..2 {
-                    for i in 0..level.reach[p].len() {
-                        desc_scratch[0].reach[p][i] = level.reach[p][i]
-                            * if p == actor && !own_best_response {
-                                level.strategy[a * na + i] as f64
-                            } else {
-                                1.0
-                            };
-                    }
+                let transport = ctx.config.kernel_diagnostics.then(Instant::now);
+                decision_reach(
+                    &level.reach,
+                    &mut desc_scratch[0].reach,
+                    actor,
+                    (!own_best_response).then(|| &level.strategy[a * na..(a + 1) * na]),
+                );
+                if let Some(t) = transport {
+                    diagnostics.times.decision_transport_ns += t.elapsed().as_nanos();
                 }
                 let (child_buffers, rest) = descendants.split(child.span);
                 descendants = rest;
@@ -1438,11 +1748,16 @@ fn traverse(
                     target,
                     mode,
                     parallel,
+                    diagnostics,
                 );
+                let transport = ctx.config.kernel_diagnostics.then(Instant::now);
                 level.action_values[a * n..(a + 1) * n]
                     .copy_from_slice(&desc_scratch[0].value[..n]);
+                if let Some(t) = transport {
+                    diagnostics.times.decision_transport_ns += t.elapsed().as_nanos();
+                }
             }
-            let start = ctx.config.profiling.then(Instant::now);
+            let start = (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
             for i in 0..n {
                 level.value[i] = if actor != target {
                     (0..actions.len())
@@ -1503,7 +1818,11 @@ fn traverse(
                 }
             }
             if let Some(t) = start {
-                state.work[2] += t.elapsed().as_nanos() as u64;
+                let ns = t.elapsed().as_nanos();
+                state.work[2] += ns as u64;
+                if ctx.config.kernel_diagnostics {
+                    diagnostics.times.section(2, ns);
+                }
             }
         }
     }
@@ -1605,6 +1924,24 @@ fn update_policy_i16(
     encode_i16(average_scratch, average, &mut scales[1], maxima[1]);
 }
 
+fn decision_reach(
+    reach: &[Vec<f64>; 2],
+    out: &mut [Vec<f64>; 2],
+    actor: usize,
+    policy: Option<&[f32]>,
+) {
+    for p in 0..2 {
+        if let Some(policy) = policy.filter(|_| p == actor) {
+            assert_eq!(out[p].len(), reach[p].len());
+            assert_eq!(policy.len(), reach[p].len());
+            for ((out, &reach), &probability) in out[p].iter_mut().zip(&reach[p]).zip(policy) {
+                *out = reach * probability as f64;
+            }
+        } else {
+            out[p].copy_from_slice(&reach[p]);
+        }
+    }
+}
 fn chance_reach(
     ctx: &Context<'_>,
     reach: &[Vec<f64>; 2],
@@ -1615,11 +1952,14 @@ fn chance_reach(
 ) {
     let mask = 1u64 << card;
     for p in 0..2 {
-        for (i, &weight) in reach[p].iter().enumerate() {
-            out[p][i] = if ctx.masks[p][i] & mask != 0 {
+        assert_eq!(out[p].len(), reach[p].len());
+        assert_eq!(ctx.masks[p].len(), reach[p].len());
+        let probability = if p == target { 1.0 } else { probability };
+        for ((out, &weight), &cards) in out[p].iter_mut().zip(&reach[p]).zip(&ctx.masks[p]) {
+            *out = if cards & mask != 0 {
                 0.0
             } else {
-                weight * if p == target { 1.0 } else { probability }
+                weight * probability
             };
         }
     }
@@ -1634,34 +1974,98 @@ fn visit_parallel_chance(
     target: usize,
     mode: Mode,
     probability: f64,
-) {
+    boundary_node: usize,
+) -> RunDiagnostics {
+    let mut diagnostics = RunDiagnostics::default();
     if children.len() > ctx.config.parallel_grain {
         let mid = children.len() / 2;
         let span = children[..mid].iter().map(|s| s.span).sum();
         let (a, b) = buffers.split(span);
         let (left, right) = children.split_at_mut(mid);
         let (ls, rs) = scratch.split_at_mut(mid);
-        rayon::join(
-            || visit_parallel_chance(ctx, left, ls, a, reach, target, mode, probability),
-            || visit_parallel_chance(ctx, right, rs, b, reach, target, mode, probability),
+        let (left, right) = rayon::join(
+            || {
+                visit_parallel_chance(
+                    ctx,
+                    left,
+                    ls,
+                    a,
+                    reach,
+                    target,
+                    mode,
+                    probability,
+                    boundary_node,
+                )
+            },
+            || {
+                visit_parallel_chance(
+                    ctx,
+                    right,
+                    rs,
+                    b,
+                    reach,
+                    target,
+                    mode,
+                    probability,
+                    boundary_node,
+                )
+            },
         );
+        diagnostics.merge(left);
+        diagnostics.merge(right);
     } else {
+        let task_start = ctx
+            .config
+            .kernel_diagnostics
+            .then(|| ctx.run_start.elapsed().as_nanos());
+        let first_child_node = children.first().map_or(0, |c| c.id);
+        let child_count = children.len();
         let mut remaining = buffers;
         for (child, scratch) in children.iter_mut().zip(scratch) {
-            let start = ctx.config.profiling.then(Instant::now);
+            let start = (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
             let card = *ctx.tree.nodes[child.id]
                 .board
                 .last()
                 .expect("chance child card");
             chance_reach(ctx, reach, &mut scratch[0].reach, card, target, probability);
             if let Some(t) = start {
-                child.work[3] += t.elapsed().as_nanos() as u64;
+                let ns = t.elapsed().as_nanos();
+                child.work[3] += ns as u64;
+                if ctx.config.kernel_diagnostics {
+                    diagnostics.times.chance_ns += ns;
+                }
             }
             let (child_buffers, rest) = remaining.split(child.span);
             remaining = rest;
-            traverse(ctx, child, scratch, child_buffers, target, mode, false);
+            traverse(
+                ctx,
+                child,
+                scratch,
+                child_buffers,
+                target,
+                mode,
+                false,
+                &mut diagnostics,
+            );
+        }
+        if let Some(start_ns) = task_start {
+            diagnostics.tasks.push(diagnostics::ChanceTask {
+                boundary_node,
+                target,
+                phase: match mode {
+                    Mode::Train => "training",
+                    Mode::Average => "average",
+                    Mode::BestResponse => "best_response",
+                },
+                first_child_node,
+                child_count,
+                worker: rayon::current_thread_index(),
+                start_ns,
+                end_ns: ctx.run_start.elapsed().as_nanos(),
+            });
         }
     }
+    diagnostics
 }
 
 #[derive(Clone, Copy)]
@@ -1679,6 +2083,28 @@ fn totals(cards: &[[Card; 2]], reach: &[f64]) -> Totals {
     }
     out
 }
+// Zero reach contributions may be omitted from nonnegative, +0-initialized
+// sums without changing rounding/order of any nonzero contribution. Values and
+// every Train update still execute, including target hands with zero own reach.
+fn totals_nonzero(cards: &[[Card; 2]], reach: &[f64], mut skipped: Option<&mut u64>) -> Totals {
+    let mut out = Totals {
+        sum: 0.0,
+        cards: [0.0; 52],
+    };
+    for (&cards, &weight) in cards.iter().zip(reach) {
+        add_nonzero(&mut out, cards, weight, skipped.as_deref_mut());
+    }
+    out
+}
+fn add_nonzero(t: &mut Totals, cards: [Card; 2], weight: f64, skipped: Option<&mut u64>) {
+    if weight == 0.0 {
+        if let Some(skipped) = skipped {
+            *skipped += 1;
+        }
+    } else {
+        add(t, cards, weight);
+    }
+}
 fn add(t: &mut Totals, cards: [Card; 2], w: f64) {
     t.sum += w;
     t.cards[cards[0].0 as usize] += w;
@@ -1687,10 +2113,23 @@ fn add(t: &mut Totals, cards: [Card; 2], w: f64) {
 fn compatible(cards: [Card; 2], t: &Totals, same: f64) -> f64 {
     (t.sum - t.cards[cards[0].0 as usize] - t.cards[cards[1].0 as usize] + same).max(0.0)
 }
-fn terminal(ctx: &Context<'_>, id: usize, level: &mut Level, target: usize, winner: Option<usize>) {
+fn terminal(
+    ctx: &Context<'_>,
+    id: usize,
+    level: &mut Level,
+    target: usize,
+    winner: Option<usize>,
+    mut diagnostics: Option<&mut diagnostics::KernelTimes>,
+) {
     let node = &ctx.tree.nodes[id];
     let reach = &level.reach[1 - target];
-    let all = totals(&ctx.hand_cards[1 - target], reach);
+    let all = totals_nonzero(
+        &ctx.hand_cards[1 - target],
+        reach,
+        diagnostics
+            .as_deref_mut()
+            .map(|d| &mut d.terminal_totals_zero_combos),
+    );
     let pot = node.pot as f64 - ctx.tree.config.rake(node.pot);
     let base = node.invested[target] as f64 + ctx.tree.config.starting_pot as f64 / 2.0;
     let board = board_mask(&node.board);
@@ -1707,6 +2146,11 @@ fn terminal(ctx: &Context<'_>, id: usize, level: &mut Level, target: usize, winn
         return;
     }
     let table = &ctx.tables[ctx.terminal_table[id].expect("showdown table").get() as usize - 1];
+    // Scratch is reused across boards. Reset only blocked outputs, not the
+    // complete dense vector (active entries are overwritten by the pack).
+    for &i in &table.blocked[target] {
+        level.value[i as usize] = 0.0;
+    }
     let mut weak = Totals {
         sum: 0.0,
         cards: [0.0; 52],
@@ -1716,7 +2160,14 @@ fn terminal(ctx: &Context<'_>, id: usize, level: &mut Level, target: usize, winn
         // These boundaries use the original (rank, dense ID) ordering, so every
         // opposing weight enters each prefix in exactly the original order.
         for hand in &table.sorted[1 - target][cursor..group.opp_before as usize] {
-            add(&mut weak, hand.cards, reach[hand.dense as usize]);
+            add_nonzero(
+                &mut weak,
+                hand.cards,
+                reach[hand.dense as usize],
+                diagnostics
+                    .as_deref_mut()
+                    .map(|d| &mut d.showdown_prefix_zero_combos),
+            );
         }
         let own = &table.sorted[target][group.own_begin as usize..group.own_end as usize];
         for hand in own {
@@ -1724,7 +2175,14 @@ fn terminal(ctx: &Context<'_>, id: usize, level: &mut Level, target: usize, winn
         }
         // E[receipt]/pot = 0.5 * (strictly weaker + weaker-or-equal).
         for hand in &table.sorted[1 - target][group.opp_before as usize..group.opp_after as usize] {
-            add(&mut weak, hand.cards, reach[hand.dense as usize]);
+            add_nonzero(
+                &mut weak,
+                hand.cards,
+                reach[hand.dense as usize],
+                diagnostics
+                    .as_deref_mut()
+                    .map(|d| &mut d.showdown_prefix_zero_combos),
+            );
         }
         cursor = group.opp_after as usize;
         for hand in own {
@@ -1738,11 +2196,7 @@ fn terminal(ctx: &Context<'_>, id: usize, level: &mut Level, target: usize, winn
             let before = level.value[i];
             // The identical opposing combo belongs to the equal prefix only.
             let after = compatible(hand.cards, &weak, same);
-            level.value[i] = if ctx.masks[target][i] & board != 0 {
-                0.0
-            } else {
-                pot * 0.5 * (before + after) - base * total
-            };
+            level.value[i] = pot * 0.5 * (before + after) - base * total;
         }
     }
 }
@@ -1831,6 +2285,312 @@ mod tests {
                 range(&[("KhKd", 1.0)], &b),
             ],
         )
+    }
+    #[test]
+    #[ignore = "opt-in subsecond-to-few-second isolated normalization throughput"]
+    #[cfg(target_arch = "aarch64")]
+    fn normalization_microbench() {
+        use std::hint::black_box;
+        fn run<const A: usize>(n: usize, masks: &[u64], board: u64) {
+            let input: Vec<i16> = (0..n * A)
+                .map(|i| ((i * 1777) % 65536) as u16 as i16)
+                .collect();
+            let mut output = vec![0.0; n * A];
+            type Kernel = fn(&[i16], &mut [f32], usize, &[u64], u64);
+            for (name, kernel) in [
+                (
+                    "scalar_reference",
+                    scalar_normalize_fixed::<i16, A> as Kernel,
+                ),
+                ("portable_zip", normalize_fixed_portable::<i16, A> as Kernel),
+                ("neon", neon_normalize_fixed::<i16, A> as Kernel),
+            ] {
+                let loops = 10_000;
+                let start = Instant::now();
+                for _ in 0..loops {
+                    black_box(kernel)(
+                        black_box(&input),
+                        black_box(&mut output),
+                        n,
+                        black_box(masks),
+                        black_box(board),
+                    );
+                }
+                let ns = start.elapsed().as_nanos();
+                let checksum: f64 = black_box(&output).iter().map(|&v| v as f64).sum();
+                println!("{{\"kernel\":\"{name}\",\"storage\":\"i16\",\"actions\":{A},\"combos\":{n},\"loops\":{loops},\"elapsed_ns\":{ns},\"ns_per_actor_combo\":{},\"ns_per_action_combo\":{},\"checksum\":{checksum}}}",ns as f64/(n*loops) as f64,ns as f64/(n*A*loops) as f64);
+            }
+        }
+        let root = board_mask(&board("Qs Jh 2h"));
+        let masks: Vec<_> = (0..1326)
+            .map(|id| Combo::from_id(id).unwrap().mask())
+            .filter(|&m| m & root == 0)
+            .collect();
+        assert_eq!(masks.len(), 1176);
+        // A future board blocks additional hands; this is synthetic policy data,
+        // not a full-range solve or a convergence-speed measurement.
+        let future =
+            root | (1 << "3c".parse::<Card>().unwrap().0) | (1 << "4d".parse::<Card>().unwrap().0);
+        for n in [1176, 690] {
+            run::<2>(n, &masks[..n], future);
+            run::<3>(n, &masks[..n], future);
+        }
+    }
+    #[test]
+    fn zipped_fixed_normalization_matches_scalar_bits_with_blockers_and_tails() {
+        for n in [1, 2, 3, 7, 8, 9, 15, 16, 17, 69, 690, 1176, 1326] {
+            let masks: Vec<_> = (0..n).map(|i| 1u64 << (i % 52)).collect();
+            let board = (1 << 3) | (1 << 7) | (1 << 11);
+            for actions in [2, 3] {
+                let len = actions * n;
+                let ints: Vec<_> = (0..len)
+                    .map(|i| [-32768i16, -7, 0, 1, 101, 32767][i % 6])
+                    .collect();
+                let floats: Vec<_> = (0..len)
+                    .map(|i| {
+                        [
+                            -1.0f32,
+                            -0.0,
+                            0.0,
+                            f32::from_bits(1),
+                            1e-37,
+                            1.0,
+                            32767.0,
+                            f32::MAX,
+                            f32::MIN_POSITIVE,
+                        ][i % 9]
+                    })
+                    .collect();
+                for zero in [false, true] {
+                    let ints = if zero { vec![0; len] } else { ints.clone() };
+                    let floats = if zero { vec![0.0; len] } else { floats.clone() };
+                    let mut actual = vec![f32::NAN; len];
+                    let mut expected = actual.clone();
+                    macro_rules! check {
+                        ($input:expr, $a:literal) => {
+                            normalize_fixed::<_, $a>(&$input, &mut actual, n, &masks, board);
+                            scalar_normalize_fixed::<_, $a>(
+                                &$input,
+                                &mut expected,
+                                n,
+                                &masks,
+                                board,
+                            );
+                            assert_eq!(
+                                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                            );
+                            normalize_fixed_portable::<_, $a>(
+                                &$input,
+                                &mut actual,
+                                n,
+                                &masks,
+                                board,
+                            );
+                            assert_eq!(
+                                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                            );
+                            assert!(actual.iter().all(|v| v.is_finite()));
+                        };
+                    }
+                    if actions == 2 {
+                        check!(ints, 2);
+                        check!(floats, 2);
+                    } else {
+                        check!(ints, 3);
+                        check!(floats, 3);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn zipped_reach_matches_scalar_bits_with_zero_subnormal_and_tails() {
+        let (tree, ranges) = toy();
+        let e = Engine::new(tree, ranges, EngineConfig::default()).unwrap();
+        let ctx = Context {
+            tree: &e.tree,
+            ranges: &e.ranges,
+            masks: &e.masks,
+            hand_cards: &e.hand_cards,
+            same: &e.same,
+            tables: &e.tables,
+            terminal_table: &e.terminal_table,
+            config: &e.config,
+            permutations: &e.permutations,
+            average_reach_scale: &e.average_reach_scale,
+            initial_reach: &e.initial_reach,
+            discounts: [1.0; 3],
+            iteration: 0,
+            run_start: Instant::now(),
+        };
+        // Different player lengths exercise independent SIMD remainders.
+        for n in [1, 2, 3, 7, 8, 9, 15, 16, 17, 690, 1176] {
+            let reach: [Vec<f64>; 2] = std::array::from_fn(|p| {
+                (0..n + p)
+                    .map(|i| [0.0, -0.0, f64::from_bits(1), 1e-100, 0.7][i % 5])
+                    .collect()
+            });
+            let mut actual: [Vec<f64>; 2] = std::array::from_fn(|p| vec![0.0; reach[p].len()]);
+            for actor in 0..2 {
+                let policy: Vec<_> = (0..reach[actor].len())
+                    .map(|i| [0.0, 0.5, 1.0][i % 3])
+                    .collect();
+                for strategy in [None, Some(policy.as_slice())] {
+                    decision_reach(&reach, &mut actual, actor, strategy);
+                    for p in 0..2 {
+                        for i in 0..reach[p].len() {
+                            let expected = reach[p][i]
+                                * if p == actor {
+                                    strategy.map_or(1.0, |s| s[i] as f64)
+                                } else {
+                                    1.0
+                                };
+                            assert_eq!(actual[p][i].to_bits(), expected.to_bits());
+                        }
+                    }
+                }
+            }
+            let masks: [Vec<u64>; 2] =
+                std::array::from_fn(|p| (0..reach[p].len()).map(|i| 1u64 << (i % 52)).collect());
+            let ctx = Context {
+                masks: &masks,
+                ..ctx
+            };
+            for target in 0..2 {
+                chance_reach(&ctx, &reach, &mut actual, 3, target, 1.0 / 44.0);
+                for p in 0..2 {
+                    for i in 0..reach[p].len() {
+                        let expected = if masks[p][i] & (1 << 3) != 0 {
+                            0.0
+                        } else {
+                            reach[p][i] * if p == target { 1.0 } else { 1.0 / 44.0 }
+                        };
+                        assert_eq!(actual[p][i].to_bits(), expected.to_bits());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn kernel_diagnostics_exact_workload_and_metrics_isolation() {
+        for storage_mode in [StorageMode::F32, StorageMode::I16] {
+            let (tree, ranges) = toy();
+            let mut baseline = Engine::new(
+                tree.clone(),
+                ranges.clone(),
+                EngineConfig {
+                    storage_mode,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut measured = Engine::new(
+                tree,
+                ranges,
+                EngineConfig {
+                    storage_mode,
+                    kernel_diagnostics: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let w = measured
+                .kernel_diagnostics()
+                .unwrap()
+                .per_iteration_workload;
+            assert_eq!(w.decision_visits, 4);
+            assert_eq!(w.decision_dense_combos, 6);
+            assert_eq!(w.decision_active_combos, 6);
+            assert_eq!(w.action_dense_combos, 12);
+            assert_eq!(w.normalization_dense_combos, 12);
+            assert_eq!(w.update_dense_combos, 6);
+            assert_eq!(w.fold_visits, 2);
+            assert_eq!(w.fold_dense_combos, 3);
+            assert_eq!(w.showdown_visits, 4);
+            assert_eq!(w.showdown_dense_combos, 6);
+            assert_eq!(w.terminal_totals_dense_combos, 9);
+            assert_eq!(w.chance_visits, 0);
+            assert_eq!(
+                measured
+                    .kernel_diagnostics()
+                    .unwrap()
+                    .per_best_response_evaluation_workload
+                    .normalization_dense_combos,
+                6
+            );
+            for _ in 0..8 {
+                baseline.iterate();
+                measured.iterate();
+            }
+            assert_eq!(baseline.regret.bits(), measured.regret.bits());
+            assert_eq!(baseline.average.bits(), measured.average.bits());
+            let training_ns = measured.kernel_diagnostics().unwrap().training.wall_ns;
+            let bm = baseline.metrics();
+            let mm = measured.metrics();
+            assert_eq!(
+                bm.exploitability_pct.to_bits(),
+                mm.exploitability_pct.to_bits()
+            );
+            let d = measured.kernel_diagnostics().unwrap();
+            assert_eq!(d.training.wall_ns, training_ns);
+            assert_eq!(d.training.traversals, 16);
+            assert_eq!(d.average_evaluation.traversals, 2);
+            assert_eq!(d.best_response_evaluation.traversals, 2);
+            assert_eq!(d.iterations.len(), 8);
+            assert!(d.training.decision_ns > 0 && d.training.showdown_ns > 0);
+            assert!(d.training.decision_transport_ns > 0);
+            assert!(baseline.kernel_diagnostics().is_none());
+        }
+    }
+    #[test]
+    fn kernel_diagnostics_parallel_tasks_and_blocked_workload() {
+        let b = board("2c 7d 9h Js");
+        let tree = GameTree::build(
+            b.clone(),
+            TreeConfig {
+                starting_pot: 1000,
+                effective_stack: 500,
+                allow_raises: false,
+                rake_rate: 0.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rr = [
+            range(&[("AcAd", 1.0), ("3c4d", 0.7)], &b),
+            range(&[("KcKd", 1.0)], &b),
+        ];
+        let mut measured = Engine::new(
+            tree,
+            rr,
+            EngineConfig {
+                threads: 2,
+                kernel_diagnostics: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        measured.iterate();
+        let d = measured.kernel_diagnostics().unwrap();
+        assert!(
+            d.per_iteration_workload.decision_active_combos
+                < d.per_iteration_workload.decision_dense_combos
+        );
+        assert!(d.per_iteration_workload.chance_representative_children > 0);
+        assert!(!d.latest_training_tasks.is_empty());
+        for t in &d.latest_training_tasks {
+            assert!(t.end_ns >= t.start_ns);
+            assert_eq!(t.child_count, 1);
+            assert!(t.worker.is_some_and(|w| w < 2));
+        }
+        for batch in &d.iterations[0].chance_batches {
+            assert!(batch.tasks > 1);
+            assert!((1..=2).contains(&batch.workers_used));
+            assert!(batch.task_min_ns <= batch.task_max_ns);
+            assert!(batch.final_task_tail_ns <= batch.wall_ns);
+        }
     }
     #[test]
     fn polarized_toy_dcfr_and_cfr_plus_match_theory() {
@@ -2072,6 +2832,186 @@ mod tests {
         values
     }
     #[test]
+    fn zero_reach_terminal_contributions_preserve_bits_and_exact_skip_counts() {
+        let (tree, ranges) = toy();
+        let mut e = Engine::new(tree, ranges, EngineConfig::default()).unwrap();
+        let id = 1;
+        for target in 0..2 {
+            for (all_zero, winner) in [false, true]
+                .into_iter()
+                .flat_map(|zero| [None, Some(0), Some(1)].map(move |winner| (zero, winner)))
+            {
+                e.tree.nodes[id].kind = NodeKind::Terminal { winner };
+                let mut level = levels(1, 0, [e.masks[0].len(), e.masks[1].len()]).remove(0);
+                for p in 0..2 {
+                    for i in 0..level.reach[p].len() {
+                        level.reach[p][i] = if all_zero || i % 2 == 0 {
+                            -0.0
+                        } else {
+                            e.initial_reach[p][i]
+                        };
+                    }
+                }
+                let expected = legacy_terminal_values(&e, id, target, &level.reach[1 - target]);
+                let mut diagnostic = diagnostics::KernelTimes::default();
+                let ctx = Context {
+                    tree: &e.tree,
+                    ranges: &e.ranges,
+                    masks: &e.masks,
+                    hand_cards: &e.hand_cards,
+                    same: &e.same,
+                    tables: &e.tables,
+                    terminal_table: &e.terminal_table,
+                    config: &e.config,
+                    permutations: &e.permutations,
+                    average_reach_scale: &e.average_reach_scale,
+                    initial_reach: &e.initial_reach,
+                    discounts: [1.0; 3],
+                    iteration: 0,
+                    run_start: Instant::now(),
+                };
+                let table = &e.tables[e.terminal_table[id].unwrap().get() as usize - 1];
+                let prefix = table.groups[target]
+                    .last()
+                    .map_or(0, |g| g.opp_after as usize);
+                let expected_prefix_skips = if winner.is_some() {
+                    0
+                } else {
+                    table.sorted[1 - target][..prefix]
+                        .iter()
+                        .filter(|h| level.reach[1 - target][h.dense as usize] == 0.0)
+                        .count() as u64
+                };
+                let expected_total_skips = level.reach[1 - target]
+                    .iter()
+                    .filter(|&&r| r == 0.0)
+                    .count() as u64;
+                terminal(&ctx, id, &mut level, target, winner, Some(&mut diagnostic));
+                assert_eq!(diagnostic.terminal_totals_zero_combos, expected_total_skips);
+                assert_eq!(
+                    diagnostic.showdown_prefix_zero_combos,
+                    expected_prefix_skips
+                );
+                assert_eq!(
+                    level.value[..expected.len()]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    #[test]
+    fn packed_terminals_match_dense_legacy_all_combos_and_empty_pack() {
+        for sparse in [false, true] {
+            let b = board("Qs Jh 2h 3c");
+            let tree = GameTree::build(
+                b.clone(),
+                TreeConfig {
+                    starting_pot: 6000,
+                    effective_stack: 0,
+                    rake_rate: 0.05,
+                    rake_cap: 3000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let hands: Vec<_> = (0..1326)
+                .map(|i| Combo::from_id(i).unwrap())
+                .filter(|c| c.mask() & board_mask(&b) == 0)
+                .collect();
+            let rr = if sparse {
+                [
+                    range(&[("AcAh", 1.0), ("AcAd", 0.3)], &b),
+                    range(&[("KcKh", 1.0), ("KdKs", 0.7)], &b),
+                ]
+            } else {
+                std::array::from_fn(|p| {
+                    Range::from_combos(
+                        hands
+                            .iter()
+                            .take(if p == 0 { hands.len() } else { 690 })
+                            .enumerate()
+                            .map(|(i, &h)| (h, (i % 23 + 1) as f64 / 23.0))
+                            .collect(),
+                    )
+                    .unwrap()
+                    .blocked(&b.iter().map(|&c| Card(c)).collect::<Vec<_>>())
+                    .unwrap()
+                })
+            };
+            let mut e = Engine::new(tree, rr, EngineConfig::default()).unwrap();
+            let ids: Vec<_> = e
+                .tree
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| matches!(n.kind, NodeKind::Terminal { winner: None }))
+                .map(|(id, _)| id)
+                .collect();
+            let mut saw_empty = false;
+            for id in ids.into_iter().step_by(if sparse { 1 } else { 7 }) {
+                let table = &e.tables[e.terminal_table[id].unwrap().get() as usize - 1];
+                for p in 0..2 {
+                    assert_eq!(
+                        table.sorted[p].len() + table.blocked[p].len(),
+                        e.masks[p].len()
+                    );
+                    saw_empty |= table.sorted[p].is_empty();
+                }
+                for winner in [None, Some(0), Some(1)] {
+                    e.tree.nodes[id].kind = NodeKind::Terminal { winner };
+                    for target in 0..2 {
+                        let mut level =
+                            levels(1, 0, [e.masks[0].len(), e.masks[1].len()]).remove(0);
+                        // Poison every reused output; blocked slots must be reset.
+                        level.value.fill(f64::NAN);
+                        for p in 0..2 {
+                            for i in 0..level.reach[p].len() {
+                                level.reach[p][i] =
+                                    if e.masks[p][i] & board_mask(&e.tree.nodes[id].board) != 0 {
+                                        0.0
+                                    } else {
+                                        e.initial_reach[p][i]
+                                    };
+                            }
+                        }
+                        let expected =
+                            legacy_terminal_values(&e, id, target, &level.reach[1 - target]);
+                        let ctx = Context {
+                            tree: &e.tree,
+                            ranges: &e.ranges,
+                            masks: &e.masks,
+                            hand_cards: &e.hand_cards,
+                            same: &e.same,
+                            tables: &e.tables,
+                            terminal_table: &e.terminal_table,
+                            config: &e.config,
+                            permutations: &e.permutations,
+                            average_reach_scale: &e.average_reach_scale,
+                            initial_reach: &e.initial_reach,
+                            discounts: [1.0; 3],
+                            iteration: 0,
+                            run_start: Instant::now(),
+                        };
+                        terminal(&ctx, id, &mut level, target, winner, None);
+                        assert_eq!(
+                            level.value[..expected.len()]
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>(),
+                            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+            if sparse {
+                assert!(saw_empty);
+            }
+        }
+    }
+    #[test]
     fn grouped_terminals_match_legacy_bits_with_future_blockers() {
         assert_eq!(std::mem::size_of::<SortedHand>(), 6);
         assert_eq!(std::mem::size_of::<RankGroup>(), 8);
@@ -2153,8 +3093,9 @@ mod tests {
                             initial_reach: &e.initial_reach,
                             discounts: [1.0; 3],
                             iteration: 0,
+                            run_start: Instant::now(),
                         };
-                        terminal(&ctx, id, &mut level, target, winner);
+                        terminal(&ctx, id, &mut level, target, winner, None);
                         assert_eq!(
                             level.value[..expected.len()]
                                 .iter()
@@ -2774,6 +3715,7 @@ mod tests {
                         (t / (t + 1.0)).powf(e.config.dcfr_gamma),
                     ],
                     iteration,
+                    run_start: Instant::now(),
                 };
                 for actions in [1, 2, 3, 4] {
                     let n = 7;
