@@ -3,3 +3,4 @@
 /data
 *.local.json
 .DS_Store
+/.local
