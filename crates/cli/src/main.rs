@@ -4,7 +4,7 @@ use cfr::{Algorithm, EngineConfig};
 use clap::{Parser, Subcommand, ValueEnum};
 use ranges::Range;
 use serde::Serialize;
-use solver::{solve, solve_with_progress, GameSpec, StopConditions};
+use solver::{solve, solve_with_progress, AdaptiveMetrics, GameSpec, StopConditions};
 mod compare;
 use std::{
     fs,
@@ -34,6 +34,9 @@ enum Storage {
     F32,
     I16,
 }
+// Parsed once at startup, not stored per node or iteration; boxing Solve would
+// add indirection/allocation without reducing the solver's working set.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     Solve {
@@ -62,6 +65,16 @@ enum Command {
         no_allin_merge: bool,
         #[arg(long, default_value_t = 10)]
         metrics_every: usize,
+        /// Opt in to sparse early exact metrics, then denser checks near the target.
+        #[arg(long)]
+        adaptive_metrics: bool,
+        #[arg(long, default_value_t = 25, requires = "adaptive_metrics")]
+        metrics_early_every: usize,
+        #[arg(long, default_value_t = 5, requires = "adaptive_metrics")]
+        metrics_near_every: usize,
+        /// Switch permanently to near cadence at target times this multiplier.
+        #[arg(long, default_value_t = 2.0, requires = "adaptive_metrics")]
+        metrics_near_target_multiplier: f64,
         /// Flush setup and fresh metric checkpoint JSONL while solving.
         #[arg(long)]
         progress_jsonl: Option<PathBuf>,
@@ -88,6 +101,12 @@ enum Command {
         out: PathBuf,
         #[arg(long, default_value_t = 10)]
         threads: usize,
+        /// Disable fine-grained worker timers (the selected mode is recorded in engine metadata).
+        #[arg(long)]
+        no_profiling: bool,
+        /// Minimum number of chance children per parallel task (must be positive).
+        #[arg(long, default_value_t = 1)]
+        parallel_grain: usize,
         #[arg(long, value_enum, default_value_t = Method::Dcfr)]
         algorithm: Method,
         #[arg(long)]
@@ -187,6 +206,10 @@ fn main() -> Result<()> {
             allin_merge_ratio,
             no_allin_merge,
             metrics_every,
+            adaptive_metrics,
+            metrics_early_every,
+            metrics_near_every,
+            metrics_near_target_multiplier,
             progress_jsonl,
             storage,
             dcfr_alpha,
@@ -199,6 +222,8 @@ fn main() -> Result<()> {
             max_seconds,
             out,
             threads,
+            no_profiling,
+            parallel_grain,
             algorithm,
             no_isomorphism,
             memory_mb,
@@ -223,6 +248,7 @@ fn main() -> Result<()> {
                 },
                 engine: EngineConfig {
                     threads,
+                    parallel_grain,
                     algorithm: match algorithm {
                         Method::Dcfr => Algorithm::Dcfr,
                         Method::CfrPlus => Algorithm::CfrPlus,
@@ -231,7 +257,7 @@ fn main() -> Result<()> {
                     memory_limit_bytes: memory_mb
                         .checked_mul(1024 * 1024)
                         .ok_or_else(|| anyhow!("memory limit overflow"))?,
-                    profiling: true,
+                    profiling: !no_profiling,
                     storage_mode: match storage {
                         Storage::F32 => cfr::StorageMode::F32,
                         Storage::I16 => cfr::StorageMode::I16,
@@ -258,6 +284,11 @@ fn main() -> Result<()> {
                     max_iterations: max_iters,
                     max_seconds,
                     metrics_every,
+                    adaptive_metrics: adaptive_metrics.then_some(AdaptiveMetrics {
+                        early_every: metrics_early_every,
+                        near_every: metrics_near_every,
+                        near_target_multiplier: metrics_near_target_multiplier,
+                    }),
                 },
                 |event| {
                     let line = serde_json::to_string(event).map_err(|e| e.to_string())?;
@@ -350,6 +381,7 @@ fn bench(threads: usize, max_iters: usize) -> Result<()> {
             max_iterations: max_iters,
             max_seconds: 300.0,
             metrics_every: 1,
+            ..Default::default()
         };
         let solution =
             solve(spec.clone(), [oop.clone(), ip.clone()], stop.clone()).map_err(|e| anyhow!(e))?;
@@ -404,6 +436,62 @@ fn bench(threads: usize, max_iters: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn solve_performance_options_are_opt_in() {
+        let base = [
+            "cli",
+            "solve",
+            "--board",
+            "QsJh2h",
+            "--pot",
+            "5.5",
+            "--stack",
+            "97.5",
+            "--oop-range",
+            "oop.json",
+            "--ip-range",
+            "ip.json",
+            "--bet",
+            "50",
+            "--out",
+            "solution.json",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        let Command::Solve {
+            no_profiling,
+            parallel_grain,
+            adaptive_metrics,
+            ..
+        } = cli.command
+        else {
+            panic!("expected solve");
+        };
+        assert!(!no_profiling);
+        assert!(!adaptive_metrics);
+        assert_eq!(parallel_grain, 1);
+        let cli = Cli::try_parse_from(base.into_iter().chain([
+            "--no-profiling",
+            "--parallel-grain",
+            "8",
+            "--adaptive-metrics",
+            "--metrics-near-every",
+            "3",
+        ]))
+        .unwrap();
+        let Command::Solve {
+            no_profiling,
+            parallel_grain,
+            adaptive_metrics,
+            metrics_near_every,
+            ..
+        } = cli.command
+        else {
+            panic!("expected solve");
+        };
+        assert!(no_profiling && adaptive_metrics);
+        assert_eq!(parallel_grain, 8);
+        assert_eq!(metrics_near_every, 3);
+    }
     #[test]
     fn board_and_chip_parsing() {
         assert_eq!(parse_board("Ah, Kd 2c").unwrap().len(), 3);

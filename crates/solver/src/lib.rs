@@ -16,6 +16,33 @@ pub struct GameSpec {
     pub engine: EngineConfig,
 }
 
+/// Opt-in cadence for exact average-EV and best-response evaluations.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdaptiveMetrics {
+    pub early_every: usize,
+    pub near_every: usize,
+    /// Enter the near phase permanently after an exact metric reaches target * multiplier.
+    pub near_target_multiplier: f64,
+}
+impl Default for AdaptiveMetrics {
+    fn default() -> Self {
+        Self {
+            early_every: 25,
+            near_every: 5,
+            near_target_multiplier: 2.0,
+        }
+    }
+}
+impl AdaptiveMetrics {
+    fn interval(&self, near: bool) -> usize {
+        if near {
+            self.near_every
+        } else {
+            self.early_every
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StopConditions {
     pub target_exploitability_pct: f64,
@@ -23,6 +50,9 @@ pub struct StopConditions {
     pub max_seconds: f64,
     /// Evaluate average EV and best responses at this interval and at final stop.
     pub metrics_every: usize,
+    /// None preserves the fixed metrics_every cadence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_metrics: Option<AdaptiveMetrics>,
 }
 impl Default for StopConditions {
     fn default() -> Self {
@@ -31,6 +61,7 @@ impl Default for StopConditions {
             max_iterations: 1_000,
             max_seconds: 60.0,
             metrics_every: 10,
+            adaptive_metrics: None,
         }
     }
 }
@@ -146,6 +177,14 @@ pub fn solve_with_progress(
     {
         return Err("stop conditions must be finite and nonnegative".into());
     }
+    if let Some(schedule) = &stop_conditions.adaptive_metrics {
+        if schedule.early_every == 0 || schedule.near_every == 0 {
+            return Err("adaptive metrics intervals must be positive".into());
+        }
+        if !schedule.near_target_multiplier.is_finite() || schedule.near_target_multiplier < 1.0 {
+            return Err("near_target_multiplier must be finite and at least 1".into());
+        }
+    }
     let setup_start = Instant::now();
     let dense = [
         input_ranges[0].blocked(&game_spec.board)?,
@@ -201,6 +240,13 @@ pub fn solve_with_progress(
             },
         })?;
         let mut measured_iteration = 0;
+        let mut near_target = stop_conditions
+            .adaptive_metrics
+            .as_ref()
+            .is_some_and(|schedule| {
+                metrics.exploitability_pct
+                    <= stop_conditions.target_exploitability_pct * schedule.near_target_multiplier
+            });
         let reason = loop {
             if measured_iteration == engine.iterations()
                 && metrics.exploitability_pct <= stop_conditions.target_exploitability_pct
@@ -238,12 +284,23 @@ pub fn solve_with_progress(
             engine.iterate();
             let iteration_seconds = iter_start.elapsed().as_secs_f64();
             training_seconds += iteration_seconds;
-            let fresh = engine.iterations() % stop_conditions.metrics_every == 0;
+            let interval = stop_conditions
+                .adaptive_metrics
+                .as_ref()
+                .map_or(stop_conditions.metrics_every, |schedule| {
+                    schedule.interval(near_target)
+                });
+            let fresh = engine.iterations() - measured_iteration >= interval;
             if fresh {
                 let metric_start = Instant::now();
                 metrics = engine.metrics();
                 metrics_seconds += metric_start.elapsed().as_secs_f64();
                 measured_iteration = engine.iterations();
+                if let Some(schedule) = &stop_conditions.adaptive_metrics {
+                    near_target |= metrics.exploitability_pct
+                        <= stop_conditions.target_exploitability_pct
+                            * schedule.near_target_multiplier;
+                }
             }
             history.push(IterationRecord {
                 iteration: engine.iterations(),
@@ -500,6 +557,7 @@ mod tests {
                 target_exploitability_pct: 0.0,
                 max_seconds: 30.0,
                 metrics_every: 1,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -528,6 +586,7 @@ mod tests {
                 max_seconds: 30.0,
                 target_exploitability_pct: 0.0,
                 metrics_every: 2,
+                ..Default::default()
             },
             |event| {
                 if let ProgressEvent::Checkpoint { record } = event {
@@ -565,6 +624,82 @@ mod tests {
             .iter()
             .all(|c| (c.reach_weight - expected).abs() < 1e-12));
         assert!(serde_json::to_value(result.report()).unwrap()["after_check_strategy"].is_object());
+    }
+    #[test]
+    fn adaptive_exact_checkpoints_and_no_duplicate_final() {
+        // Cover final stops both on and off cadence, and both scheduling phases.
+        for (near, max_iterations) in [(false, 6), (false, 7), (true, 6), (true, 7)] {
+            let (game, ranges) = example();
+            let mut checkpoints = Vec::new();
+            let result = solve_with_progress(
+                game,
+                ranges,
+                StopConditions {
+                    target_exploitability_pct: 1e-12,
+                    max_iterations,
+                    max_seconds: 30.0,
+                    adaptive_metrics: Some(AdaptiveMetrics {
+                        early_every: 3,
+                        near_every: 2,
+                        near_target_multiplier: if near { 1e18 } else { 1.0 },
+                    }),
+                    ..Default::default()
+                },
+                |event| {
+                    if let ProgressEvent::Checkpoint { record } = event {
+                        checkpoints.push(record.iteration);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let final_iteration = result.engine.iterations();
+            assert_eq!(checkpoints.first(), Some(&0));
+            assert_eq!(checkpoints.last(), Some(&final_iteration));
+            assert!(checkpoints.windows(2).all(|pair| pair[0] < pair[1]));
+            let interval = if near { 2 } else { 3 };
+            assert!(checkpoints
+                .iter()
+                .all(|&i| i == final_iteration || i % interval == 0));
+            if let Some(record) = result.history.last() {
+                assert_eq!(
+                    record.metrics.as_ref().unwrap().exploitability_pct,
+                    result.metrics.exploitability_pct
+                );
+            }
+        }
+    }
+    #[test]
+    fn invalid_adaptive_schedule() {
+        let (game, ranges) = example();
+        for schedule in [
+            AdaptiveMetrics {
+                early_every: 0,
+                ..Default::default()
+            },
+            AdaptiveMetrics {
+                near_every: 0,
+                ..Default::default()
+            },
+            AdaptiveMetrics {
+                near_target_multiplier: f64::NAN,
+                ..Default::default()
+            },
+            AdaptiveMetrics {
+                near_target_multiplier: 0.5,
+                ..Default::default()
+            },
+        ] {
+            assert!(solve(
+                game.clone(),
+                ranges.clone(),
+                StopConditions {
+                    adaptive_metrics: Some(schedule),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        }
     }
     #[test]
     fn invalid_cadence_and_progress_errors() {
