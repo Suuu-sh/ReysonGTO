@@ -95,6 +95,118 @@ pub struct NodeStrategy {
     pub classes: BTreeMap<String, Vec<f64>>,
 }
 
+/// Portable continuation input. Each weight is INITIAL own combo weight times
+/// only that player's average action probabilities. It is not a joint marginal.
+/// Chance likelihood is omitted: legal private deals all have the same runout
+/// factor; private-card blockers are applied explicitly instead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReachSnapshot {
+    pub source_node: usize,
+    pub board: Vec<Card>,
+    pub pot: i64,
+    pub stacks: [i64; 2],
+    /// Chips sunk since the source solution root. EV is centered on half the
+    /// starting pot; use source_frame_ev rather than subtracting these alone.
+    pub invested: [i64; 2],
+    pub source_starting_pot: i64,
+    pub units_per_bb: i64,
+    pub ranges: [Range; 2],
+    pub tree_config: TreeConfig,
+    pub is_street_start: bool,
+    pub can_deal_next: bool,
+}
+impl ReachSnapshot {
+    /// Condition a pre-turn / pre-river chance snapshot on one public card.
+    /// Zero entries are retained in the snapshot for auditing dense combo IDs.
+    pub fn with_card(mut self, card: Card) -> Result<Self, String> {
+        if !self.can_deal_next || !(3..=4).contains(&self.board.len()) {
+            return Err("snapshot is not a pre-turn or pre-river chance state".into());
+        }
+        self.board.push(card);
+        let mask = cards::validate_board(&self.board)?;
+        for range in &mut self.ranges {
+            // Derived serde accepts raw Card IDs; validate before any bit shift.
+            // This also rejects duplicate combos and invalid weights while the
+            // snapshot itself retains its zero entries and dense ordering.
+            Range::from_combos(range.combos.iter().map(|e| (e.combo, e.weight)).collect())?;
+            for entry in &mut range.combos {
+                entry.combo = Combo::new(entry.combo.cards[0], entry.combo.cards[1])?;
+                if entry.combo.mask() & mask != 0 {
+                    entry.weight = 0.0;
+                }
+            }
+        }
+        self.is_street_start = true;
+        self.can_deal_next = false;
+        Ok(self)
+    }
+    pub fn source_frame_ev(&self, continuation_ev: [f64; 2]) -> [f64; 2] {
+        std::array::from_fn(|p| {
+            continuation_ev[p] + (self.pot as f64 - self.source_starting_pot as f64) / 2.0
+                - self.invested[p] as f64
+        })
+    }
+}
+
+/// Start a fresh turn / river game at a street boundary. Pending wagers and
+/// unequal stacks are deliberately rejected rather than silently reconstructed.
+/// The inherited full pot is raked once at terminal; past rake is not charged.
+/// Exploitability is reported against this snapshot's starting pot.
+pub fn solve_subgame(
+    snapshot: ReachSnapshot,
+    engine: EngineConfig,
+    stop: StopConditions,
+) -> Result<Solution, String> {
+    solve_subgame_with_progress(snapshot, engine, stop, |_| Ok(()))
+}
+pub fn solve_subgame_with_progress(
+    snapshot: ReachSnapshot,
+    engine: EngineConfig,
+    stop: StopConditions,
+    progress: impl FnMut(&ProgressEvent) -> Result<(), String> + Send,
+) -> Result<Solution, String> {
+    if !snapshot.is_street_start || !(4..=5).contains(&snapshot.board.len()) {
+        return Err("subgame requires the beginning of a turn or river".into());
+    }
+    if snapshot.stacks[0] != snapshot.stacks[1] || snapshot.stacks[0] < 0 {
+        return Err("subgame requires equal nonnegative remaining stacks".into());
+    }
+    let mut config = snapshot.tree_config;
+    config.starting_pot = snapshot.pot;
+    config.effective_stack = snapshot.stacks[0];
+    solve_with_progress(
+        GameSpec {
+            board: snapshot.board,
+            units_per_bb: snapshot.units_per_bb,
+            tree: config,
+            engine,
+        },
+        snapshot.ranges,
+        stop,
+        progress,
+    )
+}
+pub fn solve_turn(
+    snapshot: ReachSnapshot,
+    engine: EngineConfig,
+    stop: StopConditions,
+) -> Result<Solution, String> {
+    if snapshot.board.len() != 4 {
+        return Err("turn solve requires four board cards".into());
+    }
+    solve_subgame(snapshot, engine, stop)
+}
+pub fn solve_river(
+    snapshot: ReachSnapshot,
+    engine: EngineConfig,
+    stop: StopConditions,
+) -> Result<Solution, String> {
+    if snapshot.board.len() != 5 {
+        return Err("river solve requires five board cards".into());
+    }
+    solve_subgame(snapshot, engine, stop)
+}
+
 pub struct Solution {
     engine: Engine,
     pub game_spec: GameSpec,
@@ -359,10 +471,9 @@ impl Solution {
                 )
             })
     }
-    /// Reach includes both players' average-profile action probabilities and
-    /// exact private-card compatibility. Public runout likelihood is a common
+    /// Own action reach for both players, without opponent compatibility. Public runout likelihood is a common
     /// node factor and is omitted (it cancels in normalized frequencies).
-    fn reaches(&self, target: usize) -> Result<[Vec<f64>; 2], String> {
+    pub fn reaches(&self, target: usize) -> Result<[Vec<f64>; 2], String> {
         fn path(tree: &GameTree, id: usize, target: usize, out: &mut Vec<(usize, usize)>) -> bool {
             if id == target {
                 return true;
@@ -409,6 +520,47 @@ impl Solution {
             }
         }
         Ok(reaches)
+    }
+    /// Both own-reach ranges and exact public state at any arena node. Suit
+    /// aliases are expanded by Engine::strategy before multiplying own actions.
+    pub fn reach_snapshot(&self, node: usize) -> Result<ReachSnapshot, String> {
+        let state = self.tree().nodes.get(node).ok_or("unknown node")?;
+        let reaches = self.reaches(node)?;
+        let ranges = std::array::from_fn(|p| Range {
+            player: self.engine.ranges()[p].player.clone(),
+            combos: self.engine.ranges()[p]
+                .combos
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ranges::WeightedCombo {
+                    combo: c.combo,
+                    weight: reaches[p][i],
+                })
+                .collect(),
+        });
+        let is_street_start = node == self.tree().root || self.tree().nodes.iter().any(|parent| {
+            matches!(&parent.kind, NodeKind::Chance { children, .. } if children.contains(&node))
+        });
+        Ok(ReachSnapshot {
+            source_node: node,
+            board: state.board.iter().copied().map(Card).collect(),
+            pot: state.pot,
+            stacks: state.stacks,
+            invested: state.invested,
+            source_starting_pot: self.game_spec.tree.starting_pot,
+            units_per_bb: self.game_spec.units_per_bb,
+            ranges,
+            tree_config: self.game_spec.tree.clone(),
+            is_street_start,
+            can_deal_next: matches!(state.kind, NodeKind::Chance { .. }) && state.board.len() < 5,
+        })
+    }
+    /// Exact average-profile and best-response metrics conditioned on a node.
+    /// EV is in the original solution's root frame (includes sunk investment).
+    /// Exploitability's denominator is the selected node's pot, not flop pot.
+    pub fn node_metrics(&mut self, node: usize) -> Result<Metrics, String> {
+        let reaches = self.reaches(node)?;
+        self.engine.metrics_at_node(node, reaches)
     }
     pub fn strategy(&self, node: usize) -> Result<NodeStrategy, String> {
         let n = self.tree().nodes.get(node).ok_or("unknown node")?;
@@ -627,6 +779,315 @@ mod tests {
             .iter()
             .all(|c| (c.reach_weight - expected).abs() < 1e-12));
         assert!(serde_json::to_value(result.report()).unwrap()["after_check_strategy"].is_object());
+    }
+    fn action_child(solution: &Solution, node: usize, action: Action) -> usize {
+        let NodeKind::Decision {
+            actions, children, ..
+        } = &solution.tree().nodes[node].kind
+        else {
+            panic!("decision required");
+        };
+        children[actions.iter().position(|a| *a == action).unwrap()]
+    }
+    #[test]
+    fn own_reach_card_blockers_snapshot_roundtrip() {
+        let (mut game, _) = example();
+        game.board.truncate(4);
+        game.engine.threads = 1;
+        game.tree.rake_rate = 0.05;
+        game.tree.rake_cap = 3000;
+        let ranges = [
+            Range::from_json(r#"{"AhAd":2,"KhKd":3}"#).unwrap(),
+            Range::from_json(r#"{"QcQd":5,"JhJd":7}"#).unwrap(),
+        ];
+        let mut solution = solve(
+            game,
+            ranges,
+            StopConditions {
+                max_iterations: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let root = solution.tree().root;
+        let after = action_child(&solution, root, Action::Check);
+        let chance = action_child(&solution, after, Action::Check);
+        let snapshot = solution.reach_snapshot(chance).unwrap();
+        let root_policy = solution.strategy(root).unwrap();
+        for (entry, strategy) in snapshot.ranges[0]
+            .combos
+            .iter()
+            .zip(root_policy.combos.iter())
+        {
+            assert!(
+                (entry.weight - strategy.weight * strategy.probabilities[0] as f64).abs() < 1e-12
+            );
+        }
+        // Only IP's own check is multiplied: OOP compatibility is NOT included.
+        assert_eq!(
+            snapshot.ranges[1]
+                .combos
+                .iter()
+                .find(|e| e.combo == "QcQd".parse::<Combo>().unwrap())
+                .unwrap()
+                .weight,
+            2.5
+        );
+        let conditioned = snapshot.clone().with_card("Ah".parse().unwrap()).unwrap();
+        assert_eq!(
+            conditioned.ranges[0]
+                .combos
+                .iter()
+                .find(|e| e.combo == "AhAd".parse::<Combo>().unwrap())
+                .unwrap()
+                .weight,
+            0.0
+        );
+        let card_node = match &solution.tree().nodes[chance].kind {
+            NodeKind::Chance { cards, children } => {
+                children[cards
+                    .iter()
+                    .position(|&c| c == "Ah".parse::<Card>().unwrap().0)
+                    .unwrap()]
+            }
+            _ => unreachable!(),
+        };
+        let direct = solution.reach_snapshot(card_node).unwrap();
+        for p in 0..2 {
+            for (a, b) in conditioned.ranges[p]
+                .combos
+                .iter()
+                .zip(&direct.ranges[p].combos)
+            {
+                assert_eq!(a.weight, b.weight);
+            }
+        }
+        assert!(snapshot.clone().with_card("2c".parse().unwrap()).is_err());
+        let restored: ReachSnapshot =
+            serde_json::from_str(&serde_json::to_string(&conditioned).unwrap()).unwrap();
+        let result = solve_river(
+            restored.clone(),
+            EngineConfig {
+                threads: 1,
+                ..Default::default()
+            },
+            StopConditions {
+                max_iterations: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.tree().nodes[result.tree().root].pot, restored.pot);
+        assert_eq!(
+            result.tree().nodes[result.tree().root].stacks,
+            restored.stacks
+        );
+        // Raked all-in continuation: centered-pot offset, not invested-only.
+        let bet = action_child(&solution, root, Action::Bet(1000));
+        let allin = action_child(&solution, bet, Action::Call);
+        let terminal = match &solution.tree().nodes[allin].kind {
+            NodeKind::Chance { cards, children } => {
+                children[cards
+                    .iter()
+                    .position(|&c| c == "Ts".parse::<Card>().unwrap().0)
+                    .unwrap()]
+            }
+            _ => unreachable!(),
+        };
+        let allin_snapshot = solution
+            .reach_snapshot(allin)
+            .unwrap()
+            .with_card("Ts".parse().unwrap())
+            .unwrap();
+        assert_eq!(allin_snapshot.invested, [1000; 2]);
+        let source_ev = solution.node_metrics(terminal).unwrap().average_ev;
+        let continuation = solve_river(
+            allin_snapshot.clone(),
+            EngineConfig {
+                threads: 1,
+                ..Default::default()
+            },
+            StopConditions {
+                max_iterations: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let translated = allin_snapshot.source_frame_ev(continuation.root_ev());
+        for p in 0..2 {
+            assert!((source_ev[p] - translated[p]).abs() < 1e-10);
+        }
+        let mut unequal = allin_snapshot;
+        unequal.invested = [200, 300];
+        unequal.pot = 2500;
+        unequal.source_starting_pot = 2000;
+        assert_eq!(unequal.source_frame_ev([1000.0, 1000.0]), [1050.0, 950.0]);
+        assert!(solve_turn(restored, EngineConfig::default(), StopConditions::default()).is_err());
+        assert!(solve_subgame(
+            solution.reach_snapshot(after).unwrap(),
+            EngineConfig::default(),
+            StopConditions::default()
+        )
+        .is_err());
+    }
+    #[test]
+    fn snapshot_conditioning_rejects_malformed_serialized_ranges() {
+        let (mut game, ranges) = example();
+        game.board.truncate(4);
+        let snapshot = ReachSnapshot {
+            source_node: 0,
+            board: game.board,
+            pot: 2000,
+            stacks: [1000; 2],
+            invested: [0; 2],
+            source_starting_pot: 2000,
+            units_per_bb: 1000,
+            ranges,
+            tree_config: game.tree,
+            is_street_start: false,
+            can_deal_next: true,
+        };
+        let mut serialized = serde_json::to_value(&snapshot).unwrap();
+        serialized["ranges"][0]["combos"][0]["combo"]["cards"] = serde_json::json!([200, 201]);
+        let malformed: ReachSnapshot = serde_json::from_value(serialized).unwrap();
+        assert!(malformed.with_card("Ts".parse().unwrap()).is_err());
+        let mut duplicate = snapshot.clone();
+        duplicate.ranges[0]
+            .combos
+            .push(duplicate.ranges[0].combos[0].clone());
+        assert!(duplicate.with_card("Ts".parse().unwrap()).is_err());
+        for weight in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut invalid = snapshot.clone();
+            invalid.ranges[0].combos[0].weight = weight;
+            assert!(invalid.with_card("Ts".parse().unwrap()).is_err());
+        }
+    }
+    #[test]
+    fn suit_alias_reach_and_conditioned_metrics_match_full_tree() {
+        let (mut game, _) = example();
+        game.board = ["2c", "3c", "7c"]
+            .iter()
+            .map(|c| c.parse().unwrap())
+            .collect();
+        game.tree.oop_can_lead_flop = true;
+        game.tree.allow_raises = false;
+        game.engine.threads = 1;
+        game.engine.suit_isomorphism = true;
+        let ranges = [
+            Range::from_json(r#"{"AhAd":1,"AhAs":1,"AdAs":1}"#).unwrap(),
+            Range::from_json(r#"{"KhKd":1,"KhKs":1,"KdKs":1}"#).unwrap(),
+        ];
+        let stop = StopConditions {
+            max_iterations: 1,
+            target_exploitability_pct: 0.0,
+            ..Default::default()
+        };
+        let mut iso = solve(game.clone(), ranges.clone(), stop.clone()).unwrap();
+        assert!(iso.report().merged_chance_children > 0);
+        let mut asymmetric = iso.reaches(iso.tree().root).unwrap();
+        asymmetric[0][0] *= 2.0;
+        assert!(iso
+            .engine
+            .metrics_at_node(iso.tree().root, asymmetric)
+            .is_err());
+        game.engine.suit_isomorphism = false;
+        let mut full = solve(game, ranges, stop).unwrap();
+        let checked = action_child(&iso, iso.tree().root, Action::Check);
+        let chance = action_child(&iso, checked, Action::Check);
+        let node = match &iso.tree().nodes[chance].kind {
+            NodeKind::Chance { cards, children } => {
+                children[cards
+                    .iter()
+                    .position(|&c| c == "Kh".parse::<Card>().unwrap().0)
+                    .unwrap()]
+            }
+            _ => unreachable!(),
+        };
+        let after = action_child(&iso, node, Action::Check);
+        let a = iso.reach_snapshot(after).unwrap();
+        let b = full.reach_snapshot(after).unwrap();
+        for p in 0..2 {
+            for (a, b) in a.ranges[p].combos.iter().zip(&b.ranges[p].combos) {
+                assert!((a.weight - b.weight).abs() < 1e-6);
+            }
+        }
+        let a = iso.node_metrics(after).unwrap();
+        let b = full.node_metrics(after).unwrap();
+        for p in 0..2 {
+            assert!((a.average_ev[p] - b.average_ev[p]).abs() < 1e-6);
+            assert!((a.best_response_ev[p] - b.best_response_ev[p]).abs() < 1e-6);
+        }
+    }
+    #[test]
+    fn flop_subtree_matches_turn_resolve() {
+        let (mut game, ranges) = example();
+        game.board.truncate(3);
+        game.tree.effective_stack = 2000;
+        game.tree.oop_can_lead_flop = false;
+        game.tree.allin_merge_ratio = 0.67;
+        game.tree.allow_raises = false;
+        game.tree.rake_rate = 0.05;
+        game.tree.rake_cap = 3000;
+        game.engine.threads = 1;
+        game.engine.suit_isomorphism = false;
+        let stop = StopConditions {
+            target_exploitability_pct: 0.001,
+            max_iterations: 300,
+            max_seconds: 60.0,
+            metrics_every: 25,
+            ..Default::default()
+        };
+        let mut flop = solve(game.clone(), ranges, stop.clone()).unwrap();
+        let root = flop.tree().root;
+        let checked = action_child(&flop, root, Action::Check);
+        let chance = action_child(&flop, checked, Action::Check);
+        let node = match &flop.tree().nodes[chance].kind {
+            NodeKind::Chance { cards, children } => {
+                children[cards
+                    .iter()
+                    .position(|&c| c == "8s".parse::<Card>().unwrap().0)
+                    .unwrap()]
+            }
+            _ => unreachable!(),
+        };
+        let snapshot = flop.reach_snapshot(node).unwrap();
+        assert_eq!(snapshot.invested, [0; 2]);
+        let original = flop.node_metrics(node).unwrap();
+        let fresh = solve_turn(snapshot.clone(), game.engine, stop).unwrap();
+        let adjusted_ev = snapshot.source_frame_ev(fresh.root_ev());
+        let ev_diff = (0..2)
+            .map(|p| (original.average_ev[p] - adjusted_ev[p]).abs())
+            .fold(0.0, f64::max);
+        let original_strategy = flop.strategy(node).unwrap();
+        let fresh_strategy = fresh.strategy(fresh.tree().root).unwrap();
+        let mut max_diff = 0.0_f64;
+        let mut weighted = 0.0_f64;
+        let mut mass = 0.0;
+        for a in &original_strategy.combos {
+            if let Some(b) = fresh_strategy
+                .combos
+                .iter()
+                .find(|b| b.combo_id == a.combo_id)
+            {
+                for (&x, &y) in a.probabilities.iter().zip(&b.probabilities) {
+                    let diff = (x as f64 - y as f64).abs();
+                    max_diff = max_diff.max(diff);
+                    weighted += a.reach_weight * diff;
+                    mass += a.reach_weight;
+                }
+            }
+        }
+        eprintln!("subgame comparison: flop iterations={} flop exploitability_pct={} conditioned exploitability_pct={} turn iterations={} turn exploitability_pct={} ev_max_diff_chips={} root_strategy_weighted_abs_diff={} root_strategy_max_abs_diff={}", flop.history.len(), flop.metrics.exploitability_pct, original.exploitability_pct, fresh.history.len(), fresh.metrics.exploitability_pct, ev_diff, weighted/mass, max_diff);
+        assert!(
+            original.exploitability_pct < 0.3,
+            "conditioned profile must independently meet accuracy"
+        );
+        assert!(fresh.metrics.exploitability_pct < 0.001);
+        // Distinct equilibria need not yield identical policies. This fixture
+        // compares measured policy AND payoff errors, not only BR gap.
+        assert!(ev_diff < snapshot.pot as f64 * 0.001);
+        assert!(weighted / mass < 0.005);
+        assert!(max_diff < 0.01);
     }
     #[test]
     fn adaptive_exact_checkpoints_and_no_duplicate_final() {

@@ -28,27 +28,122 @@ pub struct SizeContext<'a> {
 #[derive(Clone, Serialize, Deserialize)]
 pub enum SizeRule {
     Fixed(f64),
+    /// Serializable, suit-independent fractions for each street.
+    PerStreet {
+        flop: f64,
+        turn: f64,
+        river: f64,
+    },
     #[serde(skip)]
     Custom(Arc<dyn Fn(&SizeContext<'_>) -> f64 + Send + Sync>),
+    /// Explicit opt-in for a pure callback invariant under suit relabeling.
+    /// Engine construction checks deterministic samples and the actual alias
+    /// subtrees; a failed check disables isomorphism, not the sizing rule.
+    #[serde(skip)]
+    SuitInvariant(Arc<dyn Fn(&SizeContext<'_>) -> f64 + Send + Sync>),
 }
 impl std::fmt::Debug for SizeRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Fixed(v) => f.debug_tuple("Fixed").field(v).finish(),
+            Self::PerStreet { flop, turn, river } => f
+                .debug_struct("PerStreet")
+                .field("flop", flop)
+                .field("turn", turn)
+                .field("river", river)
+                .finish(),
             Self::Custom(_) => f.write_str("Custom"),
+            Self::SuitInvariant(_) => f.write_str("SuitInvariant"),
         }
     }
 }
 impl SizeRule {
-    /// Only fixed rules guarantee invariance under every suit permutation.
+    /// Whether the rule is eligible for checked suit isomorphism. A callback's
+    /// declaration alone is not proof: also call check_suit_invariance.
     pub fn is_suit_invariant(&self) -> bool {
-        matches!(self, Self::Fixed(_))
+        !matches!(self, Self::Custom(_))
     }
     pub fn fraction(&self, c: &SizeContext<'_>) -> f64 {
         match self {
             Self::Fixed(v) => *v,
-            Self::Custom(f) => f(c),
+            Self::PerStreet { flop, turn, river } => match c.street {
+                Street::Flop => *flop,
+                Street::Turn => *turn,
+                Street::River => *river,
+            },
+            Self::Custom(f) | Self::SuitInvariant(f) => f(c),
         }
+    }
+    /// Deterministic random-board validation, using all 24 suit permutations
+    /// and every player/check/first-bet context on every sampled street.
+    /// This is a falsification test, not a proof over all boards. The engine
+    /// additionally verifies actual action/amount equality before aliasing.
+    pub fn check_suit_invariance(&self, seed: u64, samples: usize) -> Result<(), String> {
+        if !self.is_suit_invariant() {
+            return Err("custom sizing rule did not declare suit invariance".into());
+        }
+        if samples == 0 {
+            return Err("suit invariance validation needs at least one sample".into());
+        }
+        let mut random = seed.max(1);
+        for sample in 0..samples {
+            let len = 3 + sample % 3;
+            let street = match len {
+                3 => Street::Flop,
+                4 => Street::Turn,
+                _ => Street::River,
+            };
+            let mut deck: [u8; 52] = std::array::from_fn(|i| i as u8);
+            for i in 0..len {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                deck.swap(i, i + random as usize % (52 - i));
+            }
+            let board = &deck[..len];
+            for player in 0..2 {
+                for first_bet in [false, true] {
+                    for after_check in [false, true] {
+                        let context = SizeContext {
+                            board,
+                            street,
+                            player,
+                            first_bet,
+                            after_check,
+                        };
+                        let expected = self.fraction(&context);
+                        if !expected.is_finite() || expected <= 0.0 {
+                            return Err(format!("invalid sizing fraction in sample {sample}"));
+                        }
+                        for a in 0..4 {
+                            for b in 0..4 {
+                                for c in 0..4 {
+                                    if a == b || a == c || b == c {
+                                        continue;
+                                    }
+                                    let d = 6 - a - b - c;
+                                    let permutation = [a, b, c, d];
+                                    let mapped = board
+                                        .iter()
+                                        .map(|&card| card / 4 * 4 + permutation[card as usize % 4])
+                                        .collect::<Vec<_>>();
+                                    let actual = self.fraction(&SizeContext {
+                                        board: &mapped,
+                                        ..context.clone()
+                                    });
+                                    if actual != expected {
+                                        return Err(format!(
+                                            "sizing rule changes under suit permutation in sample {sample} ({street:?}, player {player}, first_bet {first_bet}, after_check {after_check})"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,10 +165,14 @@ pub struct TreeConfig {
 impl Default for TreeConfig {
     fn default() -> Self {
         Self {
-            starting_pot: 5_000,
+            starting_pot: 5_500,
             effective_stack: 97_500,
             oop_can_lead_flop: false,
-            bet_size: SizeRule::Fixed(0.33),
+            bet_size: SizeRule::PerStreet {
+                flop: 0.33,
+                turn: 0.66,
+                river: 0.66,
+            },
             raise_multiplier: 2.5,
             allin_merge_enabled: true,
             allin_merge_ratio: 0.67,
@@ -449,6 +548,110 @@ mod tests {
         let (a, c) = actions(&t, 0);
         assert_eq!(a[1], Action::Bet(250));
         assert_eq!(actions(&t, c[1]).0, &[Action::Fold, Action::Call]);
+    }
+    #[test]
+    fn production_defaults_round_bets_and_raise_without_a_count_cap() {
+        let cfg = TreeConfig::default();
+        assert_eq!(cfg.starting_pot, 5_500);
+        assert_eq!(cfg.effective_stack, 97_500);
+        assert!(!cfg.oop_can_lead_flop);
+        assert_eq!(cfg.raise_multiplier, 2.5);
+        assert!(cfg.allow_raises && cfg.allin_merge_enabled);
+        assert_eq!(cfg.allin_merge_ratio, 0.67);
+        assert_eq!(cfg.rake_rate, 0.05);
+        assert_eq!(cfg.rake_cap, 3 * BB);
+        for (street, fraction) in [
+            (Street::Flop, 0.33),
+            (Street::Turn, 0.66),
+            (Street::River, 0.66),
+        ] {
+            assert_eq!(
+                cfg.bet_size.fraction(&SizeContext {
+                    board: &[],
+                    street,
+                    player: 0,
+                    first_bet: true,
+                    after_check: false,
+                }),
+                fraction
+            );
+        }
+        let tree = GameTree::build(vec![0, 5, 10, 15, 20], cfg).unwrap();
+        let (root_actions, root_children) = actions(&tree, tree.root);
+        assert_eq!(root_actions, &[Action::Check, Action::Bet(3_630)]);
+        let mut id = root_children[1];
+        let mut totals = vec![3_630];
+        while let Some(index) = actions(&tree, id)
+            .0
+            .iter()
+            .position(|a| matches!(a, Action::Raise(_)))
+        {
+            id = actions(&tree, id).1[index];
+            totals.push(*tree.nodes[id].invested.iter().max().unwrap());
+        }
+        assert_eq!(totals, [3_630, 9_075, 22_688, 56_720, 97_500]);
+        assert_eq!(actions(&tree, id).0, &[Action::Fold, Action::Call]);
+    }
+    #[test]
+    fn allin_merge_is_inclusive_and_uses_remaining_incremental_payment() {
+        for (fraction, expected) in [(0.669, 669), (0.67, 1_000)] {
+            let cfg = TreeConfig {
+                starting_pot: 1_000,
+                effective_stack: 1_000,
+                bet_size: SizeRule::Fixed(fraction),
+                ..config()
+            };
+            let tree = GameTree::build(vec![0, 5, 10, 15, 20], cfg).unwrap();
+            assert_eq!(actions(&tree, tree.root).0[1], Action::Bet(expected));
+        }
+        for (stack, expected) in [(746, 746), (747, 500)] {
+            let cfg = TreeConfig {
+                starting_pot: 400,
+                effective_stack: stack,
+                ..config()
+            };
+            let tree = GameTree::build(vec![0, 5, 10, 15, 20], cfg).unwrap();
+            let response = actions(&tree, tree.root).1[1];
+            assert_eq!(actions(&tree, response).0[2], Action::Raise(expected));
+        }
+    }
+    #[test]
+    fn suit_invariant_checker_covers_board_features_and_contexts() {
+        let rule = SizeRule::SuitInvariant(Arc::new(|c| {
+            let paired = c
+                .board
+                .iter()
+                .enumerate()
+                .any(|(i, card)| c.board[..i].iter().any(|earlier| earlier / 4 == card / 4));
+            let monotone = c.board.iter().all(|card| card % 4 == c.board[0] % 4);
+            0.25 + 0.1 * c.player as f64
+                + if paired || monotone || c.after_check {
+                    0.25
+                } else {
+                    0.0
+                }
+        }));
+        assert!(rule.check_suit_invariance(12345, 64).is_ok());
+        for rule in [
+            SizeRule::SuitInvariant(Arc::new(|c| if c.board[0] % 4 == 0 { 0.25 } else { 0.5 })),
+            SizeRule::SuitInvariant(Arc::new(|c| {
+                if c.player == 1 && !c.first_bet && c.after_check {
+                    c.board[0] as f64 + 1.0
+                } else {
+                    0.5
+                }
+            })),
+        ] {
+            let first = rule.check_suit_invariance(12345, 64).unwrap_err();
+            assert!(first.contains("suit permutation"));
+            assert_eq!(first, rule.check_suit_invariance(12345, 64).unwrap_err());
+        }
+        assert!(SizeRule::Custom(Arc::new(|_| 0.5))
+            .check_suit_invariance(12345, 64)
+            .is_err());
+        assert!(SizeRule::Fixed(0.5)
+            .check_suit_invariance(12345, 0)
+            .is_err());
     }
 }
 
