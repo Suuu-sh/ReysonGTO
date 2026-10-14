@@ -1,0 +1,5 @@
+/target
+/out
+/data
+*.local.json
+.DS_Store
