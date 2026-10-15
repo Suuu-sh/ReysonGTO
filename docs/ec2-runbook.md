@@ -1,8 +1,9 @@
 # EC2 でサイズの比較（M4：代表 120・確認用 40）を回す手順（どの PC からでも、すべてコマンド）
 
-操作する PC には、ReysonGTO（公開）の clone と、AWS CLI・GitHub のトークンがあればよい。
-**レンジ（製品データ）は非公開の `Suuu-sh/ReysonGTO-data` から取り、結果もそこへ 15 分ごとに push される**。
-PC とインスタンスの間でファイルを直接やりとりしない。
+- 操作する PC には、ReysonGTO（公開）の clone と、AWS CLI・GitHub のトークンがあればよい。
+- **AWS で作るのはインスタンス 1 台だけ（名前 `pg-yota-poc`）**。VPC・サブネット・セキュリティグループはデフォルトのものを使い、キーペアは作らない。**SSH もしない**。
+- インスタンスは起動時のスクリプト（ユーザーデータ）で、準備・ビルド・計算の開始までを自分で行う。
+- **レンジ（製品データ）は非公開の `Suuu-sh/ReysonGTO-data` から取り、結果と状態もそこへ 15 分ごとに push される**。
 
 既定：東京（ap-northeast-1）、Graviton の c8g.8xlarge（32 vCPU）のスポット。下の例は c8g.48xlarge（192 vCPU、約 8 時間）。
 
@@ -10,12 +11,12 @@ PC とインスタンスの間でファイルを直接やりとりしない。
 
 ### 0-1. 必要なもの
 
-- macOS：`brew install awscli git`
+- macOS：`brew install awscli gh git`
 - Windows：**WSL（Ubuntu）** を入れて、その中で以下をすべて実行する（PowerShell で `wsl --install`、再起動後に Ubuntu を開く）。
 - Linux / WSL：
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git curl unzip openssh-client
+sudo apt-get update && sudo apt-get install -y git curl unzip gh
 curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o awscliv2.zip
 unzip -q awscliv2.zip && sudo ./aws/install
 ```
@@ -30,7 +31,13 @@ aws configure    # Access key / Secret key / region: ap-northeast-1 / output: js
 aws sts get-caller-identity
 ```
 
-### 0-3. GitHub のトークンを作る（インスタンスが ReysonGTO-data を読み書きするため）
+### 0-3. GitHub CLI にログインする（進み具合を見るため）
+
+```bash
+gh auth login
+```
+
+### 0-4. GitHub のトークンを作る（インスタンスが ReysonGTO-data を読み書きするため）
 
 GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token。
 
@@ -40,9 +47,10 @@ GitHub → Settings → Developer settings → Personal access tokens → **Fine
 | Permissions | Repository permissions → **Contents: Read and write** |
 | Expiration | 7 日など短く |
 
-作ったトークンは、起動のときに環境変数 `DATA_TOKEN` で渡す（ファイルやリポジトリには保存しない）。
+トークンは起動のときに環境変数 `DATA_TOKEN` で渡す。インスタンスのユーザーデータに入る（EC2 の権限がある人には見える）ので、
+**このリポジトリだけ・短い期限**にし、終わったら削除する。
 
-### 0-4. ReysonGTO を取ってくる
+### 0-5. ReysonGTO を取ってくる
 
 ```bash
 git clone https://github.com/Suuu-sh/ReysonGTO.git ~/ReysonGTO
@@ -82,29 +90,28 @@ read -rs DATA_TOKEN && export DATA_TOKEN      # トークンを貼り付けて E
 TYPE=c8g.48xlarge tools/ec2/launch.sh
 ```
 
-これで次がすべて自動で行われる。
+`launch.sh` がすること：
 
-1. Ubuntu 24.04（arm64）のイメージを探し、キーペア（`~/.ssh/pg-yota-poc.pem`）と、この PC の IP からの SSH だけを許すセキュリティグループを作る
-2. スポットインスタンスを買う（中断されたら停止し、空きが戻ったら同じディスクで再開する設定）
-3. インスタンスに GitHub のトークンを渡し（権限 600 のファイル）、ツールの導入とビルド、ReysonGTO-data からレンジを取得
-4. 代表 120・確認用 40 を選び、CPU とメモリに合わせた数（c8g.48xlarge なら 16）の分担で計算を開始
-5. **15 分ごとに結果を ReysonGTO-data の `results/m4b/` へ push**（インスタンスが再起動しても自動で再開）
+1. Ubuntu 24.04（arm64）のイメージと、デフォルトの VPC・サブネット・セキュリティグループを探す
+2. スポットインスタンスを 1 台買う（名前 `pg-yota-poc`。中断されたら停止し、空きが戻ったら同じディスクで再開する設定）
+3. 起動を待って終わる（**このあと PC は閉じてよい**）
 
-インスタンスの情報はこの PC の `~/ReysonGTO/.local/ec2.env` に記録される（Git には入らない）。
+インスタンスが自分ですること（ユーザーデータ）：
+
+1. ツールの導入、ReysonGTO の取得とビルド、ReysonGTO-data からレンジの取得（約 10 分）
+2. 代表 120・確認用 40 を選び、CPU とメモリに合わせた数（c8g.48xlarge なら 16）の分担で計算を開始
+3. 15 分ごとに結果と状態を ReysonGTO-data の `results/m4b/` へ push（再起動しても自動で再開。完了を push したら止まる）
+4. 準備に失敗したら、そのログを `results/m4b/setup-failed.log` として push する
 
 ### ネットワークと名前
 
-| 項目 | 既定 | 変える場合 |
-|---|---|---|
-| VPC | そのリージョンの**デフォルト VPC** | `VPC_ID=vpc-xxxx` |
-| サブネット | その VPC のデフォルトのサブネット（なければ最初のサブネット）。**パブリック IP を付ける** | `SUBNET_ID=subnet-xxxx`（インターネットゲートウェイへの経路が必要） |
-| セキュリティグループ | `pg-yota-poc`。**入る通信は SSH（22 番）を、起動した PC の IP（/32）からだけ**。出る通信は全部許可（GitHub とパッケージの取得のため） | `SG_NAME=...` |
-| キーペア | `pg-yota-poc`（秘密鍵は `~/.ssh/pg-yota-poc.pem`、権限 400） | `KEY_NAME=...`、`KEY_PATH=...` |
-| Name タグ | インスタンス・ディスク・セキュリティグループ・キーペアに `pg-yota-poc` | `NAME=...`（終了のときも同じ名前を指定） |
-
-例：`VPC_ID=vpc-0abc SUBNET_ID=subnet-0def TYPE=c8g.48xlarge tools/ec2/launch.sh`
-
-別の PC から起動し直すと、セキュリティグループに、その PC の IP からの SSH が追加で許可される（前の PC の IP は残る）。
+| 項目 | 使うもの |
+|---|---|
+| VPC・サブネット | デフォルト VPC とそのデフォルトのサブネット（変える場合 `VPC_ID=` / `SUBNET_ID=`。インターネットへの経路が必要） |
+| セキュリティグループ | その VPC の **default**（入る通信は不要。出る通信で GitHub とパッケージを取得） |
+| パブリック IP | 付ける（GitHub に出るため） |
+| キーペア・SSH | 使わない |
+| 名前 | インスタンスの Name タグ `pg-yota-poc` だけ |
 
 ### 時間と費用の目安（概算。1 ボード約 45 分、同時に解く 1 つあたり 1 時間に約 1.3 ボード）
 
@@ -114,48 +121,31 @@ TYPE=c8g.48xlarge tools/ec2/launch.sh
 | c8g.16xlarge | 5 | 約 1 ドル | 約 1 日 | 約 25〜30 ドル |
 | c8g.48xlarge | 16 | 約 2.5〜3 ドル | 約 8 時間 | 約 25〜30 ドル |
 
-## 4. 進み具合を見る（GitHub で。PC を閉じてもよい）
-
-`launch.sh` が最後に `done. results appear in ...` と出したら、計算と結果の push はインスタンスの中で動いているので、
-**起動した PC は閉じてよい**。進み具合はどの PC からでも見られる（GitHub CLI でログインしていれば）：
+## 4. 進み具合を見る（どの PC からでも）
 
 ```bash
-tools/ec2/progress.sh            # 今の status.txt
+tools/ec2/progress.sh            # ReysonGTO-data の status.txt（GitHub CLI）
 tools/ec2/progress.sh --watch    # 5 分ごとに更新し、完了したら知らせて止まる
+tools/ec2/console.sh             # status.txt が出る前の準備の様子（AWS のコンソール出力）
 ```
 
-ブラウザなら：
+ブラウザなら `https://github.com/Suuu-sh/ReysonGTO-data/blob/main/results/m4b/status.txt`。1 行目が全体の状態：
 
-- `https://github.com/Suuu-sh/ReysonGTO-data/blob/main/results/m4b/status.txt`：1 行目が全体の状態
-  - **「状態：完了」なら終わり**（全ボードが完了し、計算も止まっている）
-  - 「状態：計算中」なら続いている（`boards complete: N / 160` が進み具合）
-  - 「状態：停止（未完了あり…）」なら、途中で止まっている（`tools/ec2/remote.sh resume` で再開）
-  - 15 分ごとに更新される（`updated:` の時刻を見る。1 時間以上古ければ、インスタンスが止まっている可能性がある）
-- 完了したときのコミットは「results/m4b 完了 …」というメッセージになるので、ReysonGTO-data のコミット一覧でも分かる
-- 自動のコミットは、この完了のコミットを push したところで止まる（終了までの間にコミットが増え続けることはない）
-- `results/m4b/report.md`：その時点までの集計
+- **「状態：完了」なら終わり**（全ボードが完了し、計算も止まっている）
+- 「状態：計算中」なら続いている（`boards complete: N / 160` が進み具合）
+- 「状態：停止（未完了あり…）」なら途中で止まっている → `tools/ec2/resume.sh`（インスタンスを再起動して続きから）
+- `updated:` の時刻が 1 時間以上古ければ、インスタンスが止まっている可能性がある（スポットの中断など）
+- `results/m4b/setup-failed.log` があれば、準備に失敗している（中身を見て、`terminate.sh` で終了してから直して起動し直す）
 
-インスタンスを直接操作したい場合（起動した PC から。`.local/ec2.env` を使う）：
-
-```bash
-tools/ec2/remote.sh status    # 今の状態
-tools/ec2/remote.sh collect   # 今すぐ結果を push させる
-tools/ec2/remote.sh resume    # 止まっていたら続きから再開
-tools/ec2/remote.sh stop      # 計算を止める
-tools/ec2/remote.sh ssh       # インスタンスに入る
-```
+完了したときのコミットは「results/m4b 完了 …」というメッセージになるので、ReysonGTO-data のコミット一覧でも分かる。
 
 ## 5. 終わったら（「状態：完了」を確認してから。どの PC からでもよい）
 
-完了の結果は自動で push 済みなので、そのまま終了してよい。AWS CLI でログインしている PC なら、起動した PC でなくてもよい
-（起動した PC でなければ、インスタンスの名前 `pg-yota-poc` で探す）。
-
 ```bash
-tools/ec2/terminate.sh             # スポットのリクエストを取り消し、インスタンスを終了（確認あり）
-tools/ec2/terminate.sh --cleanup   # さらにセキュリティグループとキーペアも消す
+tools/ec2/terminate.sh     # 名前 pg-yota-poc のインスタンスのスポットのリクエストを取り消し、終了（確認あり）
 ```
 
-- 完了の前に止める場合は、先に `tools/ec2/remote.sh collect`（起動した PC から）で最新の結果を push してから終了する（ディスクごと消える）。
+- 完了の結果は自動で push 済みなので、そのまま終了してよい。完了の前に止めると、最後の push より新しい結果は失われる。
 - スポットのリクエストを取り消さずにインスタンスだけ終了すると、代わりのインスタンスが立ち上がるので、必ずこのスクリプトで終了する。
 - 使い終わったトークンは GitHub で削除する。
 
@@ -169,8 +159,7 @@ aws ec2 describe-instances --region ap-northeast-1 \
 
 ## 補足
 
-- スクリプト：`launch.sh`・`deploy.sh`・`remote.sh`・`collect.sh`（起動した PC）、`progress.sh`（GitHub CLI がある PC）、`terminate.sh`（AWS CLI がある PC）、
-  `bootstrap.sh`・`run.sh`・`status.sh`・`sync.sh`（インスタンス）。
+- スクリプト：`launch.sh`（購入と起動）、`progress.sh`（進み具合、GitHub CLI）、`console.sh`（準備の様子）、`resume.sh`（再開）、
+  `terminate.sh`（終了）は操作する PC で。`user-data.sh`・`bootstrap.sh`・`run.sh`・`status.sh`・`sync.sh` はインスタンスの中で動く。
 - 比べるボードの数：`TRAINING=200 VALIDATION=80 TYPE=... tools/ec2/launch.sh`
 - 計算の中身は `tools/m4_trial.py`（全候補を約 5%、上位 2 つを約 0.5% で解く。1 つの解ごとに保存し、再開できる）。
-- `remote.sh` と `collect.sh` は、起動した PC の `.local/ec2.env`（と SSH の鍵）を使う。`progress.sh` と `terminate.sh` は、どの PC からでも使える。

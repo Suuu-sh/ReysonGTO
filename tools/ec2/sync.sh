@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs ON the EC2 instance: summarizes the run and pushes results (not the large solution files)
-# to the private data repository. run.sh calls this every 15 minutes; collect.sh calls it once.
+# to the private data repository. run.sh starts a loop that calls this every 15 minutes.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 OUT="${OUT:-data/m4b}"

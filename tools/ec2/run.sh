@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 OUT="${OUT:-data/m4b}"
-# Empty values (from deploy.sh) fall back to the defaults.
+# Empty values (from the launch user data) fall back to the defaults.
 TRAINING="${TRAINING:-}"; TRAINING="${TRAINING:-120}"
 VALIDATION="${VALIDATION:-}"; VALIDATION="${VALIDATION:-40}"
 THREADS="${THREADS:-12}"
@@ -15,7 +15,7 @@ if [ -f "$HOME/.cargo/env" ]; then
   source "$HOME/.cargo/env"
 fi
 for f in data/ranges/btn_open.json data/ranges/bb_call.json target/release/cli target/release/sizing; do
-  [ -e "$f" ] || { echo "missing $f (run deploy.sh / bootstrap.sh first)" >&2; exit 1; }
+  [ -e "$f" ] || { echo "missing $f (run bootstrap.sh first)" >&2; exit 1; }
 done
 if pgrep -f "tools/m4_trial.py --out $OUT" >/dev/null; then
   echo "shards for $OUT are already running; see tools/ec2/status.sh" >&2

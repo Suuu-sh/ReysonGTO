@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runs ON the EC2 instance (deploy.sh sends it over SSH): installs tools, clones and builds.
-# Usage: bash bootstrap.sh [branch] [data-repo]
-# The GitHub credentials for the private data repository are set up by deploy.sh beforehand.
+# Runs ON the EC2 instance as the ubuntu user (started by the launch user data): installs tools,
+# clones and builds, and fetches the ranges. Usage: bash bootstrap.sh [branch] [data-repo]
+# The GitHub credentials for the private data repository are set up by the user data beforehand.
 set -euo pipefail
 BRANCH="${1:-main}"
 DATA_REPO="${2:-Suuu-sh/ReysonGTO-data}"
