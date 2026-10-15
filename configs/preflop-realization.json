@@ -1,0 +1,66 @@
+{
+  "limp": {
+    "ip": {
+      "pair": 1.0,
+      "suited_connector": 1.03,
+      "suited": 0.99,
+      "offsuit_broadway": 0.97,
+      "offsuit": 0.89
+    },
+    "oop": {
+      "pair": 0.85,
+      "suited_connector": 0.88,
+      "suited": 0.84,
+      "offsuit_broadway": 0.82,
+      "offsuit": 0.74
+    }
+  },
+  "srp": {
+    "ip": {
+      "pair": 1.02,
+      "suited_connector": 1.05,
+      "suited": 1.01,
+      "offsuit_broadway": 0.99,
+      "offsuit": 0.91
+    },
+    "oop": {
+      "pair": 0.87,
+      "suited_connector": 0.9,
+      "suited": 0.86,
+      "offsuit_broadway": 0.84,
+      "offsuit": 0.76
+    }
+  },
+  "three_bet": {
+    "ip": {
+      "pair": 1.02,
+      "suited_connector": 1.05,
+      "suited": 1.01,
+      "offsuit_broadway": 0.99,
+      "offsuit": 0.91
+    },
+    "oop": {
+      "pair": 0.9,
+      "suited_connector": 0.93,
+      "suited": 0.89,
+      "offsuit_broadway": 0.87,
+      "offsuit": 0.79
+    }
+  },
+  "four_bet": {
+    "ip": {
+      "pair": 1.02,
+      "suited_connector": 1.05,
+      "suited": 1.01,
+      "offsuit_broadway": 0.99,
+      "offsuit": 0.91
+    },
+    "oop": {
+      "pair": 0.96,
+      "suited_connector": 0.99,
+      "suited": 0.95,
+      "offsuit_broadway": 0.93,
+      "offsuit": 0.85
+    }
+  }
+}

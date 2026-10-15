@@ -1,0 +1,25 @@
+{
+  "game": "Synthetic HU test",
+  "players": 2,
+  "stack_bb": 40.0,
+  "ante_bb": 0.0,
+  "rake": { "rate": 0.05, "cap_bb": 2.0, "no_flop_no_drop": true },
+  "positions": ["BTN", "BB"],
+  "dead_blind_bb": 0.5,
+  "sizing": {
+    "open_sizes_bb": [2.0],
+    "open_sizes_by_position": { "SB": 3.0 },
+    "limp": { "sb_complete_to_bb": 1.0 },
+    "fixed_raise_to_bb": {
+      "three_bet": { "ip": 7.0, "oop": 9.0 },
+      "three_bet_vs_sb_open": 9.0,
+      "iso_vs_limp": 3.0,
+      "limp_reraise": 9.0,
+      "squeeze": { "ip": 10.0, "oop": 11.0, "per_additional_caller": 2.0 },
+      "four_bet": { "ip": 21.0, "oop": 18.0 },
+      "four_bet_vs_bb_three_bet_from_sb": 20.0
+    },
+    "five_bet_all_in": true
+  },
+  "solver": { "iterations": 10, "strategy": "dcfr" }
+}
