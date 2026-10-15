@@ -4,7 +4,8 @@ use cfr::{Algorithm, EngineConfig};
 use clap::{Parser, Subcommand, ValueEnum};
 use ranges::Range;
 use serde::Serialize;
-use solver::{solve, GameSpec, StopConditions};
+use solver::{solve, solve_with_progress, GameSpec, StopConditions};
+mod compare;
 use std::{
     fs,
     io::Write,
@@ -28,6 +29,11 @@ enum Method {
     Dcfr,
     CfrPlus,
 }
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Storage {
+    F32,
+    I16,
+}
 #[derive(Subcommand)]
 enum Command {
     Solve {
@@ -46,6 +52,27 @@ enum Command {
         bet: f64,
         #[arg(long)]
         oop_leads: bool,
+        #[arg(long, default_value_t = BB)]
+        units_per_bb: i64,
+        #[arg(long, default_value_t = 2.5)]
+        raise_multiplier: f64,
+        #[arg(long, default_value_t = 0.67)]
+        allin_merge_ratio: f64,
+        #[arg(long)]
+        no_allin_merge: bool,
+        #[arg(long, default_value_t = 10)]
+        metrics_every: usize,
+        /// Flush setup and fresh metric checkpoint JSONL while solving.
+        #[arg(long)]
+        progress_jsonl: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = Storage::F32)]
+        storage: Storage,
+        #[arg(long, default_value_t = 1.5)]
+        dcfr_alpha: f64,
+        #[arg(long, default_value_t = 0.0)]
+        dcfr_beta: f64,
+        #[arg(long, default_value_t = 2.0)]
+        dcfr_gamma: f64,
         #[arg(long, default_value_t = 0.05)]
         rake: f64,
         #[arg(long, default_value_t = 3.0)]
@@ -68,6 +95,15 @@ enum Command {
         /// Conservative memory budget in MiB; also bounds arena construction.
         #[arg(long, default_value_t = 8192)]
         memory_mb: usize,
+    },
+    /// Compare local output reports against copied benchmark CSVs only.
+    Compare {
+        #[arg(long, alias = "report")]
+        solution: PathBuf,
+        #[arg(long, alias = "reference", default_value = "data/benchmark")]
+        reference_dir: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Three small synthetic cases, not production-range throughput claims.
     Bench {
@@ -92,11 +128,15 @@ fn parse_board(text: &str) -> Result<Vec<Card>> {
     cards::validate_board(&board).map_err(|e| anyhow!(e))?;
     Ok(board)
 }
+#[cfg(test)]
 fn chips(bb: f64) -> Result<i64> {
-    if !bb.is_finite() || bb < 0.0 || bb * BB as f64 >= i64::MAX as f64 {
+    chips_at(bb, BB)
+}
+fn chips_at(bb: f64, units: i64) -> Result<i64> {
+    if units <= 0 || !bb.is_finite() || bb < 0.0 || bb * units as f64 >= i64::MAX as f64 {
         bail!("BB amount must be finite, nonnegative and representable");
     }
-    Ok((bb * BB as f64).round() as i64)
+    Ok((bb * units as f64).round() as i64)
 }
 fn read_range(path: PathBuf) -> Result<Range> {
     let text = fs::read_to_string(&path)
@@ -142,6 +182,16 @@ fn main() -> Result<()> {
             ip_range,
             bet,
             oop_leads,
+            units_per_bb,
+            raise_multiplier,
+            allin_merge_ratio,
+            no_allin_merge,
+            metrics_every,
+            progress_jsonl,
+            storage,
+            dcfr_alpha,
+            dcfr_beta,
+            dcfr_gamma,
             rake,
             rake_cap,
             target,
@@ -158,13 +208,17 @@ fn main() -> Result<()> {
             }
             let spec = GameSpec {
                 board: parse_board(&board)?,
+                units_per_bb,
                 tree: TreeConfig {
-                    starting_pot: chips(pot)?,
-                    effective_stack: chips(stack)?,
+                    starting_pot: chips_at(pot, units_per_bb)?,
+                    effective_stack: chips_at(stack, units_per_bb)?,
                     oop_can_lead_flop: oop_leads,
                     bet_size: SizeRule::Fixed(bet / 100.0),
                     rake_rate: rake,
-                    rake_cap: chips(rake_cap)?,
+                    rake_cap: chips_at(rake_cap, units_per_bb)?,
+                    raise_multiplier,
+                    allin_merge_ratio,
+                    allin_merge_enabled: !no_allin_merge,
                     ..TreeConfig::default()
                 },
                 engine: EngineConfig {
@@ -178,15 +232,42 @@ fn main() -> Result<()> {
                         .checked_mul(1024 * 1024)
                         .ok_or_else(|| anyhow!("memory limit overflow"))?,
                     profiling: true,
+                    storage_mode: match storage {
+                        Storage::F32 => cfr::StorageMode::F32,
+                        Storage::I16 => cfr::StorageMode::I16,
+                    },
+                    dcfr_alpha,
+                    dcfr_beta,
+                    dcfr_gamma,
                 },
             };
-            let solution = solve(
+            let mut progress_file = progress_jsonl
+                .map(|path| {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .with_context(|| format!("cannot create progress {}", path.display()))
+                })
+                .transpose()?;
+            let solution = solve_with_progress(
                 spec,
                 [read_range(oop_range)?, read_range(ip_range)?],
                 StopConditions {
                     target_exploitability_pct: target,
                     max_iterations: max_iters,
                     max_seconds,
+                    metrics_every,
+                },
+                |event| {
+                    let line = serde_json::to_string(event).map_err(|e| e.to_string())?;
+                    eprintln!("{line}");
+                    if let Some(file) = &mut progress_file {
+                        writeln!(file, "{line}")
+                            .and_then(|_| file.flush())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
                 },
             )
             .map_err(|e| anyhow!(e))?;
@@ -203,6 +284,19 @@ fn main() -> Result<()> {
             );
         }
         Command::Bench { threads, max_iters } => bench(threads, max_iters)?,
+        Command::Compare {
+            solution,
+            reference_dir,
+            out,
+        } => {
+            let report = compare::run(&solution, &reference_dir)?;
+            let bytes = serde_json::to_vec_pretty(&report)?;
+            if let Some(path) = out {
+                write_atomic(&path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+        }
     }
     Ok(())
 }
@@ -236,6 +330,7 @@ fn bench(threads: usize, max_iters: usize) -> Result<()> {
         let ip = Range::from_json(r#"{"Th5h":1,"9h7h":1,"8h6h":1}"#).map_err(|e| anyhow!(e))?;
         let spec = GameSpec {
             board: parse_board(board)?,
+            units_per_bb: BB,
             tree: TreeConfig {
                 starting_pot: 2 * BB,
                 effective_stack: BB,
@@ -254,6 +349,7 @@ fn bench(threads: usize, max_iters: usize) -> Result<()> {
             target_exploitability_pct: 0.0,
             max_iterations: max_iters,
             max_seconds: 300.0,
+            metrics_every: 1,
         };
         let solution =
             solve(spec.clone(), [oop.clone(), ip.clone()], stop.clone()).map_err(|e| anyhow!(e))?;

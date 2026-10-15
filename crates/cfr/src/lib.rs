@@ -1,9 +1,10 @@
 //! Clean-room vector alternating CFR. Values are net future receipts minus future
 //! investments and half the starting pot (so zero-rake values sum to zero).
 //! Dense combo IDs stay stable across streets; newly blocked hands have zero strategy.
-//! Optional suit reduction uses the subgroup fixing every supplied combo pointwise
-//! and a suit-invariant size rule. This conservative subgroup needs identity combo
-//! remapping; arbitrary asymmetric ranges fall back to the unmerged exact tree.
+//! Suit reduction uses only board-history stabilizers preserving BOTH exact weighted
+//! ranges. Dense combo permutations map representative values back to physical cards.
+//! Persistent regret/average slabs are f32 or per-node scaled i16; traversal scratch
+//! is depth-local (and independent only at the first parallel chance boundary).
 use cards::{evaluate7, Card, SuitPermutation};
 use ranges::DenseRange;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,35 @@ pub struct EngineConfig {
     pub memory_limit_bytes: usize,
     pub suit_isomorphism: bool,
     pub profiling: bool,
+    #[serde(default)]
+    pub storage_mode: StorageMode,
+    #[serde(default = "default_alpha")]
+    pub dcfr_alpha: f64,
+    #[serde(default)]
+    pub dcfr_beta: f64,
+    #[serde(default = "default_gamma")]
+    pub dcfr_gamma: f64,
+}
+fn default_alpha() -> f64 {
+    1.5
+}
+fn default_gamma() -> f64 {
+    2.0
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StorageMode {
+    #[default]
+    F32,
+    I16,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct WorkProfile {
+    pub showdown_seconds: f64,
+    pub fold_seconds: f64,
+    pub regret_seconds: f64,
+    pub chance_seconds: f64,
+    pub best_response_seconds: f64,
+    pub training_seconds: f64,
 }
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -34,6 +64,10 @@ impl Default for EngineConfig {
             memory_limit_bytes: 2 * 1024 * 1024 * 1024,
             suit_isomorphism: false,
             profiling: false,
+            storage_mode: StorageMode::F32,
+            dcfr_alpha: 1.5,
+            dcfr_beta: 0.0,
+            dcfr_gamma: 2.0,
         }
     }
 }
@@ -45,60 +79,267 @@ pub struct Metrics {
     pub exploitability_pct: f64,
 }
 
-// Each node's three action-major buffers are contiguous; all traversal scratch
-// is allocated at construction, including scratch for every parallel chance child.
+// Small recursive metadata; no combo-sized buffers are retained per tree node.
 struct State {
     id: usize,
     children: Vec<State>,
-    reach: [Vec<f64>; 2],
-    value: Vec<f64>,
     offset: usize,
     own_len: usize,
     span: usize,
-    terminal_nanos: u128,
-    chance_weights: Vec<usize>,
+    scales: [f32; 2],
+    work: [u128; 4],         // showdown, fold, regret, chance (exclusive)
+    orbits: Vec<Vec<usize>>, // indices of dense combo permutations, member -> representative
+    parallel_scratch: Vec<Vec<Level>>,
+}
+struct Level {
+    reach: [Vec<f64>; 2],
+    value: Vec<f64>,
+    action_values: Vec<f64>,
+    strategy: Vec<f32>,
+    regret: Vec<f32>,
+    average: Vec<f32>,
+    average_path_reach: Vec<f64>,
+}
+fn levels(depth: usize, actions: usize, n: [usize; 2]) -> Vec<Level> {
+    (0..depth)
+        .map(|_| Level {
+            reach: [vec![0.0; n[0]], vec![0.0; n[1]]],
+            value: vec![0.0; n[0].max(n[1])],
+            action_values: vec![0.0; actions * n[0].max(n[1])],
+            strategy: vec![0.0; actions * n[0].max(n[1])],
+            regret: vec![0.0; actions * n[0].max(n[1])],
+            average: vec![0.0; actions * n[0].max(n[1])],
+            average_path_reach: vec![0.0; n[0].max(n[1])],
+        })
+        .collect()
+}
+fn tree_shape(tree: &GameTree, id: usize) -> (usize, usize) {
+    let (children, own_actions) = match &tree.nodes[id].kind {
+        NodeKind::Decision {
+            children, actions, ..
+        } => (children.as_slice(), actions.len()),
+        NodeKind::Chance { children, .. } => (children.as_slice(), 0),
+        _ => (&[][..], 0),
+    };
+    let mut shape = (1, own_actions);
+    for &child in children {
+        let s = tree_shape(tree, child);
+        shape.0 = shape.0.max(1 + s.0);
+        shape.1 = shape.1.max(s.1);
+    }
+    shape
 }
 impl State {
-    fn new(tree: &GameTree, id: usize, n: [usize; 2], offset: usize) -> Self {
-        let (children, count) = match &tree.nodes[id].kind {
+    fn new(
+        tree: &GameTree,
+        id: usize,
+        n: [usize; 2],
+        offset: usize,
+        aliases: &[usize],
+        alias_perms: &[usize],
+        parallel: bool,
+    ) -> Self {
+        let (ids, count, chance) = match &tree.nodes[id].kind {
             NodeKind::Decision {
                 player,
                 children,
                 actions,
-            } => (children.as_slice(), actions.len() * n[*player]),
-            NodeKind::Chance { children, .. } => (children.as_slice(), 0),
-            NodeKind::Terminal { .. } => (&[][..], 0),
+            } => (children.as_slice(), actions.len() * n[*player], false),
+            NodeKind::Chance { children, .. } => (children.as_slice(), 0, true),
+            _ => (&[][..], 0, false),
         };
         let mut end = offset + count;
-        let children: Vec<_> = children
-            .iter()
-            .map(|&c| {
-                let child = Self::new(tree, c, n, end);
-                end += child.span;
-                child
-            })
-            .collect();
-        let child_count = children.len();
+        let mut children = Vec::new();
+        let mut orbits = Vec::new();
+        let mut parallel_scratch = Vec::new();
+        for &c in ids {
+            if chance && aliases[c] != c {
+                continue;
+            }
+            let child = Self::new(tree, c, n, end, aliases, alias_perms, parallel && !chance);
+            end += child.span;
+            if chance {
+                orbits.push(
+                    ids.iter()
+                        .filter(|&&x| x == c || aliases[x] == c)
+                        .map(|&x| if x == c { 0 } else { alias_perms[x] })
+                        .collect(),
+                );
+                if parallel {
+                    let shape = tree_shape(tree, c);
+                    parallel_scratch.push(levels(shape.0, shape.1, n));
+                }
+            }
+            children.push(child);
+        }
         Self {
             id,
             children,
-            reach: [vec![0.0; n[0]], vec![0.0; n[1]]],
-            value: vec![0.0; n[0].max(n[1])],
             offset,
             own_len: count,
             span: end - offset,
-            terminal_nanos: 0,
-            chance_weights: vec![1; child_count],
+            scales: [1.0; 2],
+            work: [0; 4],
+            orbits,
+            parallel_scratch,
         }
     }
     fn find(&self, id: usize) -> Option<&Self> {
         if self.id == id {
-            return Some(self);
+            Some(self)
+        } else {
+            self.children.iter().find_map(|s| s.find(id))
         }
-        self.children.iter().find_map(|s| s.find(id))
     }
-    fn terminal_nanos(&self) -> u128 {
-        self.terminal_nanos + self.children.iter().map(Self::terminal_nanos).sum::<u128>()
+    fn work(&self) -> [u128; 4] {
+        let mut w = self.work;
+        for c in &self.children {
+            for (a, b) in w.iter_mut().zip(c.work()) {
+                *a += b;
+            }
+        }
+        w
+    }
+}
+#[derive(Clone)]
+struct ComboPermutation {
+    suit: SuitPermutation,
+    indices: [Vec<usize>; 2],
+}
+enum Slab {
+    F32(Vec<f32>),
+    I16(Vec<i16>),
+}
+impl Slab {
+    #[cfg(test)]
+    fn f32_mut(&mut self) -> &mut [f32] {
+        match self {
+            Self::F32(v) => v,
+            Self::I16(_) => panic!("test expects f32"),
+        }
+    }
+    #[cfg(test)]
+    fn bits(&self) -> Vec<u32> {
+        match self {
+            Self::F32(v) => v.iter().map(|x| x.to_bits()).collect(),
+            Self::I16(v) => v.iter().map(|&x| x as u32).collect(),
+        }
+    }
+    fn new(mode: StorageMode, len: usize) -> Self {
+        match mode {
+            StorageMode::F32 => Self::F32(vec![0.0; len]),
+            StorageMode::I16 => Self::I16(vec![0; len]),
+        }
+    }
+    fn slice(&mut self) -> SlabSlice<'_> {
+        match self {
+            Self::F32(v) => SlabSlice::F32(v),
+            Self::I16(v) => SlabSlice::I16(v),
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn normalize_policy(
+        &self,
+        offset: usize,
+        len: usize,
+        output: &mut [f32],
+        n: usize,
+        actions: usize,
+        masks: &[u64],
+        board: u64,
+    ) {
+        match self {
+            Self::F32(v) => normalize(&v[offset..offset + len], output, n, actions, masks, board),
+            Self::I16(v) => {
+                normalize_i16(&v[offset..offset + len], output, n, actions, masks, board)
+            }
+        }
+    }
+    #[cfg(test)]
+    fn read(&self, offset: usize, out: &mut [f32], scale: f32) {
+        match self {
+            Self::F32(v) => out.copy_from_slice(&v[offset..offset + out.len()]),
+            Self::I16(v) => {
+                for (x, &q) in out.iter_mut().zip(&v[offset..]) {
+                    *x = q as f32 * scale;
+                }
+            }
+        }
+    }
+}
+enum SlabSlice<'a> {
+    F32(&'a mut [f32]),
+    I16(&'a mut [i16]),
+}
+impl<'a> SlabSlice<'a> {
+    fn split(self, at: usize) -> (Self, Self) {
+        match self {
+            Self::F32(v) => {
+                let (a, b) = v.split_at_mut(at);
+                (Self::F32(a), Self::F32(b))
+            }
+            Self::I16(v) => {
+                let (a, b) = v.split_at_mut(at);
+                (Self::I16(a), Self::I16(b))
+            }
+        }
+    }
+    fn read(&self, out: &mut [f32], scale: f32) {
+        match self {
+            Self::F32(v) => out.copy_from_slice(v),
+            Self::I16(v) => {
+                for (x, &q) in out.iter_mut().zip(v.iter()) {
+                    *x = q as f32 * scale;
+                }
+            }
+        }
+    }
+    fn normalize_policy(
+        &self,
+        output: &mut [f32],
+        n: usize,
+        actions: usize,
+        masks: &[u64],
+        board: u64,
+    ) {
+        match self {
+            Self::F32(v) => normalize(v, output, n, actions, masks, board),
+            // The node's strictly positive scale cancels in every policy ratio.
+            // Normalizing exact stored integers also avoids f32 decode rounding.
+            Self::I16(v) => normalize_i16(v, output, n, actions, masks, board),
+        }
+    }
+    fn write(&mut self, input: &[f32], scale: &mut f32) {
+        match self {
+            Self::F32(v) => v.copy_from_slice(input),
+            Self::I16(v) => {
+                let max = input.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                // A tiny nonzero node must not produce scale=0 or an infinite
+                // f32 reciprocal (both would erase/sign-saturate its policy).
+                *scale = if max > 0.0 {
+                    (max / 32767.0).max(f32::from_bits(1))
+                } else {
+                    1.0
+                };
+                let inverse = 1.0 / *scale;
+                if inverse.is_finite() {
+                    for (q, &x) in v.iter_mut().zip(input) {
+                        *q = (x * inverse).round() as i16;
+                    }
+                } else {
+                    // Subnormal scale rounding can undershoot by a sizeable
+                    // fraction of one step. Round it upward before encoding so
+                    // the largest signed value cannot saturate by many steps.
+                    if max as f64 > 32767.0 * *scale as f64 {
+                        *scale = f32::from_bits(scale.to_bits() + 1);
+                    }
+                    let inverse = 1.0 / *scale as f64;
+                    for (q, &x) in v.iter_mut().zip(input) {
+                        *q = (x as f64 * inverse).round() as i16;
+                    }
+                }
+            }
+        }
     }
 }
 struct RankTable {
@@ -113,6 +354,10 @@ struct Context<'a> {
     tables: &'a [RankTable],
     terminal_table: &'a [Option<usize>],
     config: &'a EngineConfig,
+    permutations: &'a [ComboPermutation],
+    average_reach_scale: &'a [Vec<f64>; 2],
+    initial_reach: &'a [Vec<f64>; 2],
+    discounts: [f64; 3],
     iteration: usize,
 }
 #[derive(Clone, Copy)]
@@ -132,70 +377,93 @@ pub struct Engine {
     tables: Vec<RankTable>,
     terminal_table: Vec<Option<usize>>,
     initial_reach: [Vec<f64>; 2],
+    average_reach_scale: [Vec<f64>; 2],
     joint_mass: f64,
     iterations: usize,
     memory_bytes: usize,
     pool: Arc<rayon::ThreadPool>,
     aliases: Vec<usize>,
     merged_children: usize,
-    regret: Vec<f32>,
-    average: Vec<f32>,
-    strategy: Vec<f32>,
+    regret: Slab,
+    average: Slab,
+    scratch: Vec<Level>,
+    permutations: Vec<ComboPermutation>,
+    alias_perms: Vec<usize>,
+    wall_profile: WorkProfile,
 }
 
 /// Conservative owned solver payload estimate, including per-node traversal
 /// buffers, rank caches and tree/ranges. Thread stacks and allocator overhead are
 /// covered by a 25% margin plus 1 MiB per configured worker in Engine::new.
 pub fn estimate_memory_bytes(tree: &GameTree, ranges: &[DenseRange; 2]) -> Result<usize, String> {
+    estimate_memory_bytes_with_config(tree, ranges, &EngineConfig::default())
+}
+/// Upper bound without allocating combo-sized state. Suit reduction may lower
+/// actual persistent storage; estimates deliberately assume every physical branch.
+pub fn estimate_memory_bytes_with_config(
+    tree: &GameTree,
+    ranges: &[DenseRange; 2],
+    config: &EngineConfig,
+) -> Result<usize, String> {
     validate(tree, ranges)?;
     let n = [ranges[0].combos.len(), ranges[1].combos.len()];
     let mut bytes = 0usize;
     let mut boards = BTreeSet::new();
     for node in &tree.nodes {
-        let action = match &node.kind {
+        let (actions, children) = match &node.kind {
             NodeKind::Decision {
-                player, actions, ..
-            } => actions
-                .len()
-                .checked_mul(n[*player])
-                .ok_or("memory estimate overflow")?,
-            _ => 0,
+                player,
+                actions,
+                children,
+            } => (actions.len() * n[*player], children.len()),
+            NodeKind::Chance { children, .. } => (0, children.len()),
+            _ => (0, 0),
         };
-        let payload = action
-            .checked_mul(12)
-            .and_then(|v| v.checked_add((n[0] + n[1] + n[0].max(n[1])) * 8))
-            .ok_or("memory estimate overflow")?;
+        let scalar = match config.storage_mode {
+            StorageMode::F32 => 8,
+            StorageMode::I16 => 4,
+        };
         bytes = bytes
             .checked_add(
-                payload
+                actions
+                    .checked_mul(scalar)
+                    .ok_or("memory estimate overflow")?
                     + std::mem::size_of::<State>()
                     + std::mem::size_of::<tree::Node>()
-                    + node.board.len(),
+                    + node.board.len()
+                    + children * 48
+                    + 64,
             )
             .ok_or("memory estimate overflow")?;
-        match &node.kind {
-            NodeKind::Terminal { winner: None } => {
-                boards.insert(board_mask(&node.board));
-            }
-            NodeKind::Decision {
-                actions, children, ..
-            } => {
-                bytes = bytes
-                    .checked_add(
-                        actions.len() * std::mem::size_of::<tree::Action>() + children.len() * 16,
-                    )
-                    .ok_or("memory estimate overflow")?;
-            }
-            NodeKind::Chance { cards, children } => {
-                bytes = bytes
-                    .checked_add(cards.len() + children.len() * 16)
-                    .ok_or("memory estimate overflow")?;
-            }
-            _ => {}
+        if matches!(node.kind, NodeKind::Terminal { winner: None }) {
+            boards.insert(board_mask(&node.board));
         }
     }
+    let shape = tree_shape(tree, tree.root);
+    let level_bytes = (n[0] + n[1] + 2 * n[0].max(n[1])) * 8 + shape.1 * n[0].max(n[1]) * 20;
+    fn scratch_roots(tree: &GameTree, id: usize) -> usize {
+        match &tree.nodes[id].kind {
+            NodeKind::Chance { children, .. } => children.len(),
+            NodeKind::Decision { children, .. } => {
+                children.iter().map(|&c| scratch_roots(tree, c)).sum()
+            }
+            _ => 0,
+        }
+    }
+    let scratch_count = if config.threads > 1 {
+        1 + scratch_roots(tree, tree.root)
+    } else {
+        1
+    };
     bytes = bytes
-        .checked_add(boards.len() * (n[0] + n[1]) * 12 + (n[0] + n[1]) * 64 + tree.nodes.len() * 24)
+        .checked_add(
+            boards.len() * (n[0] + n[1]) * 12
+                + (n[0] + n[1]) * 64
+                + tree.nodes.len() * 24
+                + shape.0 * level_bytes * scratch_count
+                + 24 * (n[0] + n[1]) * 8
+                + config.threads * 1024 * 1024,
+        )
         .ok_or("memory estimate overflow")?;
     bytes
         .checked_add(bytes / 4)
@@ -300,14 +568,14 @@ impl Engine {
         if config.threads == 0 {
             return Err("threads must be positive".into());
         }
-        let memory_bytes = estimate_memory_bytes(&tree, &ranges)?
-            .checked_add(
-                config
-                    .threads
-                    .checked_mul(1024 * 1024)
-                    .ok_or("memory estimate overflow")?,
-            )
-            .ok_or("memory estimate overflow")?;
+        if ![config.dcfr_alpha, config.dcfr_beta, config.dcfr_gamma]
+            .iter()
+            .all(|x| x.is_finite())
+            || config.dcfr_gamma < 0.0
+        {
+            return Err("invalid DCFR parameters".into());
+        }
+        let memory_bytes = estimate_memory_bytes_with_config(&tree, &ranges, &config)?;
         if memory_bytes > config.memory_limit_bytes {
             return Err(format!(
                 "estimated memory {memory_bytes} exceeds limit {}",
@@ -331,6 +599,15 @@ impl Engine {
             let total: f64 = ranges[p].combos.iter().map(|c| c.weight).sum();
             ranges[p].combos.iter().map(|c| c.weight / total).collect()
         });
+        // Initial own combo mass is a constant factor that cancels from each
+        // normalized average policy. Remove it before i16 encoding, so a tiny
+        // supplied range weight cannot erase that private hand's entire policy.
+        let average_reach_scale = std::array::from_fn(|p| {
+            initial_reach[p]
+                .iter()
+                .map(|&w| if w > 0.0 { 1.0 / w } else { 0.0 })
+                .collect()
+        });
         let totals = totals(&ranges[1], &initial_reach[1]);
         let joint_mass: f64 = ranges[0]
             .combos
@@ -348,11 +625,26 @@ impl Engine {
         if !joint_mass.is_finite() || joint_mass <= 0.0 {
             return Err("ranges have no compatible positive-weight deals".into());
         }
+        let permutations = range_permutations(&tree, &ranges)?;
+        let mut aliases: Vec<usize> = (0..tree.nodes.len()).collect();
+        let mut alias_perms = vec![0; tree.nodes.len()];
+        let merged_children = if config.suit_isomorphism && tree.config.bet_size.is_suit_invariant()
+        {
+            prepare_iso(
+                &tree,
+                &permutations,
+                tree.root,
+                &mut aliases,
+                &mut alias_perms,
+            )?
+        } else {
+            0
+        };
         let mut tables = Vec::new();
         let mut table_ids = BTreeMap::new();
         let mut terminal_table = vec![None; tree.nodes.len()];
         for (id, node) in tree.nodes.iter().enumerate() {
-            if !matches!(node.kind, NodeKind::Terminal { winner: None }) {
+            if aliases[id] != id || !matches!(node.kind, NodeKind::Terminal { winner: None }) {
                 continue;
             }
             let key = board_mask(&node.board);
@@ -390,17 +682,19 @@ impl Engine {
             terminal_table[id] = Some(table_id);
         }
         let n = [ranges[0].combos.len(), ranges[1].combos.len()];
-        let mut state = State::new(&tree, tree.root, n, 0);
-        let mut aliases: Vec<usize> = (0..tree.nodes.len()).collect();
-        let merged_children = if config.suit_isomorphism && tree.config.bet_size.is_suit_invariant()
-        {
-            prepare_iso(&tree, &ranges, &mut state, &mut aliases)?
-        } else {
-            0
-        };
-        let regret = vec![0.0; state.span];
-        let average = vec![0.0; state.span];
-        let strategy = vec![0.0; state.span];
+        let state = State::new(
+            &tree,
+            tree.root,
+            n,
+            0,
+            &aliases,
+            &alias_perms,
+            config.threads > 1,
+        );
+        let shape = tree_shape(&tree, tree.root);
+        let scratch = levels(shape.0, shape.1, n);
+        let regret = Slab::new(config.storage_mode, state.span);
+        let average = Slab::new(config.storage_mode, state.span);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(config.threads)
             .stack_size(1024 * 1024)
@@ -416,6 +710,7 @@ impl Engine {
             tables,
             terminal_table,
             initial_reach,
+            average_reach_scale,
             joint_mass,
             iterations: 0,
             memory_bytes,
@@ -424,20 +719,26 @@ impl Engine {
             merged_children,
             regret,
             average,
-            strategy,
+            scratch,
+            permutations,
+            alias_perms,
+            wall_profile: WorkProfile::default(),
         })
     }
     /// One iteration is an OOP update followed by an IP update. No engine-owned
     /// heap buffers are allocated here; Rayon uses its initialized worker pool.
     pub fn iterate(&mut self) {
+        let start = Instant::now();
         self.iterations += 1;
         for player in 0..2 {
             self.run(player, Mode::Train);
         }
+        self.wall_profile.training_seconds += start.elapsed().as_secs_f64();
     }
     fn run(&mut self, player: usize, mode: Mode) -> f64 {
-        self.state.reach[0].copy_from_slice(&self.initial_reach[0]);
-        self.state.reach[1].copy_from_slice(&self.initial_reach[1]);
+        let start = Instant::now();
+        self.scratch[0].reach[0].copy_from_slice(&self.initial_reach[0]);
+        self.scratch[0].reach[1].copy_from_slice(&self.initial_reach[1]);
         let context = Context {
             tree: &self.tree,
             ranges: &self.ranges,
@@ -446,20 +747,52 @@ impl Engine {
             tables: &self.tables,
             terminal_table: &self.terminal_table,
             config: &self.config,
+            permutations: &self.permutations,
+            average_reach_scale: &self.average_reach_scale,
+            initial_reach: &self.initial_reach,
+            discounts: {
+                let t = self.iterations.max(1) as f64;
+                let pos = t.powf(self.config.dcfr_alpha);
+                let neg = t.powf(self.config.dcfr_beta);
+                [
+                    pos / (pos + 1.0),
+                    neg / (neg + 1.0),
+                    (t / (t + 1.0)).powf(self.config.dcfr_gamma),
+                ]
+            },
             iteration: self.iterations,
         };
         let buffers = Buffers {
-            regret: &mut self.regret,
-            average: &mut self.average,
-            strategy: &mut self.strategy,
+            regret: self.regret.slice(),
+            average: self.average.slice(),
         };
         if self.config.threads == 1 || self.pool.current_thread_index().is_some() {
-            traverse(&context, &mut self.state, buffers, player, mode, true);
+            traverse(
+                &context,
+                &mut self.state,
+                &mut self.scratch,
+                buffers,
+                player,
+                mode,
+                true,
+            );
         } else {
-            self.pool
-                .install(|| traverse(&context, &mut self.state, buffers, player, mode, true));
+            self.pool.install(|| {
+                traverse(
+                    &context,
+                    &mut self.state,
+                    &mut self.scratch,
+                    buffers,
+                    player,
+                    mode,
+                    true,
+                )
+            });
         }
-        self.state.value[..self.initial_reach[player].len()]
+        if matches!(mode, Mode::BestResponse) {
+            self.wall_profile.best_response_seconds += start.elapsed().as_secs_f64();
+        }
+        self.scratch[0].value[..self.initial_reach[player].len()]
             .iter()
             .zip(&self.initial_reach[player])
             .map(|(v, w)| v * w)
@@ -486,11 +819,7 @@ impl Engine {
     /// Average action-major probabilities; zero for future-board-blocked hands.
     /// The returned result allocation is outside the iteration loop.
     pub fn strategy(&self, node: usize) -> Result<Vec<f32>, String> {
-        let mut canonical = *self.aliases.get(node).ok_or("unknown node")?;
-        while self.aliases[canonical] != canonical {
-            canonical = self.aliases[canonical];
-        }
-        let s = self.state.find(canonical).ok_or("unknown node")?;
+        self.aliases.get(node).ok_or("unknown node")?;
         let NodeKind::Decision {
             player, actions, ..
         } = &self.tree.nodes[node].kind
@@ -498,15 +827,33 @@ impl Engine {
             return Err("node is not a decision".into());
         };
         let n = self.ranges[*player].combos.len();
-        let mut out = vec![0.0; s.own_len];
-        normalize(
-            &self.average[s.offset..s.offset + s.own_len],
-            &mut out,
+        let mut indices: Vec<usize> = (0..n).collect();
+        let mut source = node;
+        while self.aliases[source] != source {
+            let map = &self.permutations[self.alias_perms[source]].indices[*player];
+            for i in &mut indices {
+                *i = map[*i];
+            }
+            source = self.aliases[source];
+        }
+        let canonical = source;
+        let s = self.state.find(canonical).ok_or("unknown node")?;
+        let mut norm = vec![0.0; s.own_len];
+        self.average.normalize_policy(
+            s.offset,
+            s.own_len,
+            &mut norm,
             n,
             actions.len(),
             &self.masks[*player],
-            board_mask(&self.tree.nodes[node].board),
+            board_mask(&self.tree.nodes[canonical].board),
         );
+        let mut out = vec![0.0; s.own_len];
+        for a in 0..actions.len() {
+            for i in 0..n {
+                out[a * n + i] = norm[a * n + indices[i]];
+            }
+        }
         Ok(out)
     }
     /// Install a complete solving loop once, avoiding Rayon external-injector
@@ -533,7 +880,24 @@ impl Engine {
     }
     /// Sum of measured terminal work across workers, not wall-clock elapsed time.
     pub fn terminal_seconds(&self) -> f64 {
-        self.state.terminal_nanos() as f64 * 1e-9
+        let w = self.state.work();
+        (w[0] + w[1]) as f64 * 1e-9
+    }
+    pub fn profile(&self) -> WorkProfile {
+        let w = self.state.work();
+        let mut p = self.wall_profile;
+        p.showdown_seconds = w[0] as f64 * 1e-9;
+        p.fold_seconds = w[1] as f64 * 1e-9;
+        p.regret_seconds = w[2] as f64 * 1e-9;
+        p.chance_seconds = w[3] as f64 * 1e-9;
+        p
+    }
+    pub fn persistent_storage_bytes(&self) -> usize {
+        self.state.span
+            * match self.config.storage_mode {
+                StorageMode::F32 => 8,
+                StorageMode::I16 => 4,
+            }
     }
     pub fn isomorphism_used(&self) -> bool {
         self.merged_children > 0
@@ -546,59 +910,104 @@ impl Engine {
     }
 }
 
-// Conservative exact orbit reduction. Every private combo maps to itself, so
-// both reach vectors and all decision vectors have the identity permutation.
-// Aliases map skipped public subtrees back to the computed representative.
-fn prepare_iso(
+/// Exact weight equality is intentional: close floating-point weights are NOT
+/// evidence that a production range can safely be symmetrized.
+fn range_permutations(
     tree: &GameTree,
     ranges: &[DenseRange; 2],
-    state: &mut State,
+) -> Result<Vec<ComboPermutation>, String> {
+    let board: Vec<Card> = tree.nodes[tree.root]
+        .board
+        .iter()
+        .map(|&c| Card(c))
+        .collect();
+    let mut out = Vec::new();
+    for suit in cards::board_preserving_permutations(&board)? {
+        let mut indices: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        let mut valid = true;
+        for player in 0..2 {
+            let mut dense = [None; 1326];
+            for (i, c) in ranges[player].combos.iter().enumerate() {
+                dense[c.combo.id()] = Some(i);
+            }
+            for c in &ranges[player].combos {
+                let Some(j) = dense[suit.map_combo(c.combo).id()] else {
+                    valid = false;
+                    break;
+                };
+                if c.weight.to_bits() != ranges[player].combos[j].weight.to_bits() {
+                    valid = false;
+                    break;
+                }
+                indices[player].push(j);
+            }
+            if !valid {
+                break;
+            }
+        }
+        if valid {
+            out.push(ComboPermutation { suit, indices });
+        }
+    }
+    // Enumeration starts with identity, hence permutation 0 is always identity.
+    if out.first().is_none_or(|p| p.suit.0 != [0, 1, 2, 3]) {
+        return Err("missing identity permutation".into());
+    }
+    Ok(out)
+}
+fn prepare_iso(
+    tree: &GameTree,
+    permutations: &[ComboPermutation],
+    id: usize,
     aliases: &mut [usize],
+    alias_perms: &mut [usize],
 ) -> Result<usize, String> {
     let mut merged = 0;
-    if let NodeKind::Chance { cards, children } = &tree.nodes[state.id].kind {
-        let board: Vec<Card> = tree.nodes[state.id]
-            .board
+    let root_len = tree.nodes[tree.root].board.len();
+    let children = match &tree.nodes[id].kind {
+        NodeKind::Chance { children, .. } | NodeKind::Decision { children, .. } => {
+            children.as_slice()
+        }
+        _ => &[][..],
+    };
+    if let NodeKind::Chance { cards, .. } = &tree.nodes[id].kind {
+        // Preserve street history, not merely the final board's unordered set.
+        let valid: Vec<_> = permutations
             .iter()
-            .map(|&c| Card(c))
-            .collect();
-        let permutations: Vec<_> = cards::board_preserving_permutations(&board)?
-            .into_iter()
-            .filter(|p| {
-                ranges.iter().all(|r| {
-                    r.combos
-                        .iter()
-                        .all(|c| p.map_combo(c.combo).id() == c.combo.id())
-                })
+            .enumerate()
+            .filter(|(_, p)| {
+                tree.nodes[id].board[root_len..]
+                    .iter()
+                    .all(|&c| p.suit.map_card(Card(c)).0 == c)
             })
             .collect();
         for member in 0..cards.len() {
-            for representative in 0..member {
-                if state.chance_weights[representative] == 0 {
+            for rep in 0..member {
+                if aliases[children[rep]] != children[rep] {
                     continue;
                 }
-                if let Some(&permutation) = permutations
+                if let Some(&(index, p)) = valid
                     .iter()
-                    .find(|p| p.map_card(Card(cards[member])).0 == cards[representative])
+                    .find(|(_, p)| p.suit.map_card(Card(cards[member])).0 == cards[rep])
                 {
                     alias_subtree(
                         tree,
                         children[member],
-                        children[representative],
-                        permutation,
+                        children[rep],
+                        p.suit,
+                        index,
                         aliases,
+                        alias_perms,
                     )?;
-                    state.chance_weights[member] = 0;
-                    state.chance_weights[representative] += 1;
                     merged += 1;
                     break;
                 }
             }
         }
     }
-    for (child, &weight) in state.children.iter_mut().zip(&state.chance_weights) {
-        if weight > 0 {
-            merged += prepare_iso(tree, ranges, child, aliases)?;
+    for &child in children {
+        if aliases[child] == child {
+            merged += prepare_iso(tree, permutations, child, aliases, alias_perms)?;
         }
     }
     Ok(merged)
@@ -608,7 +1017,9 @@ fn alias_subtree(
     from: usize,
     to: usize,
     p: SuitPermutation,
+    permutation: usize,
     aliases: &mut [usize],
+    alias_perms: &mut [usize],
 ) -> Result<(), String> {
     let a = &tree.nodes[from];
     let b = &tree.nodes[to];
@@ -624,6 +1035,7 @@ fn alias_subtree(
         return Err("non-equivariant isomorphic subtree".into());
     }
     aliases[from] = to;
+    alias_perms[from] = permutation;
     match (&a.kind, &b.kind) {
         (
             NodeKind::Decision {
@@ -638,7 +1050,7 @@ fn alias_subtree(
             },
         ) if pa == pb && aa == ab => {
             for (&x, &y) in ca.iter().zip(cb) {
-                alias_subtree(tree, x, y, p, aliases)?;
+                alias_subtree(tree, x, y, p, permutation, aliases, alias_perms)?;
             }
         }
         (
@@ -656,7 +1068,7 @@ fn alias_subtree(
                     .iter()
                     .position(|&c| c == p.map_card(Card(card)).0)
                     .ok_or("isomorphic chance mismatch")?;
-                alias_subtree(tree, x, ab[j], p, aliases)?;
+                alias_subtree(tree, x, ab[j], p, permutation, aliases, alias_perms)?;
             }
         }
         (NodeKind::Terminal { winner: wa }, NodeKind::Terminal { winner: wb }) if wa == wb => {}
@@ -665,6 +1077,19 @@ fn alias_subtree(
     Ok(())
 }
 
+trait PolicyValue: Copy {
+    fn positive(self) -> f64;
+}
+impl PolicyValue for f32 {
+    fn positive(self) -> f64 {
+        self.max(0.0) as f64
+    }
+}
+impl PolicyValue for i16 {
+    fn positive(self) -> f64 {
+        self.max(0) as f64
+    }
+}
 fn normalize(
     input: &[f32],
     output: &mut [f32],
@@ -673,39 +1098,96 @@ fn normalize(
     masks: &[u64],
     board: u64,
 ) {
+    normalize_policy(input, output, n, actions, masks, board);
+}
+fn normalize_i16(
+    input: &[i16],
+    output: &mut [f32],
+    n: usize,
+    actions: usize,
+    masks: &[u64],
+    board: u64,
+) {
+    normalize_policy(input, output, n, actions, masks, board);
+}
+fn normalize_policy<T: PolicyValue>(
+    input: &[T],
+    output: &mut [f32],
+    n: usize,
+    actions: usize,
+    masks: &[u64],
+    board: u64,
+) {
+    match actions {
+        2 => normalize_fixed::<T, 2>(input, output, n, masks, board),
+        3 => normalize_fixed::<T, 3>(input, output, n, masks, board),
+        _ => {
+            for (i, &mask) in masks.iter().enumerate() {
+                if mask & board != 0 {
+                    for a in 0..actions {
+                        output[a * n + i] = 0.0;
+                    }
+                    continue;
+                }
+                let sum: f64 = (0..actions).map(|a| input[a * n + i].positive()).sum();
+                if sum > 0.0 {
+                    let inverse = 1.0 / sum;
+                    for a in 0..actions {
+                        output[a * n + i] = (input[a * n + i].positive() * inverse) as f32;
+                    }
+                } else {
+                    for a in 0..actions {
+                        output[a * n + i] = 1.0 / actions as f32;
+                    }
+                }
+            }
+        }
+    }
+}
+fn normalize_fixed<T: PolicyValue, const A: usize>(
+    input: &[T],
+    output: &mut [f32],
+    n: usize,
+    masks: &[u64],
+    board: u64,
+) {
     for (i, &mask) in masks.iter().enumerate() {
-        let sum: f64 = (0..actions).map(|a| input[a * n + i].max(0.0) as f64).sum();
-        for a in 0..actions {
-            output[a * n + i] = if mask & board != 0 {
-                0.0
-            } else if sum > 0.0 {
-                (input[a * n + i].max(0.0) as f64 / sum) as f32
-            } else {
-                1.0 / actions as f32
-            };
+        if mask & board != 0 {
+            for a in 0..A {
+                output[a * n + i] = 0.0;
+            }
+            continue;
+        }
+        let positive: [f64; A] = std::array::from_fn(|a| input[a * n + i].positive());
+        let sum: f64 = positive.iter().sum();
+        if sum > 0.0 {
+            let inverse = 1.0 / sum;
+            for a in 0..A {
+                output[a * n + i] = (positive[a] * inverse) as f32;
+            }
+        } else {
+            for a in 0..A {
+                output[a * n + i] = 1.0 / A as f32;
+            }
         }
     }
 }
 struct Buffers<'a> {
-    regret: &'a mut [f32],
-    average: &'a mut [f32],
-    strategy: &'a mut [f32],
+    regret: SlabSlice<'a>,
+    average: SlabSlice<'a>,
 }
 impl<'a> Buffers<'a> {
     fn split(self, at: usize) -> (Self, Self) {
-        let (ar, br) = self.regret.split_at_mut(at);
-        let (aa, ba) = self.average.split_at_mut(at);
-        let (as_, bs) = self.strategy.split_at_mut(at);
+        let (ar, br) = self.regret.split(at);
+        let (aa, ba) = self.average.split(at);
         (
             Self {
                 regret: ar,
                 average: aa,
-                strategy: as_,
             },
             Self {
                 regret: br,
                 average: ba,
-                strategy: bs,
             },
         )
     }
@@ -713,42 +1195,89 @@ impl<'a> Buffers<'a> {
 fn traverse(
     ctx: &Context<'_>,
     state: &mut State,
+    scratch: &mut [Level],
     buffers: Buffers<'_>,
     target: usize,
     mode: Mode,
     parallel: bool,
 ) {
+    let (level, desc_scratch) = scratch.split_first_mut().expect("depth scratch");
     let node = &ctx.tree.nodes[state.id];
     let n = ctx.ranges[target].combos.len();
-    let (own, mut descendants) = buffers.split(state.own_len);
+    let (mut own, mut descendants) = buffers.split(state.own_len);
     match &node.kind {
         NodeKind::Terminal { winner } => {
             let start = ctx.config.profiling.then(Instant::now);
-            terminal(ctx, state, target, *winner);
-            if let Some(start) = start {
-                state.terminal_nanos += start.elapsed().as_nanos();
+            terminal(ctx, state.id, level, target, *winner);
+            if let Some(t) = start {
+                state.work[if winner.is_none() { 0 } else { 1 }] += t.elapsed().as_nanos();
             }
         }
-        NodeKind::Chance { cards, .. } => {
+        NodeKind::Chance { .. } => {
+            let start = ctx.config.profiling.then(Instant::now);
+            level.value[..n].fill(0.0);
             let probability = 1.0 / (52 - node.board.len() - 4) as f64;
-            visit_chance(
-                ctx,
-                &mut state.children,
-                cards,
-                &state.chance_weights,
-                &state.reach,
-                descendants,
-                target,
-                mode,
-                probability,
-                parallel && ctx.config.threads > 1,
-            );
-            state.value[..n].fill(0.0);
-            // Fixed public-card order, regardless of worker completion order.
-            for (child, &weight) in state.children.iter().zip(&state.chance_weights) {
-                if weight > 0 {
-                    for i in 0..n {
-                        state.value[i] += child.value[i] * weight as f64;
+            if let Some(t) = start {
+                state.work[3] += t.elapsed().as_nanos();
+            }
+            if parallel && ctx.config.threads > 1 {
+                visit_parallel_chance(
+                    ctx,
+                    &mut state.children,
+                    &mut state.parallel_scratch,
+                    descendants,
+                    &level.reach,
+                    target,
+                    mode,
+                    probability,
+                );
+                let start = ctx.config.profiling.then(Instant::now);
+                for ((child_scratch, orbit), _) in state
+                    .parallel_scratch
+                    .iter()
+                    .zip(&state.orbits)
+                    .zip(&state.children)
+                {
+                    for &permutation in orbit {
+                        let map = &ctx.permutations[permutation].indices[target];
+                        for (i, &j) in map.iter().enumerate() {
+                            level.value[i] += child_scratch[0].value[j];
+                        }
+                    }
+                }
+                if let Some(t) = start {
+                    state.work[3] += t.elapsed().as_nanos();
+                }
+            } else {
+                for (child, orbit) in state.children.iter_mut().zip(&state.orbits) {
+                    let start = ctx.config.profiling.then(Instant::now);
+                    let card = *ctx.tree.nodes[child.id]
+                        .board
+                        .last()
+                        .expect("chance child card");
+                    chance_reach(
+                        ctx,
+                        &level.reach,
+                        &mut desc_scratch[0].reach,
+                        card,
+                        target,
+                        probability,
+                    );
+                    if let Some(t) = start {
+                        state.work[3] += t.elapsed().as_nanos();
+                    }
+                    let (child_buffers, rest) = descendants.split(child.span);
+                    descendants = rest;
+                    traverse(ctx, child, desc_scratch, child_buffers, target, mode, false);
+                    let start = ctx.config.profiling.then(Instant::now);
+                    for &permutation in orbit {
+                        let map = &ctx.permutations[permutation].indices[target];
+                        for (i, &j) in map.iter().enumerate() {
+                            level.value[i] += desc_scratch[0].value[j];
+                        }
+                    }
+                    if let Some(t) = start {
+                        state.work[3] += t.elapsed().as_nanos();
                     }
                 }
             }
@@ -758,25 +1287,32 @@ fn traverse(
         } => {
             let actor = *player;
             let na = ctx.ranges[actor].combos.len();
-            let strategy_source = if matches!(mode, Mode::Train) {
-                &*own.regret
-            } else {
-                &*own.average
-            };
-            normalize(
-                strategy_source,
-                own.strategy,
-                na,
-                actions.len(),
-                &ctx.masks[actor],
-                board_mask(&node.board),
-            );
+            let len = state.own_len;
+            let start = ctx.config.profiling.then(Instant::now);
+            let own_best_response = actor == target && matches!(mode, Mode::BestResponse);
+            if !own_best_response {
+                let source = if matches!(mode, Mode::Train) {
+                    &own.regret
+                } else {
+                    &own.average
+                };
+                source.normalize_policy(
+                    &mut level.strategy[..len],
+                    na,
+                    actions.len(),
+                    &ctx.masks[actor],
+                    board_mask(&node.board),
+                );
+            }
+            if let Some(t) = start {
+                state.work[2] += t.elapsed().as_nanos();
+            }
             for (a, child) in state.children.iter_mut().enumerate() {
                 for p in 0..2 {
-                    for i in 0..state.reach[p].len() {
-                        child.reach[p][i] = state.reach[p][i]
-                            * if p == actor {
-                                own.strategy[a * na + i] as f64
+                    for i in 0..level.reach[p].len() {
+                        desc_scratch[0].reach[p][i] = level.reach[p][i]
+                            * if p == actor && !own_best_response {
+                                level.strategy[a * na + i] as f64
                             } else {
                                 1.0
                             };
@@ -784,126 +1320,178 @@ fn traverse(
                 }
                 let (child_buffers, rest) = descendants.split(child.span);
                 descendants = rest;
-                traverse(ctx, child, child_buffers, target, mode, parallel);
+                traverse(
+                    ctx,
+                    child,
+                    desc_scratch,
+                    child_buffers,
+                    target,
+                    mode,
+                    parallel,
+                );
+                level.action_values[a * n..(a + 1) * n]
+                    .copy_from_slice(&desc_scratch[0].value[..n]);
             }
+            let start = ctx.config.profiling.then(Instant::now);
             for i in 0..n {
-                state.value[i] = if actor != target {
-                    state.children.iter().map(|c| c.value[i]).sum()
+                level.value[i] = if actor != target {
+                    (0..actions.len())
+                        .map(|a| level.action_values[a * n + i])
+                        .sum()
                 } else if matches!(mode, Mode::BestResponse) {
-                    state
-                        .children
-                        .iter()
-                        .map(|c| c.value[i])
+                    (0..actions.len())
+                        .map(|a| level.action_values[a * n + i])
                         .fold(f64::NEG_INFINITY, f64::max)
                 } else {
-                    state
-                        .children
-                        .iter()
-                        .enumerate()
-                        .map(|(a, c)| own.strategy[a * na + i] as f64 * c.value[i])
+                    (0..actions.len())
+                        .map(|a| level.strategy[a * na + i] as f64 * level.action_values[a * n + i])
                         .sum()
                 };
             }
             if matches!(mode, Mode::Train) && actor == target {
-                let t = ctx.iteration as f64;
-                let positive_discount = t.powf(1.5) / (t.powf(1.5) + 1.0);
-                let average_discount = (t / (t + 1.0)).powi(2);
-                for (a, child) in state.children.iter().enumerate() {
-                    for i in 0..na {
-                        let idx = a * na + i;
-                        let old = own.regret[idx] as f64;
-                        let delta = child.value[i] - state.value[i];
-                        match ctx.config.algorithm {
-                            Algorithm::Dcfr => {
-                                let r = old + delta;
-                                own.regret[idx] =
-                                    (r * if r >= 0.0 { positive_discount } else { 0.5 }) as f32;
-                                own.average[idx] = ((own.average[idx] as f64
-                                    + state.reach[actor][i] * own.strategy[idx] as f64)
-                                    * average_discount)
-                                    as f32;
-                            }
-                            Algorithm::CfrPlus => {
-                                own.regret[idx] = (old + delta).max(0.0) as f32;
-                                own.average[idx] +=
-                                    (t * state.reach[actor][i] * own.strategy[idx] as f64) as f32;
-                            }
-                        }
+                for i in 0..na {
+                    let reach = level.reach[actor][i];
+                    let scale = ctx.average_reach_scale[actor][i];
+                    level.average_path_reach[i] = if reach == 0.0 {
+                        0.0
+                    } else if scale.is_finite() {
+                        reach * scale
+                    } else {
+                        reach / ctx.initial_reach[actor][i]
+                    };
+                }
+                match (&mut own.regret, &mut own.average) {
+                    (SlabSlice::F32(regret), SlabSlice::F32(average)) => {
+                        update_policy(
+                            ctx,
+                            &level.strategy[..len],
+                            &level.action_values,
+                            &level.value,
+                            &level.average_path_reach[..na],
+                            na,
+                            actions.len(),
+                            regret,
+                            average,
+                        );
                     }
+                    _ => {
+                        own.regret.read(&mut level.regret[..len], state.scales[0]);
+                        own.average.read(&mut level.average[..len], state.scales[1]);
+                        update_policy(
+                            ctx,
+                            &level.strategy[..len],
+                            &level.action_values,
+                            &level.value,
+                            &level.average_path_reach[..na],
+                            na,
+                            actions.len(),
+                            &mut level.regret[..len],
+                            &mut level.average[..len],
+                        );
+                        own.regret.write(&level.regret[..len], &mut state.scales[0]);
+                        own.average
+                            .write(&level.average[..len], &mut state.scales[1]);
+                    }
+                }
+            }
+            if let Some(t) = start {
+                state.work[2] += t.elapsed().as_nanos();
+            }
+        }
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn update_policy(
+    ctx: &Context<'_>,
+    strategy: &[f32],
+    action_values: &[f64],
+    value: &[f64],
+    path_reach: &[f64],
+    n: usize,
+    actions: usize,
+    regret: &mut [f32],
+    average: &mut [f32],
+) {
+    let t = ctx.iteration as f64;
+    let [pos, neg, avg] = ctx.discounts;
+    for a in 0..actions {
+        for i in 0..n {
+            let idx = a * n + i;
+            let old = regret[idx] as f64;
+            let delta = action_values[idx] - value[i];
+            match ctx.config.algorithm {
+                Algorithm::Dcfr => {
+                    let r = old + delta;
+                    regret[idx] = (r * if r >= 0.0 { pos } else { neg }) as f32;
+                    average[idx] =
+                        ((average[idx] as f64 + path_reach[i] * strategy[idx] as f64) * avg) as f32;
+                }
+                Algorithm::CfrPlus => {
+                    regret[idx] = (old + delta).max(0.0) as f32;
+                    average[idx] += (t * path_reach[i] * strategy[idx] as f64) as f32;
                 }
             }
         }
     }
 }
-// Recursive disjoint slice partitioning avoids allocating a vector of mutable
-// work descriptors and guarantees no races in globally contiguous f32 slabs.
+fn chance_reach(
+    ctx: &Context<'_>,
+    reach: &[Vec<f64>; 2],
+    out: &mut [Vec<f64>; 2],
+    card: u8,
+    target: usize,
+    probability: f64,
+) {
+    let mask = 1u64 << card;
+    for p in 0..2 {
+        for (i, &weight) in reach[p].iter().enumerate() {
+            out[p][i] = if ctx.masks[p][i] & mask != 0 {
+                0.0
+            } else {
+                weight * if p == target { 1.0 } else { probability }
+            };
+        }
+    }
+}
 #[allow(clippy::too_many_arguments)]
-fn visit_chance(
+fn visit_parallel_chance(
     ctx: &Context<'_>,
     children: &mut [State],
-    cards: &[u8],
-    weights: &[usize],
-    reach: &[Vec<f64>; 2],
+    scratch: &mut [Vec<Level>],
     buffers: Buffers<'_>,
+    reach: &[Vec<f64>; 2],
     target: usize,
     mode: Mode,
     probability: f64,
-    parallel: bool,
 ) {
     if children.len() > 1 {
-        let midpoint = children.len() / 2;
-        let span = children[..midpoint].iter().map(|s| s.span).sum();
-        let (left_buf, right_buf) = buffers.split(span);
-        let (left, right) = children.split_at_mut(midpoint);
-        let a = || {
-            visit_chance(
-                ctx,
-                left,
-                &cards[..midpoint],
-                &weights[..midpoint],
-                reach,
-                left_buf,
-                target,
-                mode,
-                probability,
-                parallel,
-            )
-        };
-        let b = || {
-            visit_chance(
-                ctx,
-                right,
-                &cards[midpoint..],
-                &weights[midpoint..],
-                reach,
-                right_buf,
-                target,
-                mode,
-                probability,
-                parallel,
-            )
-        };
-        if parallel {
-            rayon::join(a, b);
-        } else {
-            a();
-            b();
-        }
+        let mid = children.len() / 2;
+        let span = children[..mid].iter().map(|s| s.span).sum();
+        let (a, b) = buffers.split(span);
+        let (left, right) = children.split_at_mut(mid);
+        let (ls, rs) = scratch.split_at_mut(mid);
+        rayon::join(
+            || visit_parallel_chance(ctx, left, ls, a, reach, target, mode, probability),
+            || visit_parallel_chance(ctx, right, rs, b, reach, target, mode, probability),
+        );
     } else if let Some(child) = children.first_mut() {
-        if weights[0] == 0 {
-            return;
+        let start = ctx.config.profiling.then(Instant::now);
+        let card = *ctx.tree.nodes[child.id]
+            .board
+            .last()
+            .expect("chance child card");
+        chance_reach(
+            ctx,
+            reach,
+            &mut scratch[0][0].reach,
+            card,
+            target,
+            probability,
+        );
+        if let Some(t) = start {
+            child.work[3] += t.elapsed().as_nanos();
         }
-        let mask = 1u64 << cards[0];
-        for (p, player_reach) in reach.iter().enumerate() {
-            for (i, &weight) in player_reach.iter().enumerate() {
-                child.reach[p][i] = if ctx.masks[p][i] & mask != 0 {
-                    0.0
-                } else {
-                    weight * if p == target { 1.0 } else { probability }
-                };
-            }
-        }
-        traverse(ctx, child, buffers, target, mode, false);
+        traverse(ctx, child, &mut scratch[0], buffers, target, mode, false);
     }
 }
 
@@ -930,11 +1518,11 @@ fn add(t: &mut Totals, cards: [Card; 2], w: f64) {
 fn compatible(cards: [Card; 2], t: &Totals, same: f64) -> f64 {
     (t.sum - t.cards[cards[0].0 as usize] - t.cards[cards[1].0 as usize] + same).max(0.0)
 }
-fn terminal(ctx: &Context<'_>, state: &mut State, target: usize, winner: Option<usize>) {
-    let node = &ctx.tree.nodes[state.id];
+fn terminal(ctx: &Context<'_>, id: usize, level: &mut Level, target: usize, winner: Option<usize>) {
+    let node = &ctx.tree.nodes[id];
     let own = &ctx.ranges[target];
     let opp = &ctx.ranges[1 - target];
-    let reach = &state.reach[1 - target];
+    let reach = &level.reach[1 - target];
     let all = totals(opp, reach);
     let pot = node.pot as f64 - ctx.tree.config.rake(node.pot);
     let base = node.invested[target] as f64 + ctx.tree.config.starting_pot as f64 / 2.0;
@@ -943,7 +1531,7 @@ fn terminal(ctx: &Context<'_>, state: &mut State, target: usize, winner: Option<
         let payoff = if winner == target { pot - base } else { -base };
         for (i, c) in own.combos.iter().enumerate() {
             let same = ctx.same[target][i].map_or(0.0, |j| reach[j]);
-            state.value[i] = if ctx.masks[target][i] & board != 0 {
+            level.value[i] = if ctx.masks[target][i] & board != 0 {
                 0.0
             } else {
                 payoff * compatible(c.combo.cards, &all, same)
@@ -951,7 +1539,7 @@ fn terminal(ctx: &Context<'_>, state: &mut State, target: usize, winner: Option<
         }
         return;
     }
-    let table = &ctx.tables[ctx.terminal_table[state.id].expect("showdown table")];
+    let table = &ctx.tables[ctx.terminal_table[id].expect("showdown table")];
     let mut weak = Totals {
         sum: 0.0,
         cards: [0.0; 52],
@@ -968,40 +1556,36 @@ fn terminal(ctx: &Context<'_>, state: &mut State, target: usize, winner: Option<
             add(&mut weak, opp.combos[j].combo.cards, reach[j]);
             cursor += 1;
         }
-        let mut equal = Totals {
-            sum: 0.0,
-            cards: [0.0; 52],
-        };
-        let mut end = cursor;
-        while end < table.sorted[1 - target].len()
-            && table.ranks[1 - target][table.sorted[1 - target][end]] == rank
-        {
-            let j = table.sorted[1 - target][end];
-            add(&mut equal, opp.combos[j].combo.cards, reach[j]);
-            end += 1;
-        }
+        let own_begin = own_cursor;
         while own_cursor < table.sorted[target].len()
             && table.ranks[target][table.sorted[target][own_cursor]] == rank
         {
             let i = table.sorted[target][own_cursor];
+            level.value[i] = compatible(own.combos[i].combo.cards, &weak, 0.0);
+            own_cursor += 1;
+        }
+        // Every opposing hand enters the card prefix once. For a tied own hand,
+        // E[receipt]/pot = 0.5 * (strictly weaker + weaker-or-equal).
+        while cursor < table.sorted[1 - target].len()
+            && table.ranks[1 - target][table.sorted[1 - target][cursor]] == rank
+        {
+            let j = table.sorted[1 - target][cursor];
+            add(&mut weak, opp.combos[j].combo.cards, reach[j]);
+            cursor += 1;
+        }
+        for &i in &table.sorted[target][own_begin..own_cursor] {
             let c = own.combos[i].combo.cards;
             let same = ctx.same[target][i].map_or(0.0, |j| reach[j]);
             let total = compatible(c, &all, same);
-            let wins = compatible(c, &weak, 0.0);
-            let ties = compatible(c, &equal, same);
-            state.value[i] = if ctx.masks[target][i] & board != 0 {
+            let before = level.value[i];
+            // The identical opposing combo belongs to the equal prefix only.
+            let after = compatible(c, &weak, same);
+            level.value[i] = if ctx.masks[target][i] & board != 0 {
                 0.0
             } else {
-                pot * (wins + 0.5 * ties) - base * total
+                pot * 0.5 * (before + after) - base * total
             };
-            own_cursor += 1;
         }
-        // Incremental card-prefix totals: each opposing hand enters once.
-        for k in cursor..end {
-            let j = table.sorted[1 - target][k];
-            add(&mut weak, opp.combos[j].combo.cards, reach[j]);
-        }
-        cursor = end;
     }
 }
 
@@ -1218,9 +1802,9 @@ mod tests {
                             naive += e.initial_reach[1 - target][j] * (payout - base);
                         }
                         assert!(
-                            (naive - e.state.value[i]).abs() < 1e-7,
+                            (naive - e.scratch[0].value[i]).abs() < 1e-7,
                             "case {case} target{target} combo{i}: {naive} != {}",
-                            e.state.value[i]
+                            e.scratch[0].value[i]
                         );
                     }
                 }
@@ -1234,16 +1818,16 @@ mod tests {
         // Opponent always calls; bettor's independent pure choices have four profiles.
         let s = e.state.find(2).unwrap();
         let start = s.offset;
-        e.average[start..start + 2].copy_from_slice(&[0.0, 1.0]);
+        e.average.f32_mut()[start..start + 2].copy_from_slice(&[0.0, 1.0]);
         let br = e.run(0, Mode::BestResponse);
         let mut exhaustive = f64::NEG_INFINITY;
         for first in 0..2 {
             for second in 0..2 {
                 let choices = [first, second];
                 let root = e.state.find(0).unwrap().offset;
-                e.average[root..root + 4].fill(0.0);
+                e.average.f32_mut()[root..root + 4].fill(0.0);
                 for (hand, &choice) in choices.iter().enumerate() {
-                    e.average[root + choice * 2 + hand] = 1.0;
+                    e.average.f32_mut()[root + choice * 2 + hand] = 1.0;
                 }
                 exhaustive = exhaustive.max(e.run(0, Mode::Average));
             }
@@ -1252,12 +1836,12 @@ mod tests {
         assert!((br - 250.0).abs() < 1e-10);
         // Bettor pure bet with both hands: defender's exhaustive call/fold choices.
         let root = e.state.find(0).unwrap().offset;
-        e.average[root..root + 4].copy_from_slice(&[0.0, 0.0, 1.0, 1.0]);
+        e.average.f32_mut()[root..root + 4].copy_from_slice(&[0.0, 0.0, 1.0, 1.0]);
         let br = e.run(1, Mode::BestResponse);
         let start = e.state.find(2).unwrap().offset;
-        e.average[start..start + 2].copy_from_slice(&[1.0, 0.0]);
+        e.average.f32_mut()[start..start + 2].copy_from_slice(&[1.0, 0.0]);
         let fold = e.run(1, Mode::Average);
-        e.average[start..start + 2].copy_from_slice(&[0.0, 1.0]);
+        e.average.f32_mut()[start..start + 2].copy_from_slice(&[0.0, 1.0]);
         let call = e.run(1, Mode::Average);
         assert!((br - fold.max(call)).abs() < 1e-10);
     }
@@ -1277,14 +1861,15 @@ mod tests {
         assert!((m.average_ev.iter().sum::<f64>()).abs() < 1e-8);
         // All river terminal counterfactual opponent reach mass totals to exactly 1.
         e.run(0, Mode::Average);
-        fn mass(s: &State) -> f64 {
-            if s.children.is_empty() {
-                s.reach[0][0] * s.reach[1][0]
-            } else {
-                s.children.iter().map(mass).sum()
-            }
-        }
-        assert!((mass(&e.state) - 1.0).abs() < 1e-12);
+        let private_mask = e.masks[0][0] | e.masks[1][0];
+        let NodeKind::Chance { cards, .. } = &e.tree.nodes[e.tree.root].kind else {
+            panic!("chance root")
+        };
+        let legal = cards
+            .iter()
+            .filter(|&&card| private_mask & (1u64 << card) == 0)
+            .count();
+        assert!((legal as f64 / (52 - b.len() - 4) as f64 - 1.0).abs() < 1e-12);
     }
     #[test]
     fn actual_isomorphism_matches_unmerged_strategies_and_br() {
@@ -1429,14 +2014,8 @@ mod tests {
             a.iterate();
             b.iterate();
         }
-        assert_eq!(
-            a.regret.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-            b.regret.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            a.average.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-            b.average.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
-        );
+        assert_eq!(a.regret.bits(), b.regret.bits());
+        assert_eq!(a.average.bits(), b.average.bits());
         let ma = a.metrics();
         let mb = b.metrics();
         assert_eq!(
@@ -1447,6 +2026,320 @@ mod tests {
             ma.average_ev.map(f64::to_bits),
             mb.average_ev.map(f64::to_bits)
         );
+    }
+    #[test]
+    fn general_combo_permutations_match_physical_flop_trees() {
+        fn all_pairs(rank: u8, b: &[u8]) -> DenseRange {
+            let hands = (0..4)
+                .flat_map(|a| {
+                    ((a + 1)..4).map(move |z| {
+                        (
+                            cards::Combo::new(Card(rank * 4 + a), Card(rank * 4 + z)).unwrap(),
+                            1.0,
+                        )
+                    })
+                })
+                .collect();
+            Range::from_combos(hands)
+                .unwrap()
+                .blocked(&b.iter().map(|&c| Card(c)).collect::<Vec<_>>())
+                .unwrap()
+        }
+        fn all_strategies(e: &Engine) -> Vec<Option<Vec<f32>>> {
+            fn visit(e: &Engine, s: &State, out: &mut [Option<Vec<f32>>]) {
+                if let NodeKind::Decision {
+                    player, actions, ..
+                } = &e.tree.nodes[s.id].kind
+                {
+                    let mut input = vec![0.0; s.own_len];
+                    e.average.read(s.offset, &mut input, s.scales[1]);
+                    let mut norm = vec![0.0; s.own_len];
+                    normalize(
+                        &input,
+                        &mut norm,
+                        e.ranges[*player].combos.len(),
+                        actions.len(),
+                        &e.masks[*player],
+                        board_mask(&e.tree.nodes[s.id].board),
+                    );
+                    out[s.id] = Some(norm);
+                }
+                for child in &s.children {
+                    visit(e, child, out);
+                }
+            }
+            let mut out = vec![None; e.tree.nodes.len()];
+            visit(e, &e.state, &mut out);
+            out
+        }
+        for (text, expected_merge) in [
+            ("Qc Jd 2h", false),
+            ("Qc Jh 2h", true),
+            ("Qh Jh 2h", true),
+            ("Qc Qd 2h", true),
+        ] {
+            let b = board(text);
+            let rr = [all_pairs(12, &b), all_pairs(11, &b)];
+            let tree = GameTree::build(
+                b,
+                TreeConfig {
+                    starting_pot: 1000,
+                    effective_stack: 500,
+                    allow_raises: false,
+                    rake_rate: 0.05,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut physical =
+                Engine::new(tree.clone(), rr.clone(), EngineConfig::default()).unwrap();
+            let mut reduced = Engine::new(
+                tree,
+                rr,
+                EngineConfig {
+                    suit_isomorphism: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(reduced.isomorphism_used(), expected_merge, "{text}");
+            if expected_merge {
+                assert!(
+                    reduced.permutations.iter().any(|p| p
+                        .indices
+                        .iter()
+                        .any(|indices| indices.iter().enumerate().any(|(i, &j)| i != j))),
+                    "nontrivial combo mapping required"
+                );
+                assert!(reduced.persistent_storage_bytes() < physical.persistent_storage_bytes());
+            }
+            for _ in 0..8 {
+                physical.iterate();
+                reduced.iterate();
+            }
+            let a = physical.metrics();
+            let z = reduced.metrics();
+            for player in 0..2 {
+                assert!(
+                    (a.average_ev[player] - z.average_ev[player]).abs() < 0.001,
+                    "{text} average EV"
+                );
+                assert!(
+                    (a.best_response_ev[player] - z.best_response_ev[player]).abs() < 0.001,
+                    "{text} BR EV"
+                );
+            }
+            let full = all_strategies(&physical);
+            let reps = all_strategies(&reduced);
+            let mut checked = 0;
+            for (id, node) in physical.tree.nodes.iter().enumerate() {
+                let NodeKind::Decision {
+                    player, actions, ..
+                } = &node.kind
+                else {
+                    continue;
+                };
+                let n = physical.ranges[*player].combos.len();
+                let mut map: Vec<_> = (0..n).collect();
+                let mut rep = id;
+                while reduced.aliases[rep] != rep {
+                    let p = &reduced.permutations[reduced.alias_perms[rep]].indices[*player];
+                    for i in &mut map {
+                        *i = p[*i];
+                    }
+                    rep = reduced.aliases[rep];
+                }
+                let direct = full[id].as_ref().unwrap();
+                let canonical = reps[rep].as_ref().unwrap();
+                for action in 0..actions.len() {
+                    for i in 0..n {
+                        assert!(
+                            (direct[action * n + i] - canonical[action * n + map[i]]).abs()
+                                < 0.0001,
+                            "{text} node {id} hand {i}"
+                        );
+                    }
+                }
+                if checked < 20 {
+                    let public = reduced.strategy(id).unwrap();
+                    for action in 0..actions.len() {
+                        for i in 0..n {
+                            assert_eq!(public[action * n + i], canonical[action * n + map[i]]);
+                        }
+                    }
+                }
+                checked += 1;
+            }
+            assert!(checked > 100);
+        }
+    }
+    #[test]
+    fn i16_storage_matches_f32_toy_accuracy_and_halves_payload() {
+        for algorithm in [Algorithm::Dcfr, Algorithm::CfrPlus] {
+            let (tree, ranges) = toy();
+            let mut f32 = Engine::new(
+                tree.clone(),
+                ranges.clone(),
+                EngineConfig {
+                    algorithm,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut i16 = Engine::new(
+                tree,
+                ranges,
+                EngineConfig {
+                    algorithm,
+                    storage_mode: StorageMode::I16,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                f32.persistent_storage_bytes(),
+                i16.persistent_storage_bytes() * 2
+            );
+            for _ in 0..2000 {
+                f32.iterate();
+                i16.iterate();
+            }
+            let a = f32.metrics();
+            let b = i16.metrics();
+            for p in 0..2 {
+                assert!((a.average_ev[p] - b.average_ev[p]).abs() < 0.3);
+                assert!((a.best_response_ev[p] - b.best_response_ev[p]).abs() < 0.3);
+            }
+            assert!((a.exploitability_pct - b.exploitability_pct).abs() < 0.03);
+            for node in [0, 2] {
+                for (a, b) in f32
+                    .strategy(node)
+                    .unwrap()
+                    .iter()
+                    .zip(i16.strategy(node).unwrap())
+                {
+                    assert!((*a - b).abs() < 0.02);
+                }
+            }
+        }
+    }
+    #[test]
+    fn integer_policy_normalization_matches_scaled_reference() {
+        for actions in [1, 2, 3, 4] {
+            let n = 7;
+            let input: Vec<i16> = (0..actions * n)
+                .map(|i| match (i * 11 + i / n * 3) % 7 {
+                    0 => -32767,
+                    1 => 0,
+                    2 => 1,
+                    3 => 32767,
+                    4 => -7,
+                    5 => 101,
+                    _ => 17,
+                })
+                .collect();
+            let masks: Vec<u64> = (0..n).map(|i| 1u64 << i).collect();
+            for scale in [0.001f32, 17.0, f32::from_bits(1)] {
+                let decoded: Vec<f32> = input.iter().map(|&q| q as f32 * scale).collect();
+                let mut reference = vec![0.0; input.len()];
+                let mut direct = reference.clone();
+                normalize(&decoded, &mut reference, n, actions, &masks, 2);
+                normalize_i16(&input, &mut direct, n, actions, &masks, 2);
+                for (&a, &b) in reference.iter().zip(&direct) {
+                    assert!(
+                        (a - b).abs() < 1e-6,
+                        "{actions} actions,scale {scale}: {a} {b}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn best_response_is_independent_of_own_average_policy() {
+        let (tree, ranges) = toy();
+        let mut e = Engine::new(tree, ranges, EngineConfig::default()).unwrap();
+        let offset = e.state.find(0).unwrap().offset;
+        e.average.f32_mut()[offset..offset + 4].copy_from_slice(&[1.0, 1.0, 0.0, 0.0]);
+        let check = e.run(0, Mode::BestResponse);
+        e.average.f32_mut()[offset..offset + 4].copy_from_slice(&[0.0, 0.0, 1.0, 1.0]);
+        let bet = e.run(0, Mode::BestResponse);
+        assert_eq!(check.to_bits(), bet.to_bits());
+    }
+    #[test]
+    fn quantized_subnormal_scale_round_trip_is_finite_and_signed() {
+        let mut cases = vec![1e-35f32, 1e-39f32, 1e-42f32, f32::from_bits(1)];
+        cases.extend((1..100).map(|i| f32::from_bits(i * 12347)));
+        for max in cases {
+            let input = [-max, 0.0, max / 2.0, max];
+            let mut encoded = [0i16; 4];
+            let mut scale = 0.0;
+            let mut slab = SlabSlice::I16(&mut encoded);
+            slab.write(&input, &mut scale);
+            assert!(scale.is_finite() && scale > 0.0);
+            let mut decoded = [0.0; 4];
+            slab.read(&mut decoded, scale);
+            assert!(decoded.iter().all(|x| x.is_finite()));
+            assert!(decoded[0] < 0.0 && decoded[3] > 0.0);
+            for (&a, &b) in input.iter().zip(&decoded) {
+                assert!((a as f64 - b as f64).abs() <= scale as f64 * 1.01 + max as f64 * 1e-6);
+            }
+        }
+    }
+    #[test]
+    fn quantized_average_preserves_tiny_weight_private_hands() {
+        let (tree, mut ranges) = toy();
+        ranges[0].combos[1].weight = 1e-8;
+        let mut exact = Engine::new(tree.clone(), ranges.clone(), EngineConfig::default()).unwrap();
+        let mut packed = Engine::new(
+            tree,
+            ranges,
+            EngineConfig {
+                storage_mode: StorageMode::I16,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..1000 {
+            exact.iterate();
+            packed.iterate();
+        }
+        let a = exact.strategy(0).unwrap();
+        let b = packed.strategy(0).unwrap();
+        for i in 0..a.len() {
+            assert!(
+                (a[i] - b[i]).abs() < 0.01,
+                "private hand strategy {i}: f32={} i16={}",
+                a[i],
+                b[i]
+            );
+        }
+    }
+    #[test]
+    fn range_weight_asymmetry_disables_nontrivial_combo_orbits() {
+        let b = board("Qh Jh 2h");
+        let rr = [
+            range(&[("AcAd", 1.0), ("AcAs", 0.5), ("AdAs", 0.25)], &b),
+            range(&[("KcKd", 1.0), ("KcKs", 1.0), ("KdKs", 1.0)], &b),
+        ];
+        let tree = GameTree::build(
+            b,
+            TreeConfig {
+                effective_stack: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let e = Engine::new(
+            tree,
+            rr,
+            EngineConfig {
+                suit_isomorphism: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(e.permutations.len(), 1);
+        assert!(!e.isomorphism_used());
     }
     #[test]
     fn raked_values_sum_to_negative_rake_and_cap() {
