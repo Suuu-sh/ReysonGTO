@@ -8,6 +8,10 @@ OUT="${OUT:-data/m4b}"
 THREADS="${THREADS:-12}"
 MEM_PER_SHARD_GB="${MEM_PER_SHARD_GB:-18}"
 
+if [ -f "$HOME/.cargo/env" ]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+fi
 for f in data/ranges/btn_open.json data/ranges/bb_call.json target/release/cli target/release/sizing; do
   [ -e "$f" ] || { echo "missing $f (run deploy.sh from the Mac)" >&2; exit 1; }
 done
