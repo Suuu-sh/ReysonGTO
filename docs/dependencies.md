@@ -82,3 +82,19 @@ Tree merge configuration and benchmark-range export add no external dependencies
 `tools/export_benchmark_ranges.py` and its synthetic tests use only Python standard
 library modules; the exporter reads saved JSON, never product/OSS source code.
 The existing locked-package license audit remains unchanged.
+
+## M5 P1–P3 changes
+
+`preflop` uses the existing workspace `cards`, `serde`, `serde_json`, `rayon`,
+`clap`, and `anyhow` packages only. No external poker evaluator/solver, random
+number crate, or additional registry package is introduced. Equity sampling uses
+a small locally implemented seeded PRNG and M1 `cards::evaluate7`. The internal
+workspace package is licensed MIT OR Apache-2.0. The full lockfile metadata
+license check is repeated for the final M5 workspace below.
+
+M5 recheck: `CARGO_HOME=/tmp/reyson-m1-audit-cargo cargo metadata
+--format-version 1` produced `/tmp/reyson-m5-metadata.json`. Compared all registry
+`(name, version)` pairs against the updated lockfile: **35 packages, zero
+missing/extra**. Every manifest license expression still consists only of MIT,
+Apache-2.0, Unlicense, and Unicode-3.0. No new registry package or license is
+present. This has the same metadata-audit limits and notice obligations as M1.

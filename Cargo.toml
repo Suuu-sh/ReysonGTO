@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cards", "crates/ranges", "crates/tree", "crates/cfr", "crates/solver", "crates/sizing", "crates/cli"]
+members = ["crates/cards", "crates/ranges", "crates/tree", "crates/cfr", "crates/solver", "crates/sizing", "crates/cli", "crates/preflop"]
 resolver = "2"
 
 [workspace.package]
@@ -8,6 +8,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+preflop = { path = "crates/preflop" }
 cards = { path = "crates/cards" }
 ranges = { path = "crates/ranges" }
 tree = { path = "crates/tree" }

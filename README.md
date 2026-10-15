@@ -1,12 +1,13 @@
 # ReysonGTO
 
 ReysonAI のための、クリーンルーム実装の Rust ポストフロップ CFR ソルバー。
-HU のフロップ／ターン／リバー開始を扱います。プリフロップ・サイズ探索・配信 API は未実装です。
+HU のフロップ／ターン／リバー開始を扱います。プリフロップは M5 P1〜P3（木・エクイティ表・HU DCFR）まで実装。6 人全体の求解・配信 API は未実装です。
 
 - [設計書](docs/design.md)
 - [M1 の測定・検証・実装対応表](docs/benchmarks/m1.md)
 - [M2 の固定条件比較・測定](docs/benchmarks/m2.md)
 - [依存 crate とライセンス監査](docs/dependencies.md)
+- [M5 プリフロップ P1〜P3 の使い方・測定・近似の制約](docs/benchmarks/m5.md)
 
 既存の OSS ポーカーソルバー・役判定のソースは参照・利用していません。
 製品レンジは含めません。レンジは外部 JSON を実行時に読み込みます。
@@ -18,7 +19,7 @@ Rust stable と Cargo が必要です。外部依存は `Cargo.lock` に固定�
 ```sh
 cargo build --release
 cargo test
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 # 重い全探索: 全 133,784,560 通りの 7 枚を独立した素朴な役判定と比較
 cargo test --release -- --ignored
 ```
