@@ -250,10 +250,20 @@ def main(argv=None):
     parser.add_argument('--stage2-target', type=float, default=2.0)
     parser.add_argument('--reuse-stage1-from', type=Path, default=None,
                         help='earlier --out directory whose complete stage-1 solves are reused')
-    parser.add_argument('--limit', type=int, default=20, help='solve only the first N selected boards')
+    parser.add_argument('--limit', type=int, default=20, help='solve only the first N selected training boards')
+    parser.add_argument('--training', type=int, default=20, help='representative boards to select (fixed per --out)')
+    parser.add_argument('--validation', type=int, default=0, help='check boards to select and solve after the training boards')
+    parser.add_argument('--shard', default='0/1', help='i/n: solve only boards with index %% n == i')
+    parser.add_argument('--prepare-only', action='store_true', help='write the manifest (board selection) and exit; run once before starting shards')
     args = parser.parse_args(argv)
     if not math.isfinite(args.max_hours) or not 0 < args.max_hours <= 48 or min(args.threads, args.memory_mb, args.max_iters, args.limit) <= 0:
         parser.error('positive resources required; max-hours must be <= 48')
+    try:
+        args.shard_index, args.shard_count = (int(x) for x in args.shard.split('/'))
+    except ValueError:
+        parser.error('--shard must look like i/n')
+    if not 0 <= args.shard_index < args.shard_count:
+        parser.error('--shard needs 0 <= i < n')
     if not 0 < args.stage2_target <= args.stage1_target:
         parser.error('stage targets must satisfy 0 < stage2 <= stage1')
     if args.reuse_stage1_from is not None:
@@ -281,22 +291,28 @@ def main(argv=None):
     else:
         directory = args.out / 'selection'
         directory.mkdir(exist_ok=True)
-        command = [str(args.sizing_binary), 'select', '--training', '20', '--validation', '0', '--seed', '20261015']
+        command = [str(args.sizing_binary), 'select', '--training', str(args.training), '--validation', str(args.validation), '--seed', '20261015']
         resource = m3.run_child(command, directory, max(0.001, deadline - time.monotonic()))
         if resource['exit_code'] != 0:
             raise ValueError('selection subprocess failed')
         selection = json.loads((directory / 'stdout.log').read_text())
-        if len(selection['training']) != 20 or len({r['flop'] for r in selection['training']}) != 20:
+        if len(selection['training']) != args.training or len({r['flop'] for r in selection['training']}) != args.training:
             raise ValueError('invalid selection')
         manifest = dict(identity=identity, provenance=provenance, selection=selection,
                         selection_command=command, selection_resource=resource,
                         created_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         budget_deadline_unix=time.time() + max(0, deadline - time.monotonic()))
         save(manifest_path, manifest)
+    if args.prepare_only:
+        print(f"prepared {len(manifest['selection']['training'])} training and {len(manifest['selection'].get('validation', []))} validation boards", flush=True)
+        return 0
     # One persisted wall-clock window, including pauses between resumptions.
     # This deliberately errs conservative rather than resetting an eight-hour budget.
     deadline = min(deadline, time.monotonic() + max(0, manifest['budget_deadline_unix'] - time.time()))
-    for selected in manifest['selection']['training'][:args.limit]:
+    boards = manifest['selection']['training'][:args.limit] + manifest['selection'].get('validation', [])
+    # Shard i/n takes every n-th board so parallel workers on one machine never share a board.
+    boards = [b for i, b in enumerate(boards) if i % args.shard_count == args.shard_index]
+    for selected in boards:
         board_path = args.out / 'flops' / (selected['flop'] + '.json')
         if board_path.exists():
             cached_board = json.loads(board_path.read_text())
@@ -320,7 +336,9 @@ def main(argv=None):
                     break
                 stage2.append(candidate(args, board, row['size'], 2, deadline, identity))
                 save(args.out / 'flops' / f'{board}.json', board_result(selected, stage1, stage2, identity))
-    summarize(args.out, args.report)
+    # Parallel shards share one output directory; run --summarize-only once after all finish.
+    if args.shard_count == 1:
+        summarize(args.out, args.report)
     return 0
 
 

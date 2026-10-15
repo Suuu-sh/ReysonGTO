@@ -32,12 +32,29 @@ cargo build --release
 scp -r ~/Projects/Products/ReysonGTO/data/ranges <host>:ReysonGTO/data/
 ```
 
-## 3. 実行（Mac での計算が終わった後に、同時実行の機能を足してから）
+## 3. 実行
 
-- 予定：代表 200 ボードのうち 21〜200 番目と、確認用 80 ボードを、**ボードの分担（シャード）**で同時に回す。
-  例：16 個同時なら `--shard 0/16` 〜 `--shard 15/16` を、それぞれ `--threads 12` で起動する。
-- 1 つの解ごとに保存されるので、止まっても同じコマンドで再開できる。
-- `tmux` か `nohup` で起動し、SSH が切れても止まらないようにする。
+```sh
+cd ~/ReysonGTO
+# 1) 代表 200・確認用 80 を選んで記録する（1 回だけ）
+python3 tools/m4_trial.py --out data/m4b --training 200 --validation 80 --limit 200 \
+  --stage2-target 0.5 --max-hours 48 --prepare-only
+# 2) 分担して同時に回す（例：192 vCPU なら 16 個 × 12 スレッド。64 vCPU なら 5 個 × 12）
+N=16
+for i in $(seq 0 $((N-1))); do
+  nohup python3 tools/m4_trial.py --out data/m4b --training 200 --validation 80 --limit 200 \
+    --stage2-target 0.5 --max-hours 48 --threads 12 --memory-mb 20000 --shard $i/$N \
+    > data/m4b-shard-$i.log 2>&1 &
+done
+# 3) 全部終わったら 1 回だけ集計
+python3 tools/m4_trial.py --out data/m4b --training 200 --validation 80 --limit 200 \
+  --stage2-target 0.5 --summarize-only --report docs/benchmarks/m4-full.md
+```
+
+- 1 つの解ごとに保存されるので、止まったら同じ 2) のコマンドで再開できる（保存済みは飛ばす）。
+- Mac の 20 ボード（data/m4a）は、選び方のシードが同じなので、代表 200 の最初の 20 と同じボード。粗い段階は
+  `--reuse-stage1-from` で、細かい段階の結果も含めて手で data/m4b にコピーすれば再利用できる（必要なら）。
+- メモリ：同時に動かす数 × 1 つあたり最大約 16GB が、インスタンスのメモリに収まるようにする。
 
 ## 4. 結果の回収
 
