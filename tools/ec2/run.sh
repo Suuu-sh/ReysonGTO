@@ -44,8 +44,10 @@ sleep 2
 echo "started; logs: $OUT-shard-*.log"
 
 # Push results to the private data repository every 15 minutes (one loop per instance).
+# The loop stops after it has pushed the 完了 (complete) status, so no commits pile up afterwards.
+STATUS_FILE="$HOME/ReysonGTO-data/results/$(basename "$OUT")/status.txt"
 if ! pgrep -f "tools/ec2/sync-loop" >/dev/null; then
-  nohup setsid bash -c "exec -a tools/ec2/sync-loop bash -c 'while true; do OUT=$OUT TRAINING=$TRAINING VALIDATION=$VALIDATION bash tools/ec2/sync.sh; sleep 900; done'" \
+  nohup setsid bash -c "exec -a tools/ec2/sync-loop bash -c 'while true; do OUT=$OUT TRAINING=$TRAINING VALIDATION=$VALIDATION bash tools/ec2/sync.sh; head -n 1 $STATUS_FILE 2>/dev/null | grep -q 完了 && break; sleep 900; done'" \
     > data/sync.log 2>&1 < /dev/null &
   echo "result sync started (every 15 minutes; log: data/sync.log)"
 fi
