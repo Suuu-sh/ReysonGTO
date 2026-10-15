@@ -3,7 +3,8 @@
 # on-demand) instance named pg-yota-poc in the default VPC / subnet / security group. No key pair and
 # no SSH: the user data (tools/ec2/user-data.sh) prepares the instance, starts the shards and pushes
 # results and status to the private data repository every 15 minutes.
-# Usage: DATA_TOKEN=<github token> tools/ec2/launch.sh
+# Usage: DATA_TOKEN=<github token> [AWS_PROFILE=<profile>] tools/ec2/launch.sh
+# Asks for confirmation after showing the AWS account; set YES=1 to skip.
 # Env: DATA_TOKEN (required; fine-grained token with Contents read/write on DATA_REPO). Optional:
 #   REGION (ap-northeast-1)  TYPE (c8g.8xlarge)  MARKET (spot | ondemand)  DISK_GB (100)
 #   NAME (pg-yota-poc; the instance Name tag)  VPC_ID (default VPC)  SUBNET_ID (default subnet of the VPC)
@@ -25,8 +26,15 @@ export AWS_REGION="$REGION" AWS_PAGER=""
 # Checked before buying anything so a missing token never leaves a paid instance behind.
 : "${DATA_TOKEN:?set DATA_TOKEN (GitHub token with Contents read/write on $DATA_REPO)}"
 command -v aws >/dev/null || { echo "install the AWS CLI first (see docs/ec2-runbook.md)" >&2; exit 1; }
-aws sts get-caller-identity --query Account --output text >/dev/null ||
-  { echo "AWS CLI is not logged in: run aws configure" >&2; exit 1; }
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text) ||
+  { echo "AWS CLI is not logged in: run aws configure (or set AWS_PROFILE)" >&2; exit 1; }
+ARN=$(aws sts get-caller-identity --query Arn --output text)
+# Show which account will be charged before buying anything.
+echo "AWS account $ACCOUNT ($ARN), profile ${AWS_PROFILE:-default}, region $REGION, $MARKET $TYPE"
+if [ "${YES:-0}" != "1" ]; then
+  read -r -p "buy the instance in this account? [y/N] " answer
+  [ "$answer" = "y" ] || { echo "cancelled"; exit 1; }
+fi
 LIVE=$(aws ec2 describe-instances \
   --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
   --query 'Reservations[].Instances[].InstanceId' --output text)
@@ -90,7 +98,7 @@ ID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" \
   --user-data "file://$USER_DATA" \
   "${MARKET_OPTS[@]}" --query 'Instances[0].InstanceId' --output text)
-printf 'REGION=%s\nINSTANCE_ID=%s\nNAME=%s\n' "$REGION" "$ID" "$NAME" > "$STATE"
+printf 'REGION=%s\nINSTANCE_ID=%s\nNAME=%s\nAWS_PROFILE=%s\n' "$REGION" "$ID" "$NAME" "${AWS_PROFILE:-}" > "$STATE"
 echo "instance $ID (recorded in $STATE)"
 aws ec2 wait instance-running --instance-ids "$ID"
 echo "running. The instance now installs, builds (about 10 minutes) and starts the comparison by itself."

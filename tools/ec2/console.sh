@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs ON ANY PC with the AWS CLI logged in: shows the instance's serial console output, where the
 # user data prints its setup progress ([setup] lines). Useful before status.txt appears (no SSH needed).
-# Usage: tools/ec2/console.sh [lines]   Env: REGION (ap-northeast-1), NAME (pg-yota-poc)
+# Usage: tools/ec2/console.sh [lines]   Env: AWS_PROFILE, REGION (ap-northeast-1), NAME (pg-yota-poc)
 set -euo pipefail
 REGION="${REGION:-ap-northeast-1}"
 NAME="${NAME:-pg-yota-poc}"

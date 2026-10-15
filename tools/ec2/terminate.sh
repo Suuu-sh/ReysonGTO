@@ -2,7 +2,7 @@
 # Runs ON ANY PC with the AWS CLI logged in: cancels the persistent spot requests and terminates the
 # instances named pg-yota-poc. Results are pushed to ReysonGTO-data every 15 minutes and when the run
 # completes (status.txt says 完了); anything newer than the last push is lost with the disk.
-# Usage: tools/ec2/terminate.sh [--yes]   Env: REGION (ap-northeast-1), NAME (pg-yota-poc)
+# Usage: [AWS_PROFILE=<profile>] tools/ec2/terminate.sh [--yes]   Env: REGION (ap-northeast-1), NAME (pg-yota-poc)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 STATE="$ROOT/.local/ec2.env"
@@ -16,11 +16,14 @@ done
 if [ -f "$STATE" ]; then
   # shellcheck disable=SC1090
   source "$STATE"
+  # Use the profile recorded at launch unless one is given now.
+  [ -n "${AWS_PROFILE:-}" ] && export AWS_PROFILE
 fi
 REGION="${REGION:-ap-northeast-1}"
 NAME="${NAME:-pg-yota-poc}"
 export AWS_REGION="$REGION" AWS_PAGER=""
 command -v aws >/dev/null || { echo "install the AWS CLI first (see docs/ec2-runbook.md)" >&2; exit 1; }
+echo "AWS account $(aws sts get-caller-identity --query Account --output text), profile ${AWS_PROFILE:-default}, region $REGION"
 
 # Every live instance with the Name tag (covers a replacement started by a spot request, too).
 IDS=$(aws ec2 describe-instances \
