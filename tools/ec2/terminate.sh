@@ -5,8 +5,8 @@
 # Usage: tools/ec2/terminate.sh [--cleanup] [--yes]
 #   --cleanup  also delete the security group and key pair
 #   --yes      do not ask for confirmation
-# Env (when there is no .local/ec2.env): REGION (ap-northeast-1), NAME (reysongto-m4),
-#   SG_NAME (reysongto-ssh), KEY_NAME (reysongto), KEY_PATH (~/.ssh/reysongto.pem)
+# Env (when there is no .local/ec2.env): REGION (ap-northeast-1), NAME (pg-yota-poc),
+#   SG_NAME (pg-yota-poc), KEY_NAME (pg-yota-poc), KEY_PATH (~/.ssh/pg-yota-poc.pem)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 STATE="$ROOT/.local/ec2.env"
@@ -24,10 +24,10 @@ if [ -f "$STATE" ]; then
   source "$STATE"
 fi
 REGION="${REGION:-ap-northeast-1}"
-NAME="${NAME:-reysongto-m4}"
-SG_NAME="${SG_NAME:-reysongto-ssh}"
-KEY_NAME="${KEY_NAME:-reysongto}"
-KEY_PATH="${KEY_PATH:-$HOME/.ssh/reysongto.pem}"
+NAME="${NAME:-pg-yota-poc}"
+SG_NAME="${SG_NAME:-pg-yota-poc}"
+KEY_NAME="${KEY_NAME:-pg-yota-poc}"
+KEY_PATH="${KEY_PATH:-$HOME/.ssh/pg-yota-poc.pem}"
 export AWS_REGION="$REGION" AWS_PAGER=""
 command -v aws >/dev/null || { echo "install the AWS CLI first (see docs/ec2-runbook.md)" >&2; exit 1; }
 
