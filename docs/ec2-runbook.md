@@ -31,7 +31,7 @@ Mac（M5）では 1 ボード約 35〜45 分だった。EC2 の 1 ボードの�
 ## 2. Mac から 1 コマンドで開始
 
 ```sh
-cd ~/Projects/Products/ReysonGTO-m4     # feat/m4_refine の作業フォルダ（data/ranges があること）
+cd ~/Projects/Products/ReysonGTO     # main の作業フォルダ（data/ranges があること）
 tools/ec2/deploy.sh ubuntu@<パブリックIP> ~/.ssh/reysongto.pem
 ```
 
@@ -60,7 +60,7 @@ ssh -i ~/.ssh/reysongto.pem ubuntu@<パブリックIP> 'bash ReysonGTO/tools/ec2
 ## 5. 結果を回収する
 
 ```sh
-cd ~/Projects/Products/ReysonGTO-m4
+cd ~/Projects/Products/ReysonGTO
 tools/ec2/collect.sh ubuntu@<パブリックIP> ~/.ssh/reysongto.pem
 ```
 

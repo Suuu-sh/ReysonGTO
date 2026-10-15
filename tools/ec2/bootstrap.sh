@@ -2,7 +2,7 @@
 # Runs ON the EC2 instance (deploy.sh sends it over SSH): installs tools, clones and builds.
 # Usage: bash bootstrap.sh [branch]
 set -euo pipefail
-BRANCH="${1:-feat/m4_refine}"
+BRANCH="${1:-main}"
 
 if command -v apt-get >/dev/null; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
