@@ -31,6 +31,15 @@ aws configure    # Access key / Secret key / region: ap-northeast-1 / output: js
 aws sts get-caller-identity
 ```
 
+**別の AWS アカウントを使う場合**は、プロファイルを分けて設定し、以降のコマンドの前に `AWS_PROFILE=<名前>` を付ける
+（`launch.sh` は購入の前にアカウント ID を表示して確認を求める。起動した PC の `terminate.sh` は、起動時のプロファイルを自動で使う）：
+
+```bash
+aws configure --profile other                  # 別のアカウントのアクセスキー
+AWS_PROFILE=other aws sts get-caller-identity  # アカウント ID を確認
+export AWS_PROFILE=other                       # このターミナルでは以降ずっと other を使う
+```
+
 ### 0-3. GitHub CLI にログインする（進み具合を見るため）
 
 ```bash

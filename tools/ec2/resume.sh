@@ -2,7 +2,7 @@
 # Runs ON ANY PC with the AWS CLI logged in: restarts a stopped comparison without SSH by rebooting
 # the instance; the @reboot cron entry (bootstrap.sh) restarts the shards (finished solves are skipped)
 # and the result sync. Also starts the instance if it is stopped.
-# Usage: tools/ec2/resume.sh   Env: REGION (ap-northeast-1), NAME (pg-yota-poc)
+# Usage: tools/ec2/resume.sh   Env: AWS_PROFILE, REGION (ap-northeast-1), NAME (pg-yota-poc)
 set -euo pipefail
 REGION="${REGION:-ap-northeast-1}"
 NAME="${NAME:-pg-yota-poc}"
