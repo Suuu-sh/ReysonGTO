@@ -132,6 +132,8 @@ pub struct SolutionReport<'a> {
     pub training_seconds: f64,
     pub metrics_seconds: f64,
     pub profile: cfr::WorkProfile,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_diagnostics: Option<&'a cfr::KernelDiagnostics>,
     pub stopped_by: &'a str,
 }
 
@@ -497,6 +499,7 @@ impl Solution {
             training_seconds: self.training_seconds,
             metrics_seconds: self.metrics_seconds,
             profile: self.engine.profile(),
+            kernel_diagnostics: self.engine.kernel_diagnostics(),
             stopped_by: &self.stopped_by,
         }
     }

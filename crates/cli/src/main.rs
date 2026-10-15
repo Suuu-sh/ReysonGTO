@@ -104,6 +104,9 @@ enum Command {
         /// Disable fine-grained worker timers (the selected mode is recorded in engine metadata).
         #[arg(long)]
         no_profiling: bool,
+        /// Opt-in phase-isolated kernel workload and chance-task diagnostics.
+        #[arg(long)]
+        kernel_diagnostics: bool,
         /// Minimum number of chance children per parallel task (must be positive).
         #[arg(long, default_value_t = 1)]
         parallel_grain: usize,
@@ -223,6 +226,7 @@ fn main() -> Result<()> {
             out,
             threads,
             no_profiling,
+            kernel_diagnostics,
             parallel_grain,
             algorithm,
             no_isomorphism,
@@ -258,6 +262,7 @@ fn main() -> Result<()> {
                         .checked_mul(1024 * 1024)
                         .ok_or_else(|| anyhow!("memory limit overflow"))?,
                     profiling: !no_profiling,
+                    kernel_diagnostics,
                     storage_mode: match storage {
                         Storage::F32 => cfr::StorageMode::F32,
                         Storage::I16 => cfr::StorageMode::I16,
