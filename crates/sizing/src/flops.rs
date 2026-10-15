@@ -62,13 +62,19 @@ pub fn canonical_flops() -> Vec<CanonicalFlop> {
     for a in 0..52u8 {
         for b in (a + 1)..52 {
             for c in (b + 1)..52 {
-                *classes.entry(canonical([Card(a), Card(b), Card(c)])).or_default() += 1;
+                *classes
+                    .entry(canonical([Card(a), Card(b), Card(c)]))
+                    .or_default() += 1;
             }
         }
     }
     classes
         .into_iter()
-        .map(|(cards, weight)| CanonicalFlop { cards, weight, features: flop_features(&cards) })
+        .map(|(cards, weight)| CanonicalFlop {
+            cards,
+            weight,
+            features: flop_features(&cards),
+        })
         .collect()
 }
 
@@ -104,47 +110,62 @@ pub fn select_flops(training: usize, validation: usize, seed: u64) -> Selection 
     for list in buckets.values_mut() {
         list.sort_by_key(|f| order_key(f, seed));
     }
-    let take = |buckets: &mut BTreeMap<FlopFeatures, Vec<CanonicalFlop>>, count: usize, salt: u64| {
-        let total: u32 = buckets.values().flatten().map(|f| f.weight).sum();
-        let nonempty = buckets.values().filter(|l| !l.is_empty()).count();
-        let mut picked = Vec::new();
-        // One per non-empty bucket first (if the budget allows), then by largest remaining share.
-        let mut quotas: Vec<(FlopFeatures, f64, usize)> = buckets
-            .iter()
-            .filter(|(_, l)| !l.is_empty())
-            .map(|(k, l)| {
-                let w: u32 = l.iter().map(|f| f.weight).sum();
-                (*k, count as f64 * w as f64 / total as f64, usize::from(count >= nonempty))
-            })
-            .collect();
-        let mut assigned: usize = quotas.iter().map(|q| q.2).sum();
-        while assigned < count {
-            let best = quotas
-                .iter_mut()
-                .filter(|q| q.2 < buckets[&q.0].len())
-                .max_by(|a, b| (a.1 - a.2 as f64).total_cmp(&(b.1 - b.2 as f64)).then(order_key_bucket(&b.0, salt).cmp(&order_key_bucket(&a.0, salt))));
-            match best {
-                Some(q) => {
-                    q.2 += 1;
-                    assigned += 1;
+    let take =
+        |buckets: &mut BTreeMap<FlopFeatures, Vec<CanonicalFlop>>, count: usize, salt: u64| {
+            let total: u32 = buckets.values().flatten().map(|f| f.weight).sum();
+            let nonempty = buckets.values().filter(|l| !l.is_empty()).count();
+            let mut picked = Vec::new();
+            // One per non-empty bucket first (if the budget allows), then by largest remaining share.
+            let mut quotas: Vec<(FlopFeatures, f64, usize)> = buckets
+                .iter()
+                .filter(|(_, l)| !l.is_empty())
+                .map(|(k, l)| {
+                    let w: u32 = l.iter().map(|f| f.weight).sum();
+                    (
+                        *k,
+                        count as f64 * w as f64 / total as f64,
+                        usize::from(count >= nonempty),
+                    )
+                })
+                .collect();
+            let mut assigned: usize = quotas.iter().map(|q| q.2).sum();
+            while assigned < count {
+                let best = quotas
+                    .iter_mut()
+                    .filter(|q| q.2 < buckets[&q.0].len())
+                    .max_by(|a, b| {
+                        (a.1 - a.2 as f64)
+                            .total_cmp(&(b.1 - b.2 as f64))
+                            .then(order_key_bucket(&b.0, salt).cmp(&order_key_bucket(&a.0, salt)))
+                    });
+                match best {
+                    Some(q) => {
+                        q.2 += 1;
+                        assigned += 1;
+                    }
+                    None => break,
                 }
-                None => break,
             }
-        }
-        for (key, _, n) in quotas {
-            let list = buckets.get_mut(&key).unwrap();
-            picked.extend(list.drain(..n.min(list.len())));
-        }
-        picked.sort_by_key(|f| f.cards);
-        picked
-    };
+            for (key, _, n) in quotas {
+                let list = buckets.get_mut(&key).unwrap();
+                picked.extend(list.drain(..n.min(list.len())));
+            }
+            picked.sort_by_key(|f| f.cards);
+            picked
+        };
     let training = take(&mut buckets, training, seed);
     let validation = take(&mut buckets, validation, seed ^ 0xA5A5);
-    Selection { training, validation }
+    Selection {
+        training,
+        validation,
+    }
 }
 
 fn order_key_bucket(key: &FlopFeatures, salt: u64) -> u64 {
-    let id = (key.height as u64) << 12 | (key.pairing as u64) << 8 | (key.suits as u64) << 4 | key.connectivity as u64;
+    let id = (key.height as u64) << 12
+        | (key.pairing as u64) << 8
+        | (key.suits as u64) << 4
+        | key.connectivity as u64;
     mix(id ^ salt)
 }
 
@@ -169,10 +190,15 @@ mod tests {
         assert_eq!(ids(&a.training), ids(&b.training));
         let train: std::collections::HashSet<_> = ids(&a.training).into_iter().collect();
         assert!(ids(&a.validation).iter().all(|f| !train.contains(f)));
-        let buckets: std::collections::HashSet<_> = canonical_flops().iter().map(|f| f.features).collect();
+        let buckets: std::collections::HashSet<_> =
+            canonical_flops().iter().map(|f| f.features).collect();
         let covered: std::collections::HashSet<_> = a.training.iter().map(|f| f.features).collect();
         if buckets.len() <= 200 {
-            assert_eq!(covered.len(), buckets.len(), "every bucket has a training flop");
+            assert_eq!(
+                covered.len(),
+                buckets.len(),
+                "every bucket has a training flop"
+            );
         }
     }
 }

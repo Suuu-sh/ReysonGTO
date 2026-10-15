@@ -1,5 +1,7 @@
 //! Readable decision table from board features to one bet size (design 12.3–12.4).
-use crate::features::{flop_features, runout_card, Connectivity, Height, Pairing, RunoutCard, SuitPattern};
+use crate::features::{
+    flop_features, runout_card, Connectivity, Height, Pairing, RunoutCard, SuitPattern,
+};
 use cards::Card;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -125,10 +127,12 @@ impl RuleTable {
     }
 
     /// The table as a tree size rule. Features ignore suit labels, so the result is
-    /// suit-invariant even though it is a custom rule (see the integration note in docs).
+    /// explicitly declared suit-invariant.
     pub fn into_size_rule(self) -> SizeRule {
         let table = Arc::new(self);
-        SizeRule::Custom(Arc::new(move |c: &SizeContext<'_>| table.fraction(&Situation::from_context(c))))
+        SizeRule::SuitInvariant(Arc::new(move |c: &SizeContext<'_>| {
+            table.fraction(&Situation::from_context(c))
+        }))
     }
 }
 
@@ -142,17 +146,48 @@ mod tests {
             candidates: vec![0.33, 0.66, 1.0, 1.25],
             default_fraction: 0.66,
             rules: vec![
-                Rule { street: Some(Street::Flop), height: Some(Height::Ace), suits: Some(SuitPattern::Rainbow), fraction: 0.33, ..Default::default() },
-                Rule { street: Some(Street::Flop), connectivity: Some(Connectivity::Connected), suits: Some(SuitPattern::TwoTone), fraction: 1.0, ..Default::default() },
-                Rule { street: Some(Street::River), runout: Some(RunoutCard::FlushComplete), fraction: 1.25, ..Default::default() },
-                Rule { street: Some(Street::Flop), fraction: 0.66, ..Default::default() },
+                Rule {
+                    street: Some(Street::Flop),
+                    height: Some(Height::Ace),
+                    suits: Some(SuitPattern::Rainbow),
+                    fraction: 0.33,
+                    ..Default::default()
+                },
+                Rule {
+                    street: Some(Street::Flop),
+                    connectivity: Some(Connectivity::Connected),
+                    suits: Some(SuitPattern::TwoTone),
+                    fraction: 1.0,
+                    ..Default::default()
+                },
+                Rule {
+                    street: Some(Street::River),
+                    runout: Some(RunoutCard::FlushComplete),
+                    fraction: 1.25,
+                    ..Default::default()
+                },
+                Rule {
+                    street: Some(Street::Flop),
+                    fraction: 0.66,
+                    ..Default::default()
+                },
             ],
         }
     }
 
     fn ctx(board: &str, street: Street) -> f64 {
-        let ids: Vec<u8> = board.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap().parse::<Card>().unwrap().0).collect();
-        table().fraction(&Situation::from_context(&SizeContext { board: &ids, street, player: 1, first_bet: true, after_check: true }))
+        let ids: Vec<u8> = board
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap().parse::<Card>().unwrap().0)
+            .collect();
+        table().fraction(&Situation::from_context(&SizeContext {
+            board: &ids,
+            street,
+            player: 1,
+            first_bet: true,
+            after_check: true,
+        }))
     }
 
     #[test]
@@ -165,9 +200,17 @@ mod tests {
     }
 
     #[test]
+    fn compiled_table_is_suit_invariant() {
+        let rule = table().into_size_rule();
+        assert!(matches!(rule, SizeRule::SuitInvariant(_)));
+        rule.check_suit_invariance(20261015, 64).unwrap();
+    }
+
+    #[test]
     fn table_round_trips_through_json() {
         let t = table();
-        let back: RuleTable = serde_json::from_str(&serde_json::to_string_pretty(&t).unwrap()).unwrap();
+        let back: RuleTable =
+            serde_json::from_str(&serde_json::to_string_pretty(&t).unwrap()).unwrap();
         assert_eq!(back, t);
         back.validate().unwrap();
     }
