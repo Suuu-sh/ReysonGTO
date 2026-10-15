@@ -185,7 +185,7 @@ def board_result(selection, stage1, stage2, identity):
 def summarize(out, report):
     manifest = json.loads((out / 'manifest.json').read_text())
     rows = []
-    for selected in manifest['selection']['training'][:args.limit]:
+    for selected in manifest['selection']['training']:
         path = out / 'flops' / (selected['flop'] + '.json')
         rows.append(json.loads(path.read_text()) if path.exists() else dict(**selected, complete=False, stage1=[], stage2=[]))
     lines = ['# M4 sizing trial (pilot)', '',
@@ -296,7 +296,7 @@ def main(argv=None):
     # One persisted wall-clock window, including pauses between resumptions.
     # This deliberately errs conservative rather than resetting an eight-hour budget.
     deadline = min(deadline, time.monotonic() + max(0, manifest['budget_deadline_unix'] - time.time()))
-    for selected in manifest['selection']['training']:
+    for selected in manifest['selection']['training'][:args.limit]:
         board_path = args.out / 'flops' / (selected['flop'] + '.json')
         if board_path.exists():
             cached_board = json.loads(board_path.read_text())
