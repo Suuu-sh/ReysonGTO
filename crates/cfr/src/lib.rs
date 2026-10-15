@@ -214,6 +214,13 @@ impl State {
             self.children.iter().find_map(|s| s.find(id))
         }
     }
+    fn find_mut(&mut self, id: usize) -> Option<&mut Self> {
+        if self.id == id {
+            Some(self)
+        } else {
+            self.children.iter_mut().find_map(|s| s.find_mut(id))
+        }
+    }
     fn work(&self) -> [u128; 4] {
         // Widen before summing worker/node durations; one node's nanosecond
         // counter covers over 584 years, while the aggregate stays u128.
@@ -765,15 +772,39 @@ impl Engine {
         // The checked node-count bound in validate makes every node ID fit.
         let mut aliases: Vec<u32> = (0..tree.nodes.len()).map(|id| id as u32).collect();
         let mut alias_perms = vec![0; tree.nodes.len()];
-        let merged_children = if config.suit_isomorphism && tree.config.bet_size.is_suit_invariant()
-        {
-            prepare_iso(
+        let eligible = config.suit_isomorphism && tree.config.bet_size.is_suit_invariant();
+        let size_invariance = if eligible {
+            // Fixed seed: validation must not depend on run date or thread order.
+            tree.config
+                .bet_size
+                .check_suit_invariance(0x726579736f6e, 64)
+        } else {
+            Ok(())
+        };
+        let merged_children = if let Err(reason) = size_invariance {
+            eprintln!("warning: suit isomorphism disabled: {reason}");
+            0
+        } else if eligible {
+            match prepare_iso(
                 &tree,
                 &permutations,
                 tree.root,
                 &mut aliases,
                 &mut alias_perms,
-            )?
+            ) {
+                Ok(merged) => merged,
+                Err(reason) => {
+                    // Sampling cannot prove arbitrary callback invariance. A
+                    // structural mismatch is another safe fallback, including
+                    // undoing aliases written before the mismatch was found.
+                    eprintln!("warning: suit isomorphism disabled: {reason}");
+                    for (id, alias) in aliases.iter_mut().enumerate() {
+                        *alias = id as u32;
+                    }
+                    alias_perms.fill(0);
+                    0
+                }
+            }
         } else {
             0
         };
@@ -1001,6 +1032,162 @@ impl Engine {
             exploitability_chips,
             exploitability_pct: 100.0 * exploitability_chips / self.tree.config.starting_pot as f64,
         }
+    }
+    /// Exact conditioned profile / BR metrics outside the allocation-free
+    /// iteration loop. Input is OWN reach in original dense combo coordinates;
+    /// aliases are permuted to the stored representative before traversal.
+    /// Rejects own reach breaking any remaining merged chance-orbit symmetry;
+    /// use a full-tree engine for arbitrary asymmetric conditioned ranges.
+    /// EV retains the source game's sunk investment; percentage uses node pot.
+    pub fn metrics_at_node(
+        &mut self,
+        node: usize,
+        mut reach: [Vec<f64>; 2],
+    ) -> Result<Metrics, String> {
+        let public = self.tree.nodes.get(node).ok_or("unknown node")?;
+        let pot = public.pot;
+        let mask = board_mask(&public.board);
+        for (p, weights) in reach.iter_mut().enumerate() {
+            if weights.len() != self.ranges[p].len()
+                || weights.iter().any(|w| !w.is_finite() || *w < 0.0)
+            {
+                return Err("invalid conditioned own reach".into());
+            }
+            for (i, w) in weights.iter_mut().enumerate() {
+                if self.masks[p][i] & mask != 0 {
+                    *w = 0.0;
+                }
+            }
+            let total: f64 = weights.iter().sum();
+            if !total.is_finite() || total <= 0.0 {
+                return Err("conditioned range has no positive legal mass".into());
+            }
+            for w in weights {
+                *w /= total;
+            }
+        }
+        let mut source = node;
+        while self.aliases[source] as usize != source {
+            let permutation = &self.permutations[self.alias_perms[source] as usize];
+            reach = std::array::from_fn(|p| {
+                let mut out = vec![0.0; reach[p].len()];
+                for (i, &w) in reach[p].iter().enumerate() {
+                    out[permutation.indices[p][i]] = w;
+                }
+                out
+            });
+            source = self.aliases[source] as usize;
+        }
+        // Remaining merged orbits evaluate representatives once. That is exact
+        // only when BOTH supplied reach vectors preserve their permutations.
+        // Reject asymmetry, never silently average or accept approximate parity.
+        fn mark_orbits(state: &State, used: &mut [bool]) {
+            for orbit in &state.orbits {
+                for &p in orbit {
+                    used[p] = true;
+                }
+            }
+            for child in &state.children {
+                mark_orbits(child, used);
+            }
+        }
+        let mut used = vec![false; self.permutations.len()];
+        mark_orbits(
+            self.state.find(source).expect("alias representative state"),
+            &mut used,
+        );
+        for (id, permutation) in self.permutations.iter().enumerate() {
+            if !used[id] {
+                continue;
+            }
+            for (p, weights) in reach.iter().enumerate() {
+                if weights
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &w)| w != weights[permutation.indices[p][i]])
+                {
+                    return Err(
+                        "conditioned reach breaks a remaining suit-isomorphism orbit".into(),
+                    );
+                }
+            }
+        }
+        let other = totals(&self.hand_cards[1], &reach[1]);
+        let joint_mass: f64 = reach[0]
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| {
+                w * compatible(
+                    self.hand_cards[0][i],
+                    &other,
+                    self.same[0][i].map_or(0.0, |j| reach[1][j]),
+                )
+            })
+            .sum();
+        if !joint_mass.is_finite() || joint_mass <= 0.0 {
+            return Err("conditioned ranges have no compatible deals".into());
+        }
+        let mut evaluate = |player, mode| {
+            self.scratch[0].reach[0].copy_from_slice(&reach[0]);
+            self.scratch[0].reach[1].copy_from_slice(&reach[1]);
+            let context = Context {
+                tree: &self.tree,
+                ranges: &self.ranges,
+                masks: &self.masks,
+                hand_cards: &self.hand_cards,
+                same: &self.same,
+                tables: &self.tables,
+                terminal_table: &self.terminal_table,
+                config: &self.config,
+                permutations: &self.permutations,
+                average_reach_scale: &self.average_reach_scale,
+                initial_reach: &self.initial_reach,
+                discounts: [0.0; 3],
+                iteration: self.iterations,
+                run_start: Instant::now(),
+            };
+            let state = self
+                .state
+                .find_mut(source)
+                .expect("alias representative state");
+            let (_, buffers) = (Buffers {
+                regret: self.regret.slice(),
+                average: self.average.slice(),
+            })
+            .split(state.offset);
+            let (buffers, _) = buffers.split(state.span);
+            traverse(
+                &context,
+                state,
+                &mut self.scratch,
+                buffers,
+                player,
+                mode,
+                false,
+                &mut RunDiagnostics::default(),
+            );
+            self.scratch[0].value[..reach[player].len()]
+                .iter()
+                .zip(&reach[player])
+                .map(|(v, w)| v * w)
+                .sum::<f64>()
+                / joint_mass
+        };
+        let average_ev = [evaluate(0, Mode::Average), evaluate(1, Mode::Average)];
+        let best_response_ev = [
+            evaluate(0, Mode::BestResponse),
+            evaluate(1, Mode::BestResponse),
+        ];
+        let exploitability_chips = ((best_response_ev[0] - average_ev[0])
+            + (best_response_ev[1] - average_ev[1]))
+            .max(0.0)
+            / 2.0;
+        Ok(Metrics {
+            average_ev,
+            best_response_ev,
+            exploitability_chips,
+            exploitability_pct: 100.0 * exploitability_chips / pot as f64,
+        })
     }
     /// Average action-major probabilities; zero for future-board-blocked hands.
     /// The returned result allocation is outside the iteration loop.
