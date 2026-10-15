@@ -2,6 +2,8 @@
 # Runs ON the EC2 instance: selects the boards once, then starts parallel shards that survive SSH logout.
 # Re-running resumes (finished solves are skipped). Override with env: OUT, TRAINING, VALIDATION, THREADS, SHARDS, MEM_PER_SHARD_GB.
 set -euo pipefail
+# Name the failing command in the setup log (pushed as setup-failed.log; no SSH to look).
+trap 'echo "[run] failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 cd "$(dirname "$0")/../.."
 OUT="${OUT:-data/m4b}"
 # Empty values (from the launch user data) fall back to the defaults.
