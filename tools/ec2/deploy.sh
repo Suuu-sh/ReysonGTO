@@ -2,11 +2,11 @@
 # Runs ON THE MAC: sets up a fresh EC2 instance and starts the size comparison.
 # Usage: tools/ec2/deploy.sh <user@host> [path/to/key.pem]
 #   e.g. tools/ec2/deploy.sh ubuntu@203.0.113.10 ~/.ssh/reysongto.pem
-# Env: BRANCH (default feat/m4_refine), THREADS, SHARDS, MEM_PER_SHARD_GB (passed to run.sh).
+# Env: BRANCH (default main), THREADS, SHARDS, MEM_PER_SHARD_GB (passed to run.sh).
 set -euo pipefail
 HOST="${1:?usage: deploy.sh <user@host> [key.pem]}"
 KEY="${2:-}"
-BRANCH="${BRANCH:-feat/m4_refine}"
+BRANCH="${BRANCH:-main}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 OPTS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30)
