@@ -26,7 +26,13 @@ git add -A "results/$NAME"
 if git diff --cached --quiet; then
   echo "no new results"
 else
-  git commit -q -m "results/$NAME $(date -u +%Y-%m-%dT%H:%MZ)"
+  # A distinct message makes completion visible in the GitHub commit list.
+  if head -n 1 "$DEST/status.txt" | grep -q '完了'; then
+    MESSAGE="results/$NAME 完了 $(date -u +%Y-%m-%dT%H:%MZ)"
+  else
+    MESSAGE="results/$NAME $(date -u +%Y-%m-%dT%H:%MZ)"
+  fi
+  git commit -q -m "$MESSAGE"
   git push -q origin HEAD:main
   echo "pushed results/$NAME"
 fi

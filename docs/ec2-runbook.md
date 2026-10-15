@@ -102,7 +102,12 @@ TYPE=c8g.48xlarge tools/ec2/launch.sh
 
 ## 4. 進み具合を見る（GitHub で）
 
-- `https://github.com/Suuu-sh/ReysonGTO-data/blob/main/results/m4b/status.txt`：完了したボードの数、動いている分担、ログの最後の行
+- `https://github.com/Suuu-sh/ReysonGTO-data/blob/main/results/m4b/status.txt`：1 行目が全体の状態
+  - **「状態：完了」なら終わり**（全ボードが完了し、計算も止まっている）
+  - 「状態：計算中」なら続いている（`boards complete: N / 160` が進み具合）
+  - 「状態：停止（未完了あり…）」なら、途中で止まっている（`tools/ec2/remote.sh resume` で再開）
+  - 15 分ごとに更新される（`updated:` の時刻を見る。1 時間以上古ければ、インスタンスが止まっている可能性がある）
+- 完了したときのコミットは「results/m4b 完了 …」というメッセージになるので、ReysonGTO-data のコミット一覧でも分かる
 - `results/m4b/report.md`：その時点までの集計
 
 インスタンスを直接操作したい場合（起動した PC から）：
