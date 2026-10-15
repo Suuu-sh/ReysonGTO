@@ -5,6 +5,7 @@
 # results and status to the private data repository every 15 minutes.
 # Usage: DATA_TOKEN=<github token> [AWS_PROFILE=<profile>] tools/ec2/launch.sh
 # Asks for confirmation after showing the AWS account; set YES=1 to skip.
+# DRY_RUN=1 only checks with AWS whether the purchase is allowed (IAM / organization SCP); nothing is bought.
 # Env: DATA_TOKEN (required; fine-grained token with Contents read/write on DATA_REPO). Optional:
 #   REGION (ap-northeast-1)  TYPE (c8g.8xlarge)  MARKET (spot | ondemand)  DISK_GB (100)
 #   NAME (pg-yota-poc; the instance Name tag)  VPC_ID (default VPC)  SUBNET_ID (default subnet of the VPC)
@@ -31,7 +32,7 @@ ACCOUNT=$(aws sts get-caller-identity --query Account --output text) ||
 ARN=$(aws sts get-caller-identity --query Arn --output text)
 # Show which account will be charged before buying anything.
 echo "AWS account $ACCOUNT ($ARN), profile ${AWS_PROFILE:-default}, region $REGION, $MARKET $TYPE"
-if [ "${YES:-0}" != "1" ]; then
+if [ "${YES:-0}" != "1" ] && [ "${DRY_RUN:-0}" != "1" ]; then
   read -r -p "buy the instance in this account? [y/N] " answer
   [ "$answer" = "y" ] || { echo "cancelled"; exit 1; }
 fi
@@ -92,12 +93,29 @@ if [ "$MARKET" = "spot" ]; then
   MARKET_OPTS=(--instance-market-options
     'MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}')
 fi
-ID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" \
-  --network-interfaces "DeviceIndex=0,SubnetId=$SUBNET_ID,Groups=$SG,AssociatePublicIpAddress=true,DeleteOnTermination=true" \
-  --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$DISK_GB,VolumeType=gp3,DeleteOnTermination=true}" \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" \
-  --user-data "file://$USER_DATA" \
-  "${MARKET_OPTS[@]}" --query 'Instances[0].InstanceId' --output text)
+RUN_ARGS=(--image-id "$AMI" --instance-type "$TYPE"
+  --network-interfaces "DeviceIndex=0,SubnetId=$SUBNET_ID,Groups=$SG,AssociatePublicIpAddress=true,DeleteOnTermination=true"
+  --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$DISK_GB,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}"
+  --metadata-options "HttpTokens=required,HttpEndpoint=enabled,HttpPutResponseHopLimit=1"
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]"
+  --user-data "file://$USER_DATA" "${MARKET_OPTS[@]}")
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  # Asks AWS whether this exact purchase is allowed (IAM and organization SCPs) without buying anything.
+  if OUT=$(aws ec2 run-instances "${RUN_ARGS[@]}" --dry-run 2>&1); then :; fi
+  if grep -q DryRunOperation <<<"$OUT"; then
+    echo "DRY RUN OK: this purchase is allowed (nothing was bought)"
+  else
+    echo "DRY RUN DENIED: $OUT"
+    ENCODED=$(grep -o 'Encoded authorization failure message: [^ ]*' <<<"$OUT" | awk '{print $NF}' || true)
+    if [ -n "$ENCODED" ]; then
+      echo "--- decoded (needs sts:DecodeAuthorizationMessage)"
+      aws sts decode-authorization-message --encoded-message "$ENCODED" --query DecodedMessage --output text 2>&1 |
+        python3 -m json.tool 2>/dev/null || echo "(could not decode; send the message above to the account administrator)"
+    fi
+  fi
+  exit 0
+fi
+ID=$(aws ec2 run-instances "${RUN_ARGS[@]}" --query 'Instances[0].InstanceId' --output text)
 printf 'REGION=%s\nINSTANCE_ID=%s\nNAME=%s\nAWS_PROFILE=%s\n' "$REGION" "$ID" "$NAME" "${AWS_PROFILE:-}" > "$STATE"
 echo "instance $ID (recorded in $STATE)"
 aws ec2 wait instance-running --instance-ids "$ID"

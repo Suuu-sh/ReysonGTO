@@ -96,8 +96,16 @@ aws budgets create-budget --account-id "$ACCOUNT" \
 ```bash
 cd ~/ReysonGTO && git pull --ff-only
 read -rs DATA_TOKEN && export DATA_TOKEN      # トークンを貼り付けて Enter（画面には出ない）
-TYPE=c8g.48xlarge tools/ec2/launch.sh
+TYPE=c8g.8xlarge THREADS=10 tools/ec2/launch.sh   # 32 vCPU / 64GB で 3 つ同時に（約 2〜2.2 日）
 ```
+
+**組織の SCP などで購入が禁止されていないかを、買わずに確かめる**（おすすめ。止められたら理由が表示される）：
+
+```bash
+DRY_RUN=1 TYPE=c8g.8xlarge THREADS=10 tools/ec2/launch.sh
+```
+
+`DRY RUN OK` なら、`DRY_RUN=1` を外して実行する。`DRY RUN DENIED` なら、表示された理由（どの操作・条件が拒否されたか）を管理者か Claude に伝える。
 
 `launch.sh` がすること：
 
@@ -120,6 +128,7 @@ TYPE=c8g.48xlarge tools/ec2/launch.sh
 | セキュリティグループ | その VPC の **default**（入る通信は不要。出る通信で GitHub とパッケージを取得） |
 | パブリック IP | 付ける（GitHub に出るため） |
 | キーペア・SSH | 使わない |
+| ディスク・メタデータ | ディスクは暗号化（アカウントの既定の KMS キー）、インスタンスのメタデータは IMDSv2 のみ（組織の SCP でよく求められる設定） |
 | 名前 | インスタンスの Name タグ `pg-yota-poc` だけ |
 
 ### 時間と費用の目安（概算。1 ボード約 45 分、同時に解く 1 つあたり 1 時間に約 1.3 ボード）
