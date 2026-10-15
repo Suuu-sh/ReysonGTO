@@ -100,7 +100,17 @@ TYPE=c8g.48xlarge tools/ec2/launch.sh
 | c8g.16xlarge | 5 | 約 1 ドル | 約 1 日 | 約 25〜30 ドル |
 | c8g.48xlarge | 16 | 約 2.5〜3 ドル | 約 8 時間 | 約 25〜30 ドル |
 
-## 4. 進み具合を見る（GitHub で）
+## 4. 進み具合を見る（GitHub で。PC を閉じてもよい）
+
+`launch.sh` が最後に `done. results appear in ...` と出したら、計算と結果の push はインスタンスの中で動いているので、
+**起動した PC は閉じてよい**。進み具合はどの PC からでも見られる（GitHub CLI でログインしていれば）：
+
+```bash
+tools/ec2/progress.sh            # 今の status.txt
+tools/ec2/progress.sh --watch    # 5 分ごとに更新し、完了したら知らせて止まる
+```
+
+ブラウザなら：
 
 - `https://github.com/Suuu-sh/ReysonGTO-data/blob/main/results/m4b/status.txt`：1 行目が全体の状態
   - **「状態：完了」なら終わり**（全ボードが完了し、計算も止まっている）
@@ -111,7 +121,7 @@ TYPE=c8g.48xlarge tools/ec2/launch.sh
 - 自動のコミットは、この完了のコミットを push したところで止まる（終了までの間にコミットが増え続けることはない）
 - `results/m4b/report.md`：その時点までの集計
 
-インスタンスを直接操作したい場合（起動した PC から）：
+インスタンスを直接操作したい場合（起動した PC から。`.local/ec2.env` を使う）：
 
 ```bash
 tools/ec2/remote.sh status    # 今の状態
@@ -121,16 +131,18 @@ tools/ec2/remote.sh stop      # 計算を止める
 tools/ec2/remote.sh ssh       # インスタンスに入る
 ```
 
-## 5. 終わったら（status.txt で全部完了を確認してから）
+## 5. 終わったら（「状態：完了」を確認してから。どの PC からでもよい）
+
+完了の結果は自動で push 済みなので、そのまま終了してよい。AWS CLI でログインしている PC なら、起動した PC でなくてもよい
+（起動した PC でなければ、インスタンスの名前 `reysongto-m4` で探す）。
 
 ```bash
-tools/ec2/remote.sh collect        # 最後の結果を push
 tools/ec2/terminate.sh             # スポットのリクエストを取り消し、インスタンスを終了（確認あり）
 tools/ec2/terminate.sh --cleanup   # さらにセキュリティグループとキーペアも消す
 ```
 
-- **必ず collect してから終了する**（ディスクごと消える）。スポットのリクエストを取り消さずにインスタンスだけ終了すると、
-  代わりのインスタンスが立ち上がるので、必ずこのスクリプトで終了する。
+- 完了の前に止める場合は、先に `tools/ec2/remote.sh collect`（起動した PC から）で最新の結果を push してから終了する（ディスクごと消える）。
+- スポットのリクエストを取り消さずにインスタンスだけ終了すると、代わりのインスタンスが立ち上がるので、必ずこのスクリプトで終了する。
 - 使い終わったトークンは GitHub で削除する。
 
 残っていないかの確認：
@@ -143,9 +155,8 @@ aws ec2 describe-instances --region ap-northeast-1 \
 
 ## 補足
 
-- スクリプト：`launch.sh`・`deploy.sh`・`remote.sh`・`collect.sh`・`terminate.sh`（操作する PC）、
+- スクリプト：`launch.sh`・`deploy.sh`・`remote.sh`・`collect.sh`（起動した PC）、`progress.sh`（GitHub CLI がある PC）、`terminate.sh`（AWS CLI がある PC）、
   `bootstrap.sh`・`run.sh`・`status.sh`・`sync.sh`（インスタンス）。
 - 比べるボードの数：`TRAINING=200 VALIDATION=80 TYPE=... tools/ec2/launch.sh`
 - 計算の中身は `tools/m4_trial.py`（全候補を約 5%、上位 2 つを約 0.5% で解く。1 つの解ごとに保存し、再開できる）。
-- インスタンスの操作（remote.sh、terminate.sh）は、起動した PC の `.local/ec2.env` を使う。別の PC から終了したい場合は、
-  AWS コンソールで、スポットリクエストのキャンセル → インスタンスの終了、の順で行う。
+- `remote.sh` と `collect.sh` は、起動した PC の `.local/ec2.env`（と SSH の鍵）を使う。`progress.sh` と `terminate.sh` は、どの PC からでも使える。
