@@ -90,6 +90,32 @@ def reusable(record, identity):
         return False
 
 
+def imported_stage1(args, board, size, stage):
+    """A complete stage-1 result from an earlier run with the same game settings.
+
+    Source hashes differ between runs (new crates), so only the solved game is compared:
+    the solution file must still match its recorded digest and use the same stage-1 target."""
+    if stage != 1 or args.reuse_stage1_from is None:
+        return None
+    path = args.reuse_stage1_from / 'runs' / board / f'stage1-{size}' / 'result.json'
+    if not path.exists():
+        return None
+    record = json.loads(path.read_text())
+    old = json.loads((args.reuse_stage1_from / 'manifest.json').read_text())['provenance']['config']
+    same_game = all(old.get(k) == v for k, v in game_config().items())
+    try:
+        intact = record.get('solution_sha256') == m3.digest(Path(record['solution_path']))
+    except (OSError, KeyError):
+        intact = False
+    if record.get('status') == 'complete' and same_game and intact and record.get('target_pct') == args.stage1_target:
+        return dict(record, reused_from=str(path))
+    return None
+
+
+def game_config():
+    return dict(sizes=SIZES, pot=POT, stack=97.5, player=1, turn=66, river=66, preset='production')
+
+
 def candidate(args, board, size, stage, deadline, identity):
     directory = args.out / 'runs' / board / f'stage{stage}-{size}'
     directory.mkdir(parents=True, exist_ok=True)
@@ -98,6 +124,11 @@ def candidate(args, board, size, stage, deadline, identity):
         record = json.loads(cached.read_text())
         if reusable(record, identity):
             return record
+    imported = imported_stage1(args, board, size, stage)
+    if imported:
+        save(cached, dict(imported, identity=identity))
+        print(f'{board} stage{stage} {size}%: reused from {args.reuse_stage1_from}', flush=True)
+        return dict(imported, identity=identity)
     # Retain every failed attempt and partial checkpoint, never overwrite it on resume.
     attempt = 1
     while (directory / f'attempt-{attempt}').exists():
@@ -107,7 +138,7 @@ def candidate(args, board, size, stage, deadline, identity):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return dict(status='budget_exhausted', size=size, stage=stage, identity=identity)
-    target = 5.0 if stage == 1 else 2.0
+    target = args.stage1_target if stage == 1 else args.stage2_target
     args.target, args.max_seconds = target, max(0.001, remaining - min(30, remaining / 10))
     command = m3.command_for(args, board, directory)
     command[command.index('--bet-flop') + 1] = str(size)
@@ -153,7 +184,7 @@ def board_result(selection, stage1, stage2, identity):
 def summarize(out, report):
     manifest = json.loads((out / 'manifest.json').read_text())
     rows = []
-    for selected in manifest['selection']['training']:
+    for selected in manifest['selection']['training'][:args.limit]:
         path = out / 'flops' / (selected['flop'] + '.json')
         rows.append(json.loads(path.read_text()) if path.exists() else dict(**selected, complete=False, stage1=[], stage2=[]))
     lines = ['# M4 sizing trial (pilot)', '',
@@ -214,9 +245,18 @@ def main(argv=None):
     parser.add_argument('--max-hours', type=float, default=8)
     parser.add_argument('--max-iters', type=int, default=10000)
     parser.add_argument('--summarize-only', action='store_true')
+    parser.add_argument('--stage1-target', type=float, default=5.0)
+    parser.add_argument('--stage2-target', type=float, default=2.0)
+    parser.add_argument('--reuse-stage1-from', type=Path, default=None,
+                        help='earlier --out directory whose complete stage-1 solves are reused')
+    parser.add_argument('--limit', type=int, default=20, help='solve only the first N selected boards')
     args = parser.parse_args(argv)
-    if not math.isfinite(args.max_hours) or not 0 < args.max_hours <= 8 or min(args.threads, args.memory_mb, args.max_iters) <= 0:
-        parser.error('positive resources required; max-hours must be <= 8')
+    if not math.isfinite(args.max_hours) or not 0 < args.max_hours <= 48 or min(args.threads, args.memory_mb, args.max_iters, args.limit) <= 0:
+        parser.error('positive resources required; max-hours must be <= 48')
+    if not 0 < args.stage2_target <= args.stage1_target:
+        parser.error('stage targets must satisfy 0 < stage2 <= stage1')
+    if args.reuse_stage1_from is not None:
+        args.reuse_stage1_from = args.reuse_stage1_from.resolve()
     args.out, args.report = args.out.resolve(), args.report.resolve()
     if args.summarize_only:
         summarize(args.out, args.report)
@@ -228,7 +268,7 @@ def main(argv=None):
     paths = [args.binary, args.sizing_binary, args.oop_range, args.ip_range]
     sources = sorted([*ROOT.glob('crates/**/*.rs'), *ROOT.glob('crates/**/Cargo.toml'), ROOT / 'Cargo.toml', ROOT / 'Cargo.lock', Path(__file__).resolve(), ROOT / 'tools/m3_bench.py'])
     config = dict(threads=args.threads, memory_mb=args.memory_mb, max_iters=args.max_iters,
-                  sizes=SIZES, targets=[5, 2], pot=POT, stack=97.5, player=1, turn=66, river=66, preset='production')
+                  targets=[args.stage1_target, args.stage2_target], **game_config())
     provenance = dict(hashes={str(p): m3.digest(p) for p in paths + sources}, config=config)
     identity = fingerprint(provenance)
     args.out.mkdir(parents=True, exist_ok=True)
