@@ -15,7 +15,7 @@ if [ -f "$HOME/.cargo/env" ]; then
   source "$HOME/.cargo/env"
 fi
 for f in data/ranges/btn_open.json data/ranges/bb_call.json target/release/cli target/release/sizing; do
-  [ -e "$f" ] || { echo "missing $f (run deploy.sh from the Mac)" >&2; exit 1; }
+  [ -e "$f" ] || { echo "missing $f (run deploy.sh / bootstrap.sh first)" >&2; exit 1; }
 done
 if pgrep -f "tools/m4_trial.py --out $OUT" >/dev/null; then
   echo "shards for $OUT are already running; see tools/ec2/status.sh" >&2
@@ -42,3 +42,10 @@ for i in $(seq 0 $(( SHARDS - 1 ))); do
 done
 sleep 2
 echo "started; logs: $OUT-shard-*.log"
+
+# Push results to the private data repository every 15 minutes (one loop per instance).
+if ! pgrep -f "tools/ec2/sync-loop" >/dev/null; then
+  nohup setsid bash -c "exec -a tools/ec2/sync-loop bash -c 'while true; do OUT=$OUT TRAINING=$TRAINING VALIDATION=$VALIDATION bash tools/ec2/sync.sh; sleep 900; done'" \
+    > data/sync.log 2>&1 < /dev/null &
+  echo "result sync started (every 15 minutes; log: data/sync.log)"
+fi

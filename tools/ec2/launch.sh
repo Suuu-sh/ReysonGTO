@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Runs ON THE MAC: buys a spot (or on-demand) instance with the AWS CLI, waits for SSH,
-# then runs deploy.sh to install, build and start the size comparison.
-# Usage: tools/ec2/launch.sh
-# Env (all optional):
+# Runs ON YOUR PC (macOS, Linux or Windows WSL): buys a spot (or on-demand) instance with the AWS CLI,
+# waits for SSH, then runs deploy.sh to install, build and start the size comparison.
+# Usage: DATA_TOKEN=<github token> tools/ec2/launch.sh
+# Env: DATA_TOKEN (required unless DEPLOY=0; see deploy.sh). Optional:
 #   REGION (ap-northeast-1)  TYPE (c8g.8xlarge)  MARKET (spot | ondemand)  DISK_GB (100)
 #   NAME (reysongto-m4)  KEY_NAME (reysongto)  KEY_PATH (~/.ssh/reysongto.pem)  SG_NAME (reysongto-ssh)
 #   DEPLOY (1; set 0 to only create the instance)
@@ -20,7 +20,12 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 STATE="$ROOT/.local/ec2.env"
 export AWS_REGION="$REGION" AWS_PAGER=""
 
-command -v aws >/dev/null || { echo "install the AWS CLI first: brew install awscli" >&2; exit 1; }
+if [ "${DEPLOY:-1}" = "1" ] && [ -z "${DATA_TOKEN:-}" ]; then
+  # Checked before buying anything so a missing token never leaves a paid instance behind.
+  echo "set DATA_TOKEN (GitHub token with read/write on Suuu-sh/ReysonGTO-data) or DEPLOY=0" >&2
+  exit 1
+fi
+command -v aws >/dev/null || { echo "install the AWS CLI first (see docs/ec2-runbook.md)" >&2; exit 1; }
 aws sts get-caller-identity --query Account --output text >/dev/null ||
   { echo "AWS CLI is not logged in: run aws configure" >&2; exit 1; }
 if [ -f "$STATE" ]; then

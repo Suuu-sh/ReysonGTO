@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs ON THE MAC: shortcuts for the instance recorded by launch.sh.
+# Runs ON YOUR PC: shortcuts for the instance recorded by launch.sh.
 # Usage: tools/ec2/remote.sh status | collect | resume | stop | ssh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
