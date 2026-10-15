@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs ON the EC2 instance: progress of the shards. The first line is the overall state:
-#   状態：計算中 / 状態：完了 / 状態：停止（未完了あり。tools/ec2/remote.sh resume で再開）
+#   状態：計算中 / 状態：完了 / 状態：停止（未完了あり。tools/ec2/resume.sh で再開）
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 OUT="${OUT:-data/m4b}"
@@ -20,7 +20,7 @@ if [ "${SHARDS:-0}" -gt 0 ]; then
 elif [ "$DONE" -ge "$TOTAL" ]; then
   echo "状態：完了"
 else
-  echo "状態：停止（未完了あり。tools/ec2/remote.sh resume で再開）"
+  echo "状態：停止（未完了あり。tools/ec2/resume.sh で再開）"
 fi
 echo "boards complete: $DONE / $TOTAL"
 echo "running shards: ${SHARDS:-0}"
