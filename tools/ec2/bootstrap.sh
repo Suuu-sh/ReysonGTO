@@ -3,6 +3,8 @@
 # clones and builds, and fetches the ranges. Usage: bash bootstrap.sh [branch] [data-repo]
 # The GitHub credentials for the private data repository are set up by the user data beforehand.
 set -euo pipefail
+# Name the failing command in the setup log (pushed as setup-failed.log; no SSH to look).
+trap 'echo "[bootstrap] failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 BRANCH="${1:-main}"
 DATA_REPO="${2:-Suuu-sh/ReysonGTO-data}"
 
@@ -39,6 +41,10 @@ fi
 git -C "$HOME/ReysonGTO-data" pull -q --ff-only origin main
 ln -sfn "$HOME/ReysonGTO-data/ranges" data/ranges
 # Resume the shards automatically after a spot interruption brings the instance back.
-( crontab -l 2>/dev/null | grep -v 'tools/ec2/run.sh' ; \
-  echo "@reboot sleep 60 && cd $HOME/ReysonGTO && bash tools/ec2/run.sh >> $HOME/ReysonGTO/data/reboot.log 2>&1" ) | crontab -
+# A new instance has no crontab yet: `crontab -l` fails and grep -v may print nothing, and with
+# `set -e -o pipefail` either would abort the setup, so both are allowed to fail here.
+REBOOT_LINE="@reboot sleep 60 && cd $HOME/ReysonGTO && bash tools/ec2/run.sh >> $HOME/ReysonGTO/data/reboot.log 2>&1"
+EXISTING_CRON="$(crontab -l 2>/dev/null || true)"
+{ grep -v 'tools/ec2/run.sh' <<<"$EXISTING_CRON" || true; echo "$REBOOT_LINE"; } | crontab -
+echo "[setup] @reboot entry installed"
 echo "bootstrap done: $(git rev-parse --short HEAD) on $(uname -m), $(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB"
