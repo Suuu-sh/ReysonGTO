@@ -1,7 +1,7 @@
 # EC2 でサイズの比較（M4：代表 200・確認用 80）を回す手順（すべてコマンド）
 
 Mac のターミナルで、上から順に実行する。AWS の認証情報の入力（0-2）と、上限の引き上げの申請（1）はユーザーが行う。
-既定のリージョンは東京（ap-northeast-1）、インスタンスは c8g.48xlarge（Graviton、192 vCPU / 384GB）のスポット。
+既定のリージョンは東京（ap-northeast-1）、インスタンスは c8g.8xlarge（Graviton、32 vCPU / 64GB、同時に 2 ボード）のスポット。
 
 ## 0. 準備（最初の 1 回だけ）
 
@@ -35,7 +35,7 @@ ls data/ranges   # btn_open.json と bb_call.json があること（製品のレ
 
 ## 1. vCPU の上限を確認する（足りなければ申請）
 
-スポットの vCPU の上限（全標準インスタンス）が 192 以上必要（c7g.16xlarge なら 64 以上）。
+スポットの vCPU の上限（全標準インスタンス）が、使うタイプの vCPU 以上必要（c8g.8xlarge なら 32、c8g.16xlarge なら 64、c8g.48xlarge なら 192）。
 
 ```bash
 aws service-quotas get-service-quota --region ap-northeast-1 --service-code ec2 \
@@ -46,7 +46,7 @@ aws service-quotas get-service-quota --region ap-northeast-1 --service-code ec2 
 
 ```bash
 aws service-quotas request-service-quota-increase --region ap-northeast-1 --service-code ec2 \
-  --quota-code L-34B43A08 --desired-value 192
+  --quota-code L-34B43A08 --desired-value 64
 ```
 
 オンデマンドで回す場合の上限は `L-1216C47A`（同じコマンドで確認・申請）。
@@ -72,7 +72,7 @@ tools/ec2/launch.sh
 
 1. Ubuntu 24.04（arm64）の最新イメージを探す
 2. キーペア（`~/.ssh/reysongto.pem`）とセキュリティグループ（この Mac の IP からの SSH だけ許可）を作る
-3. **c8g.48xlarge のスポットインスタンス**を買う（中断されたら停止し、空きが戻ったら同じディスクで再開する設定）
+3. **c8g.8xlarge のスポットインスタンス**を買う（中断されたら停止し、空きが戻ったら同じディスクで再開する設定）
 4. 起動と SSH を待つ
 5. ツールの導入とビルド（5〜10 分）、レンジの送付、代表 200・確認用 80 の選択、CPU とメモリに合わせた数の分担で計算を開始
    （インスタンスが再起動したときも自動で再開する）
@@ -82,17 +82,21 @@ tools/ec2/launch.sh
 変えたい場合は環境変数で指定する：
 
 ```bash
-TYPE=c7g.16xlarge tools/ec2/launch.sh          # 64 vCPU / 128GB（遅いが同じくらいの費用）
+TYPE=c8g.16xlarge tools/ec2/launch.sh          # 64 vCPU / 128GB（同時に 5 ボード。早いが同じくらいの費用）
+TYPE=c8g.48xlarge tools/ec2/launch.sh          # 192 vCPU / 384GB（同時に 16 ボード）
 MARKET=ondemand tools/ec2/launch.sh            # 中断されない（料金は 3〜4 倍）
 REGION=us-east-1 tools/ec2/launch.sh           # スポットの空きや価格で選ぶ
 ```
 
-### 時間と費用の目安（概算）
+### 時間と費用の目安（概算。1 ボード約 45 分、同時に解く 1 つあたり 1 時間に約 1.3 ボード）
 
-| タイプ | 同時に解く数 | 280 ボードの時間 | 費用（スポット） | 費用（オンデマンド） |
-|---|---|---|---|---|
-| c8g.48xlarge | 16（12 スレッドずつ） | 約 15〜20 時間 | 約 40〜60 ドル | 約 120〜150 ドル |
-| c7g.16xlarge | 5 | 約 2〜3 日 | 約 40〜60 ドル | 約 120〜160 ドル |
+| タイプ | 同時に解く数 | 1 時間あたり（スポット） | 120 ボード | 280 ボード | 総額 |
+|---|---|---|---|---|---|
+| c8g.8xlarge（既定） | 2 | 約 0.5 ドル | 約 2 日 | 約 4〜5 日 | 120 で約 20〜25 ドル |
+| c8g.16xlarge | 5 | 約 1 ドル | 約 18〜20 時間 | 約 2 日 | 120 で約 20 ドル |
+| c8g.48xlarge | 16 | 約 2.5〜3 ドル | 約 6 時間 | 約 13〜15 時間 | 280 で約 40〜50 ドル |
+
+総額はボードの数でほぼ決まり、タイプを小さくすると時間が延びるだけ。
 
 ## 4. 進み具合を見る・操作する
 

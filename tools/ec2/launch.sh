@@ -3,12 +3,12 @@
 # then runs deploy.sh to install, build and start the size comparison.
 # Usage: tools/ec2/launch.sh
 # Env (all optional):
-#   REGION (ap-northeast-1)  TYPE (c8g.48xlarge)  MARKET (spot | ondemand)  DISK_GB (100)
+#   REGION (ap-northeast-1)  TYPE (c8g.8xlarge)  MARKET (spot | ondemand)  DISK_GB (100)
 #   NAME (reysongto-m4)  KEY_NAME (reysongto)  KEY_PATH (~/.ssh/reysongto.pem)  SG_NAME (reysongto-ssh)
 #   DEPLOY (1; set 0 to only create the instance)
 set -euo pipefail
 REGION="${REGION:-ap-northeast-1}"
-TYPE="${TYPE:-c8g.48xlarge}"
+TYPE="${TYPE:-c8g.8xlarge}"
 MARKET="${MARKET:-spot}"
 DISK_GB="${DISK_GB:-100}"
 NAME="${NAME:-reysongto-m4}"
