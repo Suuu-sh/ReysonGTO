@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs ON THE MAC: cancels the persistent spot request and terminates the instance recorded by launch.sh.
+# Runs ON YOUR PC: cancels the persistent spot request and terminates the instance recorded by launch.sh.
 # Collect results first (tools/ec2/remote.sh collect): the disk is deleted with the instance.
 # Usage: tools/ec2/terminate.sh [--cleanup]   (--cleanup also deletes the security group and key pair)
 set -euo pipefail
