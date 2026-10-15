@@ -29,4 +29,7 @@ git checkout "$BRANCH"
 git pull --ff-only origin "$BRANCH"
 cargo build --release -p cli -p sizing
 mkdir -p data
+# Resume the shards automatically after a spot interruption brings the instance back.
+( crontab -l 2>/dev/null | grep -v 'tools/ec2/run.sh' ; \
+  echo "@reboot sleep 60 && cd $HOME/ReysonGTO && bash tools/ec2/run.sh >> $HOME/ReysonGTO/data/reboot.log 2>&1" ) | crontab -
 echo "bootstrap done: $(git rev-parse --short HEAD) on $(uname -m), $(nproc) vCPU, $(free -g | awk '/Mem:/{print $2}') GB"
