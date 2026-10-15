@@ -19,8 +19,8 @@ echo "== 1/3 GitHub credentials for $DATA_REPO (sent over stdin, stored with mod
 printf 'https://x-access-token:%s@github.com\n' "$DATA_TOKEN" |
   ssh "${OPTS[@]}" "$HOST" 'umask 077 && cat > ~/.git-credentials &&
     git config --global credential.helper store &&
-    git config --global user.name "reysongto-ec2" &&
-    git config --global user.email "reysongto-ec2@users.noreply.github.com"'
+    git config --global user.name "pg-yota-poc" &&
+    git config --global user.email "pg-yota-poc@users.noreply.github.com"'
 
 echo "== 2/3 install, build and fetch the ranges on $HOST (about 5-10 minutes)"
 ssh "${OPTS[@]}" "$HOST" "bash -s -- '$BRANCH' '$DATA_REPO'" < "$HERE/bootstrap.sh"

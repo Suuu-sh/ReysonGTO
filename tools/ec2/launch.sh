@@ -4,17 +4,20 @@
 # Usage: DATA_TOKEN=<github token> tools/ec2/launch.sh
 # Env: DATA_TOKEN (required unless DEPLOY=0; see deploy.sh). Optional:
 #   REGION (ap-northeast-1)  TYPE (c8g.8xlarge)  MARKET (spot | ondemand)  DISK_GB (100)
-#   NAME (reysongto-m4)  KEY_NAME (reysongto)  KEY_PATH (~/.ssh/reysongto.pem)  SG_NAME (reysongto-ssh)
+#   NAME (pg-yota-poc)  KEY_NAME (pg-yota-poc)  KEY_PATH (~/.ssh/pg-yota-poc.pem)  SG_NAME (pg-yota-poc)
+#   VPC_ID (default VPC)  SUBNET_ID (a subnet of VPC_ID; default: the first default/any subnet of the VPC)
 #   DEPLOY (1; set 0 to only create the instance)
+# Network: the instance gets a public IP; its security group allows SSH (22) only from this PC's IP
+# and all outbound traffic (GitHub, packages).
 set -euo pipefail
 REGION="${REGION:-ap-northeast-1}"
 TYPE="${TYPE:-c8g.8xlarge}"
 MARKET="${MARKET:-spot}"
 DISK_GB="${DISK_GB:-100}"
-NAME="${NAME:-reysongto-m4}"
-KEY_NAME="${KEY_NAME:-reysongto}"
-KEY_PATH="${KEY_PATH:-$HOME/.ssh/reysongto.pem}"
-SG_NAME="${SG_NAME:-reysongto-ssh}"
+NAME="${NAME:-pg-yota-poc}"
+KEY_NAME="${KEY_NAME:-pg-yota-poc}"
+KEY_PATH="${KEY_PATH:-$HOME/.ssh/pg-yota-poc.pem}"
+SG_NAME="${SG_NAME:-pg-yota-poc}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 STATE="$ROOT/.local/ec2.env"
@@ -47,18 +50,37 @@ if [ ! -f "$KEY_PATH" ]; then
   fi
   mkdir -p "$(dirname "$KEY_PATH")"
   aws ec2 create-key-pair --key-name "$KEY_NAME" --key-type ed25519 \
+    --tag-specifications "ResourceType=key-pair,Tags=[{Key=Name,Value=$NAME}]" \
     --query KeyMaterial --output text > "$KEY_PATH"
   chmod 400 "$KEY_PATH"
 fi
 
-echo "== security group $SG_NAME (SSH from this Mac's IP only)"
-VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
-[ "$VPC" != "None" ] || { echo "no default VPC in $REGION" >&2; exit 1; }
+echo "== network"
+if [ -n "${SUBNET_ID:-}" ]; then
+  VPC=$(aws ec2 describe-subnets --subnet-ids "$SUBNET_ID" --query 'Subnets[0].VpcId' --output text)
+elif [ -n "${VPC_ID:-}" ]; then
+  VPC="$VPC_ID"
+else
+  VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+  [ "$VPC" != "None" ] || { echo "no default VPC in $REGION; set VPC_ID and SUBNET_ID" >&2; exit 1; }
+fi
+if [ -z "${SUBNET_ID:-}" ]; then
+  SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" "Name=default-for-az,Values=true" \
+    --query 'Subnets[0].SubnetId' --output text)
+  if [ "$SUBNET_ID" = "None" ]; then
+    SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" --query 'Subnets[0].SubnetId' --output text)
+  fi
+fi
+[ "$SUBNET_ID" != "None" ] || { echo "no subnet in $VPC" >&2; exit 1; }
+echo "vpc $VPC, subnet $SUBNET_ID (needs a route to an internet gateway)"
+
+echo "== security group $SG_NAME (SSH from this PC's IP only)"
 SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC" \
   --query 'SecurityGroups[0].GroupId' --output text)
 if [ "$SG" = "None" ]; then
-  SG=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "ReysonGTO SSH" \
-    --vpc-id "$VPC" --query GroupId --output text)
+  SG=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "$SG_NAME ssh" \
+    --vpc-id "$VPC" --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$NAME}]" \
+    --query GroupId --output text)
 fi
 MYIP=$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')
 aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 \
@@ -73,9 +95,9 @@ if [ "$MARKET" = "spot" ]; then
     'MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}')
 fi
 ID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --key-name "$KEY_NAME" \
-  --security-group-ids "$SG" \
+  --network-interfaces "DeviceIndex=0,SubnetId=$SUBNET_ID,Groups=$SG,AssociatePublicIpAddress=true,DeleteOnTermination=true" \
   --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$DISK_GB,VolumeType=gp3,DeleteOnTermination=true}" \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" "ResourceType=volume,Tags=[{Key=Name,Value=$NAME}]" \
   "${MARKET_OPTS[@]}" --query 'Instances[0].InstanceId' --output text)
 mkdir -p "$ROOT/.local"
 printf 'REGION=%s\nINSTANCE_ID=%s\nKEY_NAME=%s\nKEY_PATH=%s\nSG_ID=%s\nSG_NAME=%s\n' \

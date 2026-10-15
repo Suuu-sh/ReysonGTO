@@ -70,7 +70,7 @@ aws service-quotas request-service-quota-increase --region ap-northeast-1 --serv
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 aws budgets create-budget --account-id "$ACCOUNT" \
-  --budget '{"BudgetName":"reysongto","BudgetLimit":{"Amount":"100","Unit":"USD"},"TimeUnit":"MONTHLY","BudgetType":"COST"}' \
+  --budget '{"BudgetName":"pg-yota-poc","BudgetLimit":{"Amount":"100","Unit":"USD"},"TimeUnit":"MONTHLY","BudgetType":"COST"}' \
   --notifications-with-subscribers '[{"Notification":{"NotificationType":"FORECASTED","ComparisonOperator":"GREATER_THAN","Threshold":80,"ThresholdType":"PERCENTAGE"},"Subscribers":[{"SubscriptionType":"EMAIL","Address":"<メール>"}]}]'
 ```
 
@@ -84,13 +84,27 @@ TYPE=c8g.48xlarge tools/ec2/launch.sh
 
 これで次がすべて自動で行われる。
 
-1. Ubuntu 24.04（arm64）のイメージを探し、キーペア（`~/.ssh/reysongto.pem`）と、この PC の IP からの SSH だけを許すセキュリティグループを作る
+1. Ubuntu 24.04（arm64）のイメージを探し、キーペア（`~/.ssh/pg-yota-poc.pem`）と、この PC の IP からの SSH だけを許すセキュリティグループを作る
 2. スポットインスタンスを買う（中断されたら停止し、空きが戻ったら同じディスクで再開する設定）
 3. インスタンスに GitHub のトークンを渡し（権限 600 のファイル）、ツールの導入とビルド、ReysonGTO-data からレンジを取得
 4. 代表 120・確認用 40 を選び、CPU とメモリに合わせた数（c8g.48xlarge なら 16）の分担で計算を開始
 5. **15 分ごとに結果を ReysonGTO-data の `results/m4b/` へ push**（インスタンスが再起動しても自動で再開）
 
 インスタンスの情報はこの PC の `~/ReysonGTO/.local/ec2.env` に記録される（Git には入らない）。
+
+### ネットワークと名前
+
+| 項目 | 既定 | 変える場合 |
+|---|---|---|
+| VPC | そのリージョンの**デフォルト VPC** | `VPC_ID=vpc-xxxx` |
+| サブネット | その VPC のデフォルトのサブネット（なければ最初のサブネット）。**パブリック IP を付ける** | `SUBNET_ID=subnet-xxxx`（インターネットゲートウェイへの経路が必要） |
+| セキュリティグループ | `pg-yota-poc`。**入る通信は SSH（22 番）を、起動した PC の IP（/32）からだけ**。出る通信は全部許可（GitHub とパッケージの取得のため） | `SG_NAME=...` |
+| キーペア | `pg-yota-poc`（秘密鍵は `~/.ssh/pg-yota-poc.pem`、権限 400） | `KEY_NAME=...`、`KEY_PATH=...` |
+| Name タグ | インスタンス・ディスク・セキュリティグループ・キーペアに `pg-yota-poc` | `NAME=...`（終了のときも同じ名前を指定） |
+
+例：`VPC_ID=vpc-0abc SUBNET_ID=subnet-0def TYPE=c8g.48xlarge tools/ec2/launch.sh`
+
+別の PC から起動し直すと、セキュリティグループに、その PC の IP からの SSH が追加で許可される（前の PC の IP は残る）。
 
 ### 時間と費用の目安（概算。1 ボード約 45 分、同時に解く 1 つあたり 1 時間に約 1.3 ボード）
 
@@ -134,7 +148,7 @@ tools/ec2/remote.sh ssh       # インスタンスに入る
 ## 5. 終わったら（「状態：完了」を確認してから。どの PC からでもよい）
 
 完了の結果は自動で push 済みなので、そのまま終了してよい。AWS CLI でログインしている PC なら、起動した PC でなくてもよい
-（起動した PC でなければ、インスタンスの名前 `reysongto-m4` で探す）。
+（起動した PC でなければ、インスタンスの名前 `pg-yota-poc` で探す）。
 
 ```bash
 tools/ec2/terminate.sh             # スポットのリクエストを取り消し、インスタンスを終了（確認あり）
@@ -149,7 +163,7 @@ tools/ec2/terminate.sh --cleanup   # さらにセキュリティグループと�
 
 ```bash
 aws ec2 describe-instances --region ap-northeast-1 \
-  --filters Name=tag:Name,Values=reysongto-m4 Name=instance-state-name,Values=pending,running,stopping,stopped \
+  --filters Name=tag:Name,Values=pg-yota-poc Name=instance-state-name,Values=pending,running,stopping,stopped \
   --query 'Reservations[].Instances[].InstanceId'      # [] なら残っていない
 ```
 
