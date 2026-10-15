@@ -8,7 +8,7 @@ import json, sys, pathlib
 out = pathlib.Path(sys.argv[1])
 manifest = json.loads((out / 'manifest.json').read_text())
 sel = manifest['selection']
-total = len(sel['training'][:200]) + len(sel.get('validation', []))
+total = len(sel['training']) + len(sel.get('validation', []))
 done = 0
 for path in (out / 'flops').glob('*.json'):
     done += bool(json.loads(path.read_text()).get('complete'))

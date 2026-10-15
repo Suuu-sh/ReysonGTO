@@ -23,5 +23,5 @@ ssh "${OPTS[@]}" "$HOST" "mkdir -p ReysonGTO/data"
 scp "${OPTS[@]}" -r "$ROOT/data/ranges" "$HOST:ReysonGTO/data/"
 
 echo "== 3/3 start the shards"
-ssh "${OPTS[@]}" "$HOST" "cd ReysonGTO && THREADS='${THREADS:-}' SHARDS='${SHARDS:-}' MEM_PER_SHARD_GB='${MEM_PER_SHARD_GB:-}' bash tools/ec2/run.sh"
+ssh "${OPTS[@]}" "$HOST" "cd ReysonGTO && THREADS='${THREADS:-}' TRAINING='${TRAINING:-}' VALIDATION='${VALIDATION:-}' SHARDS='${SHARDS:-}' MEM_PER_SHARD_GB='${MEM_PER_SHARD_GB:-}' bash tools/ec2/run.sh"
 echo "done. progress: ssh ${OPTS[*]} $HOST 'bash ReysonGTO/tools/ec2/status.sh'"

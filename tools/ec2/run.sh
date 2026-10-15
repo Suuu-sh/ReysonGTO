@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Runs ON the EC2 instance: selects the boards once, then starts parallel shards that survive SSH logout.
-# Re-running resumes (finished solves are skipped). Override with env: OUT, THREADS, SHARDS, MEM_PER_SHARD_GB.
+# Re-running resumes (finished solves are skipped). Override with env: OUT, TRAINING, VALIDATION, THREADS, SHARDS, MEM_PER_SHARD_GB.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 OUT="${OUT:-data/m4b}"
 # Empty values (from deploy.sh) fall back to the defaults.
+TRAINING="${TRAINING:-}"; TRAINING="${TRAINING:-120}"
+VALIDATION="${VALIDATION:-}"; VALIDATION="${VALIDATION:-40}"
 THREADS="${THREADS:-12}"
 MEM_PER_SHARD_GB="${MEM_PER_SHARD_GB:-18}"
 
@@ -29,7 +31,7 @@ SHARDS="${SHARDS:-}"
 SHARDS="${SHARDS:-$AUTO}"
 [ "$SHARDS" -ge 1 ] || { echo "not enough CPU/memory for one shard" >&2; exit 1; }
 
-COMMON=(--out "$OUT" --training 200 --validation 80 --limit 200 --stage2-target 0.5 --max-hours 48)
+COMMON=(--out "$OUT" --training "$TRAINING" --validation "$VALIDATION" --limit "$TRAINING" --stage2-target 0.5 --max-hours 48)
 python3 tools/m4_trial.py "${COMMON[@]}" --prepare-only
 
 echo "starting $SHARDS shards x $THREADS threads (${CORES} vCPU, ${MEM_GB} GB)"
