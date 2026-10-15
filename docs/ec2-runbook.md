@@ -1,71 +1,78 @@
-# EC2 でサイズの比較・本番計算を回す手順
+# EC2 でサイズの比較（M4：代表 200・確認用 80）を回す手順
 
-状態：下書き（M4 の 21 ボード目以降を EC2 で回すため）。インスタンスの作成と AWS の設定はユーザーが行う。
+インスタンスの作成と AWS の設定はユーザーが行う。立てたあとは、**Mac でコマンドを 1 つ実行するだけ**で、
+準備・ビルド・レンジの送付・計算の開始まで進む。
 
-## 1. インスタンス
+## 1. インスタンスを立てる（AWS コンソール）
 
-| 項目 | おすすめ | 理由 |
-|---|---|---|
-| 種類 | **Graviton（ARM）のコンピュート向け**：c8g.48xlarge（192 vCPU / 384GB）または c7g.16xlarge（64 vCPU / 128GB） | ソルバーは aarch64 の NEON 向けに最適化済み。価格あたりの性能が良い |
-| 買い方 | スポット（止められても、1 つの解ごとに保存して再開できる） | オンデマンドの 3〜4 割の料金 |
-| OS | Ubuntu 24.04 LTS（arm64） | Rust の導入が簡単 |
-| ディスク | gp3 100GB | 解のファイル（1 つ数百 MB〜数 GB）を一時的に置く |
-| ネットワーク | SSH（22 番）を自分の IP だけに開く | — |
+EC2 → インスタンスを起動、で次のように設定する。
 
-メモリ：1 つの解（本番の設定、f32）で最大 約 9〜16GB。192 vCPU / 384GB なら同時に 12〜16 個、64 vCPU / 128GB なら 4〜6 個。
+| 項目 | 設定 |
+|---|---|
+| 名前 | reysongto-m4 |
+| OS（AMI） | **Ubuntu Server 24.04 LTS、アーキテクチャは 64 ビット（Arm）** |
+| インスタンスタイプ | **c8g.48xlarge**（192 vCPU / 384GB。速い）または **c7g.16xlarge**（64 vCPU / 128GB。台数を抑えたい場合） |
+| キーペア | 新しく作る（例：reysongto）。ダウンロードした .pem を Mac の `~/.ssh/reysongto.pem` に置き、`chmod 400 ~/.ssh/reysongto.pem` |
+| ネットワーク | セキュリティグループで **SSH（22 番）を「マイ IP」だけ**に許可。パブリック IP の自動割り当てを有効 |
+| ストレージ | gp3 **100GB** |
+| 購入オプション（高度な詳細） | **スポットインスタンス**（安い。止められても再開できる）。急ぐ・確実に回したい場合はオンデマンド |
 
-## 2. 準備（インスタンスの上で 1 回だけ）
+起動したら、インスタンスの「パブリック IPv4 アドレス」を控える。
 
-```sh
-sudo apt-get update && sudo apt-get install -y build-essential git python3
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source ~/.cargo/env
-git clone https://github.com/Suuu-sh/ReysonGTO.git && cd ReysonGTO
-git checkout feat/m4_refine   # またはその時点の最新のブランチ
-cargo build --release
-```
+### 時間と費用の目安（概算）
 
-レンジ（製品データ、Git に入っていない）は Mac から送る：
+| タイプ | 同時に解く数 | 280 ボードの時間 | 費用（スポット） | 費用（オンデマンド） |
+|---|---|---|---|---|
+| c8g.48xlarge | 16（12 スレッドずつ） | 約 15〜20 時間 | 約 40〜60 ドル | 約 120〜150 ドル |
+| c7g.16xlarge | 5 | 約 2〜3 日 | 約 40〜60 ドル | 約 120〜160 ドル |
 
-```sh
-# Mac 側で
-scp -r ~/Projects/Products/ReysonGTO/data/ranges <host>:ReysonGTO/data/
-```
+Mac（M5）では 1 ボード約 35〜45 分だった。EC2 の 1 ボードの時間は CPU の違いで前後する。予算アラートの設定を推奨。
 
-## 3. 実行
+## 2. Mac から 1 コマンドで開始
 
 ```sh
-cd ~/ReysonGTO
-# 1) 代表 200・確認用 80 を選んで記録する（1 回だけ）
-python3 tools/m4_trial.py --out data/m4b --training 200 --validation 80 --limit 200 \
-  --stage2-target 0.5 --max-hours 48 --prepare-only
-# 2) 分担して同時に回す（例：192 vCPU なら 16 個 × 12 スレッド。64 vCPU なら 5 個 × 12）
-N=16
-for i in $(seq 0 $((N-1))); do
-  nohup python3 tools/m4_trial.py --out data/m4b --training 200 --validation 80 --limit 200 \
-    --stage2-target 0.5 --max-hours 48 --threads 12 --memory-mb 20000 --shard $i/$N \
-    > data/m4b-shard-$i.log 2>&1 &
-done
-# 3) 全部終わったら 1 回だけ集計
-python3 tools/m4_trial.py --out data/m4b --training 200 --validation 80 --limit 200 \
-  --stage2-target 0.5 --summarize-only --report docs/benchmarks/m4-full.md
+cd ~/Projects/Products/ReysonGTO-m4     # feat/m4_refine の作業フォルダ（data/ranges があること）
+tools/ec2/deploy.sh ubuntu@<パブリックIP> ~/.ssh/reysongto.pem
 ```
 
-- 1 つの解ごとに保存されるので、止まったら同じ 2) のコマンドで再開できる（保存済みは飛ばす）。
-- Mac の 20 ボード（data/m4a）は「20 を選ぶ」選び方なので、代表 200 とは別の集合（一部は重なる）。
-  重なったボードの粗い段階は `--reuse-stage1-from data/m4a` で再利用できる（data/m4a を EC2 に送った場合）。
-  20 ボードの結果は、規則づくりの追加のデータとしても使う。
-- メモリ：同時に動かす数 × 1 つあたり最大約 16GB が、インスタンスのメモリに収まるようにする。
+これで次が自動で行われる。
 
-## 4. 結果の回収
+1. インスタンスに必要なもの（コンパイラ、git、Python、Rust）を入れ、ReysonGTO を取ってきて release ビルドする（5〜10 分）
+2. レンジ（製品データ、Git に入っていない）を送る
+3. 代表 200・確認用 80 を選んで記録し、CPU とメモリに合わせた数の分担（シャード）で計算を始める。SSH を切っても止まらない
+
+調整したい場合は環境変数で：`THREADS=12 SHARDS=16 MEM_PER_SHARD_GB=18 tools/ec2/deploy.sh ...`
+
+## 3. 進み具合を見る
 
 ```sh
-# Mac 側で（解の本体は大きいので、結果の JSON だけを回収する）
-rsync -av --include='*/' --include='result.json' --include='*.json' --exclude='solution.json' \
-  <host>:ReysonGTO/data/m4b/ ~/Projects/Products/ReysonGTO/data/m4b/
+ssh -i ~/.ssh/reysongto.pem ubuntu@<パブリックIP> 'bash ReysonGTO/tools/ec2/status.sh'
 ```
 
-## 5. 止めるとき
+完了したボードの数、動いている分担の数、各分担のログの最後の行、メモリの使用量が出る。
+
+## 4. 止まった・再開したいとき
+
+- 同じインスタンスで再開する場合：`ssh ... 'bash ReysonGTO/tools/ec2/run.sh'`（保存済みの解は飛ばす）。
+- スポットが回収されてインスタンスがなくなった場合：新しく立てて、もう一度 2. を実行する（前のインスタンスの途中結果は失われる）。
+- 計算を途中で止めたい場合：`ssh ... 'pkill -f tools/m4_trial.py; pkill -f "target/release/cli solve"'`
+
+## 5. 結果を回収する
+
+```sh
+cd ~/Projects/Products/ReysonGTO-m4
+tools/ec2/collect.sh ubuntu@<パブリックIP> ~/.ssh/reysongto.pem
+```
+
+インスタンス上で集計（docs/benchmarks/m4-full.md）を作り、結果の JSON とログ（大きい解の本体は除く）を Mac の `data/m4b/` にコピーする。
+
+## 6. 終わったら
 
 - 回収が終わったら、インスタンスを**停止ではなく終了（terminate）**する（ディスクの料金も止まる）。
-- AWS の予算アラートを設定しておく（ユーザーの作業）。
+- 使わなくなったセキュリティグループとキーペアは削除してよい。
+
+## 補足
+
+- スクリプト：`tools/ec2/deploy.sh`（Mac）、`bootstrap.sh`・`run.sh`・`status.sh`（インスタンス）、`collect.sh`（Mac）。
+- 計算の中身は `tools/m4_trial.py`（全候補を約 5%、上位 2 つを約 0.5% で解く。1 つの解ごとに保存し、再開できる）。
+- x86 のインスタンス（c7a など）でも動く（NEON の代わりにスカラーの実装になるので、やや遅い）。
