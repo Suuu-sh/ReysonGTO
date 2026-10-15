@@ -113,7 +113,8 @@ def imported_stage1(args, board, size, stage):
 
 
 def game_config():
-    return dict(sizes=SIZES, pot=POT, stack=97.5, player=1, turn=66, river=66, preset='production')
+    # Lists, not tuples, so values compare equal to configs read back from JSON.
+    return dict(sizes=list(SIZES), pot=POT, stack=97.5, player=1, turn=66, river=66, preset='production')
 
 
 def candidate(args, board, size, stage, deadline, identity):
