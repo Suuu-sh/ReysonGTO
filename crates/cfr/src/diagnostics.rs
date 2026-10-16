@@ -196,12 +196,12 @@ fn normalization_evaluated(masks: &[u64], board: u64, actions: u64, active: u64)
     };
     actions * lanes
 }
-pub(super) fn workload(engine: &Engine) -> [KernelWorkload; 3] {
+pub(super) fn workload<S: Scratch, T: Scratch>(engine: &EngineCore<S, T>) -> [KernelWorkload; 3] {
     // A board cache exists only during opt-in initialization, no per-node growth.
     let mut boards = BTreeMap::<u64, [u64; 2]>::new();
-    fn visit(
-        e: &Engine,
-        state: &State,
+    fn visit<S: Scratch, T: Scratch>(
+        e: &EngineCore<S, T>,
+        state: &State<S>,
         target: usize,
         mode: Mode,
         boards: &mut BTreeMap<u64, [u64; 2]>,

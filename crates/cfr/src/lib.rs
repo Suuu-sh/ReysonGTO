@@ -40,6 +40,8 @@ pub struct EngineConfig {
     pub kernel_diagnostics: bool,
     #[serde(default)]
     pub storage_mode: StorageMode,
+    #[serde(default)]
+    pub scratch_precision: ScratchPrecision,
     #[serde(default = "default_alpha")]
     pub dcfr_alpha: f64,
     #[serde(default)]
@@ -62,6 +64,60 @@ pub enum StorageMode {
     F32,
     I16,
 }
+/// Traversal scratch arithmetic, independent of persistent policy storage.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ScratchPrecision {
+    #[default]
+    F64,
+    /// f32 reach/value arithmetic and blocker/prefix totals. Tiny positive
+    /// normalized weights may underflow; this mode is intentionally approximate.
+    F32,
+    /// Experimental comparison: f32 traversal with f64 blocker/prefix totals.
+    F32WideTotals,
+}
+trait Scratch:
+    Copy
+    + Default
+    + Send
+    + Sync
+    + PartialEq
+    + PartialOrd
+    + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Mul<Output = Self>
+    + std::ops::Div<Output = Self>
+    + std::ops::Neg<Output = Self>
+    + std::ops::AddAssign
+    + std::iter::Sum
+{
+    const ZERO: Self;
+    const NEG_INFINITY: Self;
+    fn from_f64(value: f64) -> Self;
+    fn to_f64(self) -> f64;
+    fn max(self, other: Self) -> Self;
+}
+macro_rules! scratch_scalar {
+    ($t:ty) => {
+        impl Scratch for $t {
+            const ZERO: Self = 0.0;
+            const NEG_INFINITY: Self = Self::NEG_INFINITY;
+            #[inline]
+            fn from_f64(value: f64) -> Self {
+                value as Self
+            }
+            #[inline]
+            fn to_f64(self) -> f64 {
+                self as f64
+            }
+            #[inline]
+            fn max(self, other: Self) -> Self {
+                self.max(other)
+            }
+        }
+    };
+}
+scratch_scalar!(f64);
+scratch_scalar!(f32);
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct WorkProfile {
     pub showdown_seconds: f64,
@@ -82,6 +138,7 @@ impl Default for EngineConfig {
             profiling: false,
             kernel_diagnostics: false,
             storage_mode: StorageMode::F32,
+            scratch_precision: ScratchPrecision::F64,
             dcfr_alpha: 1.5,
             dcfr_beta: 0.0,
             dcfr_gamma: 2.0,
@@ -97,36 +154,36 @@ pub struct Metrics {
 }
 
 // Small recursive metadata; no combo-sized buffers are retained per tree node.
-struct State {
+struct State<S: Scratch = f64> {
     id: usize,
-    children: Vec<State>,
+    children: Vec<State<S>>,
     offset: usize,
     own_len: usize,
     span: usize,
     scales: [f32; 2],
     work: [u64; 4],          // showdown, fold, regret, chance (exclusive)
     orbits: Vec<Vec<usize>>, // indices of dense combo permutations, member -> representative
-    parallel_scratch: Vec<Vec<Level>>,
+    parallel_scratch: Vec<Vec<Level<S>>>,
 }
-struct Level {
-    reach: [Vec<f64>; 2],
-    value: Vec<f64>,
-    action_values: Vec<f64>,
+struct Level<S: Scratch = f64> {
+    reach: [Vec<S>; 2],
+    value: Vec<S>,
+    action_values: Vec<S>,
     strategy: Vec<f32>,
     regret: Vec<f32>,
     average: Vec<f32>,
-    average_path_reach: Vec<f64>,
+    average_path_reach: Vec<S>,
 }
-fn levels(depth: usize, actions: usize, n: [usize; 2]) -> Vec<Level> {
+fn levels<S: Scratch>(depth: usize, actions: usize, n: [usize; 2]) -> Vec<Level<S>> {
     (0..depth)
         .map(|_| Level {
-            reach: [vec![0.0; n[0]], vec![0.0; n[1]]],
-            value: vec![0.0; n[0].max(n[1])],
-            action_values: vec![0.0; actions * n[0].max(n[1])],
+            reach: [vec![S::ZERO; n[0]], vec![S::ZERO; n[1]]],
+            value: vec![S::ZERO; n[0].max(n[1])],
+            action_values: vec![S::ZERO; actions * n[0].max(n[1])],
             strategy: vec![0.0; actions * n[0].max(n[1])],
             regret: vec![0.0; actions * n[0].max(n[1])],
             average: vec![0.0; actions * n[0].max(n[1])],
-            average_path_reach: vec![0.0; n[0].max(n[1])],
+            average_path_reach: vec![S::ZERO; n[0].max(n[1])],
         })
         .collect()
 }
@@ -146,7 +203,7 @@ fn tree_shape(tree: &GameTree, id: usize) -> (usize, usize) {
     }
     shape
 }
-impl State {
+impl<S: Scratch> State<S> {
     fn new(
         tree: &GameTree,
         id: usize,
@@ -493,11 +550,12 @@ enum Mode {
     BestResponse,
 }
 
-pub struct Engine {
+struct EngineCore<S: Scratch = f64, T: Scratch = S> {
+    totals_precision: std::marker::PhantomData<T>,
     tree: GameTree,
     ranges: [DenseRange; 2],
     config: EngineConfig,
-    state: State,
+    state: State<S>,
     masks: [Vec<u64>; 2],
     hand_cards: [Vec<[Card; 2]>; 2],
     same: [Vec<Option<usize>>; 2],
@@ -513,7 +571,7 @@ pub struct Engine {
     merged_children: usize,
     regret: Slab,
     average: Slab,
-    scratch: Vec<Level>,
+    scratch: Vec<Level<S>>,
     permutations: Vec<ComboPermutation>,
     alias_perms: Vec<u32>,
     wall_profile: WorkProfile,
@@ -556,7 +614,7 @@ pub fn estimate_memory_bytes_with_config(
                 actions
                     .checked_mul(scalar)
                     .ok_or("memory estimate overflow")?
-                    + std::mem::size_of::<State>()
+                    + std::mem::size_of::<State<f64>>()
                     + std::mem::size_of::<tree::Node>()
                     + node.board.len()
                     + children * 48
@@ -568,7 +626,12 @@ pub fn estimate_memory_bytes_with_config(
         }
     }
     let shape = tree_shape(tree, tree.root);
-    let level_bytes = (n[0] + n[1] + 2 * n[0].max(n[1])) * 8 + shape.1 * n[0].max(n[1]) * 20;
+    let scalar_bytes = match config.scratch_precision {
+        ScratchPrecision::F64 => 8,
+        ScratchPrecision::F32 | ScratchPrecision::F32WideTotals => 4,
+    };
+    let level_bytes = (n[0] + n[1] + 2 * n[0].max(n[1])) * scalar_bytes
+        + shape.1 * n[0].max(n[1]) * (scalar_bytes + 12);
     fn scratch_roots(tree: &GameTree, id: usize) -> usize {
         match &tree.nodes[id].kind {
             NodeKind::Chance { children, .. } => children.len(),
@@ -697,7 +760,7 @@ fn board_mask(board: &[u8]) -> u64 {
     board.iter().fold(0, |m, &c| m | (1u64 << c))
 }
 
-impl Engine {
+impl<S: Scratch, T: Scratch> EngineCore<S, T> {
     pub fn new(
         tree: GameTree,
         ranges: [DenseRange; 2],
@@ -869,6 +932,7 @@ impl Engine {
             .build()
             .map_err(|e| e.to_string())?;
         let mut engine = Self {
+            totals_precision: std::marker::PhantomData,
             tree,
             ranges,
             config,
@@ -926,10 +990,25 @@ impl Engine {
     fn run(&mut self, player: usize, mode: Mode) -> f64 {
         self.run_with_cache(player, mode, TotalsCache::default())
     }
-    fn run_with_cache(&mut self, player: usize, mode: Mode, mut totals_cache: TotalsCache) -> f64 {
+    fn run_with_cache(
+        &mut self,
+        player: usize,
+        mode: Mode,
+        mut totals_cache: TotalsCache<T>,
+    ) -> f64 {
         let start = Instant::now();
-        self.scratch[0].reach[0].copy_from_slice(&self.initial_reach[0]);
-        self.scratch[0].reach[1].copy_from_slice(&self.initial_reach[1]);
+        for (out, &weight) in self.scratch[0].reach[0]
+            .iter_mut()
+            .zip(&self.initial_reach[0])
+        {
+            *out = S::from_f64(weight);
+        }
+        for (out, &weight) in self.scratch[0].reach[1]
+            .iter_mut()
+            .zip(&self.initial_reach[1])
+        {
+            *out = S::from_f64(weight);
+        }
         let context = Context {
             tree: &self.tree,
             ranges: &self.ranges,
@@ -1014,7 +1093,7 @@ impl Engine {
         self.scratch[0].value[..self.initial_reach[player].len()]
             .iter()
             .zip(&self.initial_reach[player])
-            .map(|(v, w)| v * w)
+            .map(|(v, w)| v.to_f64() * w)
             .sum::<f64>()
             / self.joint_mass
     }
@@ -1086,7 +1165,7 @@ impl Engine {
         // Remaining merged orbits evaluate representatives once. That is exact
         // only when BOTH supplied reach vectors preserve their permutations.
         // Reject asymmetry, never silently average or accept approximate parity.
-        fn mark_orbits(state: &State, used: &mut [bool]) {
+        fn mark_orbits<S: Scratch>(state: &State<S>, used: &mut [bool]) {
             for orbit in &state.orbits {
                 for &p in orbit {
                     used[p] = true;
@@ -1133,8 +1212,12 @@ impl Engine {
             return Err("conditioned ranges have no compatible deals".into());
         }
         let mut evaluate = |player, mode| {
-            self.scratch[0].reach[0].copy_from_slice(&reach[0]);
-            self.scratch[0].reach[1].copy_from_slice(&reach[1]);
+            for (out, &weight) in self.scratch[0].reach[0].iter_mut().zip(&reach[0]) {
+                *out = S::from_f64(weight);
+            }
+            for (out, &weight) in self.scratch[0].reach[1].iter_mut().zip(&reach[1]) {
+                *out = S::from_f64(weight);
+            }
             let context = Context {
                 tree: &self.tree,
                 ranges: &self.ranges,
@@ -1169,13 +1252,13 @@ impl Engine {
                 player,
                 mode,
                 false,
-                &mut TotalsCache::default(),
+                &mut TotalsCache::<T>::default(),
                 &mut RunDiagnostics::default(),
             );
             self.scratch[0].value[..reach[player].len()]
                 .iter()
                 .zip(&reach[player])
-                .map(|(v, w)| v * w)
+                .map(|(v, w)| v.to_f64() * w)
                 .sum::<f64>()
                 / joint_mass
         };
@@ -1234,16 +1317,6 @@ impl Engine {
             }
         }
         Ok(out)
-    }
-    /// Install a complete solving loop once, avoiding Rayon external-injector
-    /// queue allocations between calls to iterate/metrics. For threads=1 calls
-    /// are already allocation-free and execute directly on the calling thread.
-    pub fn with_pool<R: Send>(&mut self, f: impl FnOnce(&mut Self) -> R + Send) -> R {
-        if self.config.threads == 1 {
-            return f(self);
-        }
-        let pool = Arc::clone(&self.pool);
-        pool.install(|| f(self))
     }
     pub fn iterations(&self) -> usize {
         self.iterations
@@ -1751,15 +1824,15 @@ impl<'a> Buffers<'a> {
 // Traversal borrows independent slabs/scratch and a worker-local opt-in report;
 // keeping these explicit avoids shared locks or additional per-node metadata.
 #[allow(clippy::too_many_arguments)]
-fn traverse(
+fn traverse<S: Scratch, T: Scratch>(
     ctx: &Context<'_>,
-    state: &mut State,
-    scratch: &mut [Level],
+    state: &mut State<S>,
+    scratch: &mut [Level<S>],
     buffers: Buffers<'_>,
     target: usize,
     mode: Mode,
     parallel: bool,
-    totals_cache: &mut TotalsCache,
+    totals_cache: &mut TotalsCache<T>,
     diagnostics: &mut RunDiagnostics,
 ) {
     let (level, desc_scratch) = scratch.split_first_mut().expect("depth scratch");
@@ -1792,7 +1865,7 @@ fn traverse(
         }
         NodeKind::Chance { .. } => {
             let start = (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
-            level.value[..n].fill(0.0);
+            level.value[..n].fill(S::ZERO);
             let probability = 1.0 / (52 - node.board.len() - 4) as f64;
             if let Some(t) = start {
                 let ns = t.elapsed().as_nanos();
@@ -1964,31 +2037,48 @@ fn traverse(
                 }
             }
             let start = (ctx.config.profiling || ctx.config.kernel_diagnostics).then(Instant::now);
-            for i in 0..n {
-                level.value[i] = if actor != target {
-                    (0..actions.len())
-                        .map(|a| level.action_values[a * n + i])
-                        .sum()
-                } else if matches!(mode, Mode::BestResponse) {
-                    (0..actions.len())
-                        .map(|a| level.action_values[a * n + i])
-                        .fold(f64::NEG_INFINITY, f64::max)
-                } else {
-                    (0..actions.len())
-                        .map(|a| level.strategy[a * na + i] as f64 * level.action_values[a * n + i])
-                        .sum()
-                };
+            // Action-major contiguous slices, retaining each hand's original
+            // action order and float Sum's negative-zero identity exactly.
+            let value = &mut level.value[..n];
+            if actor == target && matches!(mode, Mode::BestResponse) {
+                value.fill(S::NEG_INFINITY);
+                for action in level.action_values[..actions.len() * n].chunks_exact(n) {
+                    for (out, &child) in value.iter_mut().zip(action) {
+                        *out = out.max(child);
+                    }
+                }
+            } else {
+                value.fill(S::from_f64(-0.0));
+                for (a, action) in level.action_values[..actions.len() * n]
+                    .chunks_exact(n)
+                    .enumerate()
+                {
+                    if actor != target {
+                        for (out, &child) in value.iter_mut().zip(action) {
+                            *out += child;
+                        }
+                    } else {
+                        let policy = &level.strategy[a * na..(a + 1) * na];
+                        for ((out, &child), &probability) in
+                            value.iter_mut().zip(action).zip(policy)
+                        {
+                            *out += S::from_f64(probability as f64) * child;
+                        }
+                    }
+                }
             }
             if matches!(mode, Mode::Train) && actor == target {
                 for i in 0..na {
                     let reach = level.reach[actor][i];
+                    // Keep inverse-range normalization wide: its constant scale
+                    // can overflow f32 even when the resulting path reach cannot.
                     let scale = ctx.average_reach_scale[actor][i];
-                    level.average_path_reach[i] = if reach == 0.0 {
-                        0.0
+                    level.average_path_reach[i] = if reach == S::ZERO {
+                        S::ZERO
                     } else if scale.is_finite() {
-                        reach * scale
+                        S::from_f64(reach.to_f64() * scale)
                     } else {
-                        reach / ctx.initial_reach[actor][i]
+                        S::from_f64(reach.to_f64() / ctx.initial_reach[actor][i])
                     };
                 }
                 match (&mut own.regret, &mut own.average) {
@@ -2034,34 +2124,37 @@ fn traverse(
     }
 }
 #[allow(clippy::too_many_arguments)]
-fn update_policy(
+fn update_policy<S: Scratch>(
     ctx: &Context<'_>,
     strategy: &[f32],
-    action_values: &[f64],
-    value: &[f64],
-    path_reach: &[f64],
+    action_values: &[S],
+    value: &[S],
+    path_reach: &[S],
     n: usize,
     actions: usize,
     regret: &mut [f32],
     average: &mut [f32],
 ) {
+    // Persistent slab updates/discounts deliberately remain f64; traversal
+    // differences are rounded in S before crossing this boundary.
     let t = ctx.iteration as f64;
     let [pos, neg, avg] = ctx.discounts;
     for a in 0..actions {
         for i in 0..n {
             let idx = a * n + i;
             let old = regret[idx] as f64;
-            let delta = action_values[idx] - value[i];
+            let delta = (action_values[idx] - value[i]).to_f64();
             match ctx.config.algorithm {
                 Algorithm::Dcfr => {
                     let r = old + delta;
                     regret[idx] = (r * if r >= 0.0 { pos } else { neg }) as f32;
-                    average[idx] =
-                        ((average[idx] as f64 + path_reach[i] * strategy[idx] as f64) * avg) as f32;
+                    average[idx] = ((average[idx] as f64
+                        + path_reach[i].to_f64() * strategy[idx] as f64)
+                        * avg) as f32;
                 }
                 Algorithm::CfrPlus => {
                     regret[idx] = (old + delta).max(0.0) as f32;
-                    average[idx] += (t * path_reach[i] * strategy[idx] as f64) as f32;
+                    average[idx] += (t * path_reach[i].to_f64() * strategy[idx] as f64) as f32;
                 }
             }
         }
@@ -2071,12 +2164,12 @@ fn update_policy(
 // Preserve the old f32 decode and rounding points before the f64 update; using
 // q as f64 * scale as f64 here instead would silently change stored strategies.
 #[allow(clippy::too_many_arguments)]
-fn update_policy_i16(
+fn update_policy_i16<S: Scratch>(
     ctx: &Context<'_>,
     strategy: &[f32],
-    action_values: &[f64],
-    value: &[f64],
-    path_reach: &[f64],
+    action_values: &[S],
+    value: &[S],
+    path_reach: &[S],
     n: usize,
     regret: &mut [i16],
     average: &mut [i16],
@@ -2101,10 +2194,11 @@ fn update_policy_i16(
                 for i in 0..n {
                     let old = (regret[i] as f32 * regret_scale) as f64;
                     let old_average = (average[i] as f32 * average_scale) as f64;
-                    let delta = action_values[i] - value[i];
+                    let delta = (action_values[i] - value[i]).to_f64();
                     let r = old + delta;
                     let r = (r * if r >= 0.0 { pos } else { neg }) as f32;
-                    let a = ((old_average + path_reach[i] * strategy[i] as f64) * avg) as f32;
+                    let a =
+                        ((old_average + path_reach[i].to_f64() * strategy[i] as f64) * avg) as f32;
                     regret_out[i] = r;
                     average_out[i] = a;
                     maxima[0] = maxima[0].max(r.abs());
@@ -2115,9 +2209,9 @@ fn update_policy_i16(
                 for i in 0..n {
                     let old = (regret[i] as f32 * regret_scale) as f64;
                     let old_average = average[i] as f32 * average_scale;
-                    let delta = action_values[i] - value[i];
+                    let delta = (action_values[i] - value[i]).to_f64();
                     let r = (old + delta).max(0.0) as f32;
-                    let a = old_average + (t * path_reach[i] * strategy[i] as f64) as f32;
+                    let a = old_average + (t * path_reach[i].to_f64() * strategy[i] as f64) as f32;
                     regret_out[i] = r;
                     average_out[i] = a;
                     maxima[0] = maxima[0].max(r.abs());
@@ -2130,9 +2224,9 @@ fn update_policy_i16(
     encode_i16(average_scratch, average, &mut scales[1], maxima[1]);
 }
 
-fn decision_reach(
-    reach: &[Vec<f64>; 2],
-    out: &mut [Vec<f64>; 2],
+fn decision_reach<S: Scratch>(
+    reach: &[Vec<S>; 2],
+    out: &mut [Vec<S>; 2],
     actor: usize,
     policy: Option<&[f32]>,
 ) {
@@ -2141,17 +2235,17 @@ fn decision_reach(
             assert_eq!(out[p].len(), reach[p].len());
             assert_eq!(policy.len(), reach[p].len());
             for ((out, &reach), &probability) in out[p].iter_mut().zip(&reach[p]).zip(policy) {
-                *out = reach * probability as f64;
+                *out = reach * S::from_f64(probability as f64);
             }
         } else {
             out[p].copy_from_slice(&reach[p]);
         }
     }
 }
-fn chance_reach(
+fn chance_reach<S: Scratch>(
     ctx: &Context<'_>,
-    reach: &[Vec<f64>; 2],
-    out: &mut [Vec<f64>; 2],
+    reach: &[Vec<S>; 2],
+    out: &mut [Vec<S>; 2],
     card: u8,
     target: usize,
     probability: f64,
@@ -2160,10 +2254,10 @@ fn chance_reach(
     for p in 0..2 {
         assert_eq!(out[p].len(), reach[p].len());
         assert_eq!(ctx.masks[p].len(), reach[p].len());
-        let probability = if p == target { 1.0 } else { probability };
+        let probability = S::from_f64(if p == target { 1.0 } else { probability });
         for ((out, &weight), &cards) in out[p].iter_mut().zip(&reach[p]).zip(&ctx.masks[p]) {
             *out = if cards & mask != 0 {
-                0.0
+                S::ZERO
             } else {
                 weight * probability
             };
@@ -2173,7 +2267,7 @@ fn chance_reach(
 // Contiguous partitions keep slab borrows disjoint and leave the later
 // child/orbit accumulation order untouched. Slab span approximates subtree work;
 // a terminal-only child still costs one unit. No extra nested scratch is allocated.
-fn weighted_chance_split(children: &[State]) -> usize {
+fn weighted_chance_split<S: Scratch>(children: &[State<S>]) -> usize {
     debug_assert!(children.len() > 1);
     let total: u128 = children.iter().map(|c| c.span.max(1) as u128).sum();
     let mut prefix = 0u128;
@@ -2195,17 +2289,17 @@ fn weighted_chance_split(children: &[State]) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn visit_parallel_chance(
+fn visit_parallel_chance<S: Scratch, T: Scratch>(
     ctx: &Context<'_>,
-    children: &mut [State],
-    scratch: &mut [Vec<Level>],
+    children: &mut [State<S>],
+    scratch: &mut [Vec<Level<S>>],
     buffers: Buffers<'_>,
-    reach: &[Vec<f64>; 2],
+    reach: &[Vec<S>; 2],
     target: usize,
     mode: Mode,
     probability: f64,
     boundary_node: usize,
-    totals_cache: &TotalsCache,
+    totals_cache: &TotalsCache<T>,
 ) -> RunDiagnostics {
     let mut diagnostics = RunDiagnostics::default();
     if children.len() > ctx.config.parallel_grain {
@@ -2306,12 +2400,12 @@ fn visit_parallel_chance(
 // combo-sized scratch or memory-limit estimate changes. Only target-player
 // decisions may share this cache; chance/opponent actions create a fresh one.
 #[derive(Default)]
-struct TotalsCache {
-    value: Option<Totals>,
+struct TotalsCache<T: Scratch = f64> {
+    value: Option<Totals<T>>,
     #[cfg(test)]
     disabled: bool,
 }
-impl TotalsCache {
+impl<T: Scratch> TotalsCache<T> {
     fn fresh(&self) -> Self {
         Self {
             value: None,
@@ -2319,12 +2413,12 @@ impl TotalsCache {
             disabled: self.disabled,
         }
     }
-    fn get(
+    fn get<S: Scratch>(
         &mut self,
         cards: &[[Card; 2]],
-        reach: &[f64],
+        reach: &[S],
         mut diagnostics: Option<&mut diagnostics::KernelTimes>,
-    ) -> &Totals {
+    ) -> &Totals<T> {
         #[cfg(test)]
         if self.disabled {
             self.value = None;
@@ -2348,14 +2442,14 @@ impl TotalsCache {
 }
 
 #[derive(Clone, Copy)]
-struct Totals {
-    sum: f64,
-    cards: [f64; 52],
+struct Totals<T: Scratch = f64> {
+    sum: T,
+    cards: [T; 52],
 }
-fn totals(cards: &[[Card; 2]], reach: &[f64]) -> Totals {
+fn totals<T: Scratch>(cards: &[[Card; 2]], reach: &[T]) -> Totals<T> {
     let mut out = Totals {
-        sum: 0.0,
-        cards: [0.0; 52],
+        sum: T::ZERO,
+        cards: [T::ZERO; 52],
     };
     for (&cards, &w) in cards.iter().zip(reach) {
         add(&mut out, cards, w);
@@ -2365,18 +2459,32 @@ fn totals(cards: &[[Card; 2]], reach: &[f64]) -> Totals {
 // Zero reach contributions may be omitted from nonnegative, +0-initialized
 // sums without changing rounding/order of any nonzero contribution. Values and
 // every Train update still execute, including target hands with zero own reach.
-fn totals_nonzero(cards: &[[Card; 2]], reach: &[f64], mut skipped: Option<&mut u64>) -> Totals {
+fn totals_nonzero<S: Scratch, T: Scratch>(
+    cards: &[[Card; 2]],
+    reach: &[S],
+    mut skipped: Option<&mut u64>,
+) -> Totals<T> {
     let mut out = Totals {
-        sum: 0.0,
-        cards: [0.0; 52],
+        sum: T::ZERO,
+        cards: [T::ZERO; 52],
     };
     for (&cards, &weight) in cards.iter().zip(reach) {
-        add_nonzero(&mut out, cards, weight, skipped.as_deref_mut());
+        add_nonzero(
+            &mut out,
+            cards,
+            T::from_f64(weight.to_f64()),
+            skipped.as_deref_mut(),
+        );
     }
     out
 }
-fn add_nonzero(t: &mut Totals, cards: [Card; 2], weight: f64, skipped: Option<&mut u64>) {
-    if weight == 0.0 {
+fn add_nonzero<T: Scratch>(
+    t: &mut Totals<T>,
+    cards: [Card; 2],
+    weight: T,
+    skipped: Option<&mut u64>,
+) {
+    if weight == T::ZERO {
         if let Some(skipped) = skipped {
             *skipped += 1;
         }
@@ -2384,21 +2492,21 @@ fn add_nonzero(t: &mut Totals, cards: [Card; 2], weight: f64, skipped: Option<&m
         add(t, cards, weight);
     }
 }
-fn add(t: &mut Totals, cards: [Card; 2], w: f64) {
+fn add<T: Scratch>(t: &mut Totals<T>, cards: [Card; 2], w: T) {
     t.sum += w;
     t.cards[cards[0].0 as usize] += w;
     t.cards[cards[1].0 as usize] += w;
 }
-fn compatible(cards: [Card; 2], t: &Totals, same: f64) -> f64 {
-    (t.sum - t.cards[cards[0].0 as usize] - t.cards[cards[1].0 as usize] + same).max(0.0)
+fn compatible<T: Scratch>(cards: [Card; 2], t: &Totals<T>, same: T) -> T {
+    (t.sum - t.cards[cards[0].0 as usize] - t.cards[cards[1].0 as usize] + same).max(T::ZERO)
 }
-fn terminal(
+fn terminal<S: Scratch, T: Scratch>(
     ctx: &Context<'_>,
     id: usize,
-    level: &mut Level,
+    level: &mut Level<S>,
     target: usize,
     winner: Option<usize>,
-    totals_cache: &mut TotalsCache,
+    totals_cache: &mut TotalsCache<T>,
     mut diagnostics: Option<&mut diagnostics::KernelTimes>,
 ) {
     let node = &ctx.tree.nodes[id];
@@ -2408,17 +2516,18 @@ fn terminal(
         reach,
         diagnostics.as_deref_mut(),
     );
-    let pot = node.pot as f64 - ctx.tree.config.rake(node.pot);
-    let base = node.invested[target] as f64 + ctx.tree.config.starting_pot as f64 / 2.0;
+    let pot = S::from_f64(node.pot as f64 - ctx.tree.config.rake(node.pot));
+    let base =
+        S::from_f64(node.invested[target] as f64 + ctx.tree.config.starting_pot as f64 / 2.0);
     let board = board_mask(&node.board);
     if let Some(winner) = winner {
         let payoff = if winner == target { pot - base } else { -base };
         for (i, &cards) in ctx.hand_cards[target].iter().enumerate() {
-            let same = ctx.same[target][i].map_or(0.0, |j| reach[j]);
+            let same = ctx.same[target][i].map_or(T::ZERO, |j| T::from_f64(reach[j].to_f64()));
             level.value[i] = if ctx.masks[target][i] & board != 0 {
-                0.0
+                S::ZERO
             } else {
-                payoff * compatible(cards, all, same)
+                payoff * S::from_f64(compatible(cards, all, same).to_f64())
             };
         }
         return;
@@ -2427,11 +2536,11 @@ fn terminal(
     // Scratch is reused across boards. Reset only blocked outputs, not the
     // complete dense vector (active entries are overwritten by the pack).
     for &i in &table.blocked[target] {
-        level.value[i as usize] = 0.0;
+        level.value[i as usize] = S::ZERO;
     }
     let mut weak = Totals {
-        sum: 0.0,
-        cards: [0.0; 52],
+        sum: T::ZERO,
+        cards: [T::ZERO; 52],
     };
     let mut cursor = 0;
     for group in &table.groups[target] {
@@ -2441,7 +2550,7 @@ fn terminal(
             add_nonzero(
                 &mut weak,
                 hand.cards,
-                reach[hand.dense as usize],
+                T::from_f64(reach[hand.dense as usize].to_f64()),
                 diagnostics
                     .as_deref_mut()
                     .map(|d| &mut d.showdown_prefix_zero_combos),
@@ -2449,14 +2558,15 @@ fn terminal(
         }
         let own = &table.sorted[target][group.own_begin as usize..group.own_end as usize];
         for hand in own {
-            level.value[hand.dense as usize] = compatible(hand.cards, &weak, 0.0);
+            level.value[hand.dense as usize] =
+                S::from_f64(compatible(hand.cards, &weak, T::ZERO).to_f64());
         }
         // E[receipt]/pot = 0.5 * (strictly weaker + weaker-or-equal).
         for hand in &table.sorted[1 - target][group.opp_before as usize..group.opp_after as usize] {
             add_nonzero(
                 &mut weak,
                 hand.cards,
-                reach[hand.dense as usize],
+                T::from_f64(reach[hand.dense as usize].to_f64()),
                 diagnostics
                     .as_deref_mut()
                     .map(|d| &mut d.showdown_prefix_zero_combos),
@@ -2466,22 +2576,125 @@ fn terminal(
         for hand in own {
             let i = hand.dense as usize;
             let same = if hand.same == u16::MAX {
-                0.0
+                T::ZERO
             } else {
-                reach[hand.same as usize]
+                T::from_f64(reach[hand.same as usize].to_f64())
             };
-            let total = compatible(hand.cards, all, same);
+            let total = S::from_f64(compatible(hand.cards, all, same).to_f64());
             let before = level.value[i];
             // The identical opposing combo belongs to the equal prefix only.
-            let after = compatible(hand.cards, &weak, same);
-            level.value[i] = pot * 0.5 * (before + after) - base * total;
+            let after = S::from_f64(compatible(hand.cards, &weak, same).to_f64());
+            level.value[i] = pot * S::from_f64(0.5) * (before + after) - base * total;
         }
     }
 }
 
+/// Runtime-selected traversal precision with one monomorphized core per mode.
+pub struct Engine {
+    inner: EngineInner,
+}
+enum EngineInner {
+    F64(EngineCore<f64, f64>),
+    F32(EngineCore<f32, f32>),
+    F32WideTotals(EngineCore<f32, f64>),
+}
+macro_rules! dispatch_engine {
+    ($self:expr, $e:ident => $body:expr) => {
+        match &$self.inner {
+            EngineInner::F64($e) => $body,
+            EngineInner::F32($e) => $body,
+            EngineInner::F32WideTotals($e) => $body,
+        }
+    };
+}
+macro_rules! dispatch_engine_mut {
+    ($self:expr, $e:ident => $body:expr) => {
+        match &mut $self.inner {
+            EngineInner::F64($e) => $body,
+            EngineInner::F32($e) => $body,
+            EngineInner::F32WideTotals($e) => $body,
+        }
+    };
+}
+impl Engine {
+    pub fn new(
+        tree: GameTree,
+        ranges: [DenseRange; 2],
+        config: EngineConfig,
+    ) -> Result<Self, String> {
+        let inner = match config.scratch_precision {
+            ScratchPrecision::F64 => EngineInner::F64(EngineCore::new(tree, ranges, config)?),
+            ScratchPrecision::F32 => EngineInner::F32(EngineCore::new(tree, ranges, config)?),
+            ScratchPrecision::F32WideTotals => {
+                EngineInner::F32WideTotals(EngineCore::new(tree, ranges, config)?)
+            }
+        };
+        Ok(Self { inner })
+    }
+    pub fn iterate(&mut self) {
+        dispatch_engine_mut!(self, e => e.iterate())
+    }
+    pub fn metrics(&mut self) -> Metrics {
+        dispatch_engine_mut!(self, e => e.metrics())
+    }
+    pub fn metrics_at_node(
+        &mut self,
+        node: usize,
+        reach: [Vec<f64>; 2],
+    ) -> Result<Metrics, String> {
+        dispatch_engine_mut!(self, e => e.metrics_at_node(node, reach))
+    }
+    pub fn strategy(&self, node: usize) -> Result<Vec<f32>, String> {
+        dispatch_engine!(self, e => e.strategy(node))
+    }
+    /// Install a complete solving loop once, avoiding Rayon external-injector
+    /// queue allocations between calls to iterate/metrics. For threads=1 calls
+    /// are already allocation-free and execute directly on the calling thread.
+    pub fn with_pool<R: Send>(&mut self, f: impl FnOnce(&mut Self) -> R + Send) -> R {
+        let pool = dispatch_engine!(self, e => (e.config.threads > 1).then(|| Arc::clone(&e.pool)));
+        match pool {
+            Some(pool) => pool.install(|| f(self)),
+            None => f(self),
+        }
+    }
+    pub fn iterations(&self) -> usize {
+        dispatch_engine!(self, e => e.iterations())
+    }
+    pub fn memory_bytes(&self) -> usize {
+        dispatch_engine!(self, e => e.memory_bytes())
+    }
+    pub fn tree(&self) -> &GameTree {
+        dispatch_engine!(self, e => e.tree())
+    }
+    pub fn ranges(&self) -> &[DenseRange; 2] {
+        dispatch_engine!(self, e => e.ranges())
+    }
+    pub fn terminal_seconds(&self) -> f64 {
+        dispatch_engine!(self, e => e.terminal_seconds())
+    }
+    pub fn profile(&self) -> WorkProfile {
+        dispatch_engine!(self, e => e.profile())
+    }
+    pub fn kernel_diagnostics(&self) -> Option<&KernelDiagnostics> {
+        dispatch_engine!(self, e => e.kernel_diagnostics())
+    }
+    pub fn persistent_storage_bytes(&self) -> usize {
+        dispatch_engine!(self, e => e.persistent_storage_bytes())
+    }
+    pub fn isomorphism_used(&self) -> bool {
+        dispatch_engine!(self, e => e.isomorphism_used())
+    }
+    pub fn merged_chance_children(&self) -> usize {
+        dispatch_engine!(self, e => e.merged_chance_children())
+    }
+    pub fn strategy_storage_offset(&self, node: usize) -> Option<usize> {
+        dispatch_engine!(self, e => e.strategy_storage_offset(node))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    type Engine = EngineCore<f64, f64>;
     use cards::Combo;
     use ranges::Range;
     use tree::{Action, Node, SizeRule, TreeConfig};
@@ -2563,6 +2776,161 @@ mod tests {
                 range(&[("KhKd", 1.0)], &b),
             ],
         )
+    }
+    fn public_slab_bits(engine: &super::Engine) -> [Vec<u32>; 2] {
+        match &engine.inner {
+            EngineInner::F64(e) => [e.regret.bits(), e.average.bits()],
+            EngineInner::F32(e) => [e.regret.bits(), e.average.bits()],
+            EngineInner::F32WideTotals(e) => [e.regret.bits(), e.average.bits()],
+        }
+    }
+    fn metric_bits(metrics: &Metrics) -> Vec<u64> {
+        metrics
+            .average_ev
+            .iter()
+            .chain(&metrics.best_response_ev)
+            .chain([&metrics.exploitability_chips, &metrics.exploitability_pct])
+            .map(|v| v.to_bits())
+            .collect()
+    }
+    #[test]
+    fn scratch_precision_public_dispatch_accuracy_and_thread_bits() {
+        let b = board("2c 7d 9h Js");
+        let tree = GameTree::build(
+            b.clone(),
+            TreeConfig {
+                starting_pot: 1000,
+                effective_stack: 500,
+                allow_raises: false,
+                rake_rate: 0.05,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Asymmetric, overlapping ranges include zero reach and future blockers.
+        let rr = [
+            range(&[("AcAd", 1.0), ("3c4d", 0.3), ("KcKd", 0.0)], &b),
+            range(&[("KcKd", 0.7), ("3c4d", 0.6), ("AcAd", 0.2)], &b),
+        ];
+        for algorithm in [Algorithm::Dcfr, Algorithm::CfrPlus] {
+            for storage_mode in [StorageMode::F32, StorageMode::I16] {
+                let config = EngineConfig {
+                    algorithm,
+                    storage_mode,
+                    ..Default::default()
+                };
+                let mut reference =
+                    super::Engine::new(tree.clone(), rr.clone(), config.clone()).unwrap();
+                let mut legacy = Engine::new(tree.clone(), rr.clone(), config.clone()).unwrap();
+                for _ in 0..64 {
+                    reference.iterate();
+                    legacy.iterate();
+                }
+                let expected = reference.metrics();
+                // Default runtime dispatch remains exactly the f64 core, including slabs.
+                assert_eq!(
+                    public_slab_bits(&reference),
+                    [legacy.regret.bits(), legacy.average.bits()]
+                );
+                assert_eq!(metric_bits(&expected), metric_bits(&legacy.metrics()));
+                for precision in [ScratchPrecision::F32, ScratchPrecision::F32WideTotals] {
+                    let mut serial = super::Engine::new(
+                        tree.clone(),
+                        rr.clone(),
+                        EngineConfig {
+                            scratch_precision: precision,
+                            ..config.clone()
+                        },
+                    )
+                    .unwrap();
+                    let mut parallel = super::Engine::new(
+                        tree.clone(),
+                        rr.clone(),
+                        EngineConfig {
+                            scratch_precision: precision,
+                            threads: 4,
+                            parallel_grain: 7,
+                            ..config.clone()
+                        },
+                    )
+                    .unwrap();
+                    assert!(serial.memory_bytes() < reference.memory_bytes());
+                    assert_eq!(
+                        serial.persistent_storage_bytes(),
+                        reference.persistent_storage_bytes()
+                    );
+                    for _ in 0..64 {
+                        serial.iterate();
+                        parallel.iterate();
+                    }
+                    let actual = serial.metrics();
+                    assert_eq!(public_slab_bits(&serial), public_slab_bits(&parallel));
+                    assert_eq!(metric_bits(&actual), metric_bits(&parallel.metrics()));
+                    // 0.05 chips is 5e-5 of the 1000-chip pot; allow the same
+                    // bounded trajectory drift in EV and BR, not bit equivalence.
+                    for p in 0..2 {
+                        assert!(
+                            (actual.average_ev[p] - expected.average_ev[p]).abs() < 0.05,
+                            "{algorithm:?}/{storage_mode:?}/{precision:?}: {:?} != {:?}",
+                            actual,
+                            expected
+                        );
+                        assert!(
+                            (actual.best_response_ev[p] - expected.best_response_ev[p]).abs()
+                                < 0.05
+                        );
+                    }
+                    assert!(
+                        (actual.exploitability_pct - expected.exploitability_pct).abs() < 0.005
+                    );
+                    for (id, node) in tree.nodes.iter().enumerate() {
+                        if matches!(node.kind, NodeKind::Decision { .. }) {
+                            assert_eq!(
+                                serial.strategy(id).unwrap(),
+                                parallel.strategy(id).unwrap()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn scratch_precision_f32_toy_matches_theory() {
+        for algorithm in [Algorithm::Dcfr, Algorithm::CfrPlus] {
+            for storage_mode in [StorageMode::F32, StorageMode::I16] {
+                for scratch_precision in [ScratchPrecision::F32, ScratchPrecision::F32WideTotals] {
+                    let (tree, ranges) = toy();
+                    let nuts = ranges[0]
+                        .combos
+                        .iter()
+                        .position(|c| c.combo == "AhAd".parse::<Combo>().unwrap())
+                        .unwrap();
+                    let mut engine = super::Engine::new(
+                        tree,
+                        ranges,
+                        EngineConfig {
+                            algorithm,
+                            storage_mode,
+                            scratch_precision,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    for _ in 0..20000 {
+                        engine.iterate();
+                    }
+                    let bettor = engine.strategy(0).unwrap();
+                    let call = engine.strategy(2).unwrap()[1] as f64;
+                    let bluff_fraction =
+                        bettor[2 + 1 - nuts] as f64 / (bettor[2] + bettor[3]) as f64;
+                    assert!((bluff_fraction - 0.25).abs() < 0.01);
+                    assert!((call - 2.0 / 3.0).abs() < 0.01);
+                    assert!((bettor[2 + nuts] - 1.0).abs() < 0.01);
+                    assert!(engine.metrics().exploitability_pct < 0.1);
+                }
+            }
+        }
     }
     #[test]
     #[ignore = "opt-in subsecond-to-few-second isolated normalization throughput"]
@@ -3170,7 +3538,7 @@ mod tests {
                     &mut level,
                     target,
                     winner,
-                    &mut TotalsCache::default(),
+                    &mut TotalsCache::<f64>::default(),
                     Some(&mut diagnostic),
                 );
                 assert_eq!(diagnostic.terminal_totals_zero_combos, expected_total_skips);
@@ -3287,7 +3655,7 @@ mod tests {
                             &mut level,
                             target,
                             winner,
-                            &mut TotalsCache::default(),
+                            &mut TotalsCache::<f64>::default(),
                             None,
                         );
                         assert_eq!(
@@ -3395,7 +3763,7 @@ mod tests {
                             &mut level,
                             target,
                             winner,
-                            &mut TotalsCache::default(),
+                            &mut TotalsCache::<f64>::default(),
                             None,
                         );
                         assert_eq!(
@@ -3600,8 +3968,8 @@ mod tests {
     fn totals_cache_reuse_counts_actual_scans_and_preserves_sum_bits() {
         let cards = [[Card(0), Card(1)], [Card(2), Card(3)], [Card(0), Card(3)]];
         let reach = [0.7, -0.0, f64::from_bits(1)];
-        let original = totals_nonzero(&cards, &reach, None);
-        let mut cache = TotalsCache::default();
+        let original = totals_nonzero::<f64, f64>(&cards, &reach, None);
+        let mut cache = TotalsCache::<f64>::default();
         let mut diagnostic = diagnostics::KernelTimes::default();
         for _ in 0..3 {
             let actual = cache.get(&cards, &reach, Some(&mut diagnostic));
@@ -3618,7 +3986,7 @@ mod tests {
         cache = cache.fresh();
         let next = [0.0, 0.9, 0.2];
         let actual = cache.get(&cards, &next, Some(&mut diagnostic));
-        let expected = totals_nonzero(&cards, &next, None);
+        let expected = totals_nonzero::<f64, f64>(&cards, &next, None);
         assert_eq!(actual.sum.to_bits(), expected.sum.to_bits());
         assert_eq!(
             actual.cards.map(f64::to_bits),
@@ -3646,7 +4014,7 @@ mod tests {
     }
     #[test]
     fn weighted_chance_split_balances_skew_and_terminal_only_children() {
-        let state = |span| State {
+        let state = |span| State::<f64> {
             id: 0,
             children: Vec::new(),
             offset: 0,

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use cards::Card;
-use cfr::{Algorithm, EngineConfig};
+use cfr::{Algorithm, EngineConfig, ScratchPrecision};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ranges::Range;
 use serde::Serialize;
@@ -33,6 +33,11 @@ enum Method {
 enum Storage {
     F32,
     I16,
+}
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Scratch {
+    F32,
+    F64,
 }
 // Parsed once at startup, not stored per node or iteration; boxing Solve would
 // add indirection/allocation without reducing the solver's working set.
@@ -140,6 +145,12 @@ struct SolveArgs {
     reach_card: Option<Card>,
     #[arg(long, value_enum)]
     storage: Option<Storage>,
+    /// Precision of iteration scratch buffers; independent of regret storage.
+    #[arg(long, value_enum, default_value_t = Scratch::F64)]
+    scratch_precision: Scratch,
+    /// Diagnostic only: retain f64 total accumulation with f32 scratch.
+    #[arg(long, hide = true)]
+    wide_totals: bool,
     #[arg(long)]
     dcfr_alpha: Option<f64>,
     #[arg(long)]
@@ -347,6 +358,9 @@ impl SolveArgs {
     }
     fn engine_config(&self) -> Result<EngineConfig> {
         let benchmark = self.preset == Some(Preset::Benchmark);
+        if self.wide_totals && !matches!(self.scratch_precision, Scratch::F32) {
+            bail!("--wide-totals requires --scratch-precision f32");
+        }
         Ok(EngineConfig {
             threads: self.threads,
             parallel_grain: self.parallel_grain,
@@ -361,6 +375,11 @@ impl SolveArgs {
                 .ok_or_else(|| anyhow!("memory limit overflow"))?,
             profiling: self.profiling,
             kernel_diagnostics: self.kernel_diagnostics,
+            scratch_precision: match self.scratch_precision {
+                Scratch::F32 if self.wide_totals => ScratchPrecision::F32WideTotals,
+                Scratch::F32 => ScratchPrecision::F32,
+                Scratch::F64 => ScratchPrecision::F64,
+            },
             storage_mode: match self.storage.unwrap_or(if benchmark {
                 Storage::I16
             } else {
@@ -676,6 +695,68 @@ mod tests {
                 after_check: false,
             })
         })
+    }
+    #[test]
+    fn scratch_precision_defaults_and_explicit_values_propagate() {
+        for command in ["solve", "solve-subgame"] {
+            for preset in ["production", "benchmark"] {
+                let defaults = args(command, &["--preset", preset]);
+                assert!(matches!(
+                    defaults.engine_config().unwrap().scratch_precision,
+                    ScratchPrecision::F64
+                ));
+                for (value, expected) in [
+                    ("f32", ScratchPrecision::F32),
+                    ("f64", ScratchPrecision::F64),
+                ] {
+                    let explicit =
+                        args(command, &["--preset", preset, "--scratch-precision", value]);
+                    let actual = explicit.engine_config().unwrap().scratch_precision;
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+    #[test]
+    fn scratch_precision_rejects_unknown_values() {
+        for command in ["solve", "solve-subgame"] {
+            let result = Cli::try_parse_from([
+                "cli",
+                command,
+                "--board",
+                "QsJh2h",
+                "--oop-range",
+                "oop.json",
+                "--ip-range",
+                "ip.json",
+                "--out",
+                "solution.json",
+                "--scratch-precision",
+                "f16",
+            ]);
+            assert!(matches!(
+                result.err().unwrap().kind(),
+                clap::error::ErrorKind::InvalidValue
+            ));
+        }
+    }
+    #[test]
+    fn wide_totals_requires_f32_scratch() {
+        for command in ["solve", "solve-subgame"] {
+            assert!(args(command, &["--wide-totals"]).engine_config().is_err());
+            assert!(
+                args(command, &["--scratch-precision", "f64", "--wide-totals"])
+                    .engine_config()
+                    .is_err()
+            );
+            assert!(matches!(
+                args(command, &["--scratch-precision", "f32", "--wide-totals"])
+                    .engine_config()
+                    .unwrap()
+                    .scratch_precision,
+                ScratchPrecision::F32WideTotals
+            ));
+        }
     }
     #[test]
     fn production_and_benchmark_presets() {
