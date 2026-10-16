@@ -48,9 +48,9 @@
       "status": "active",
       "tasks": [
         { "text": "第 1 段階：解を変えない高速化（PR #26）", "status": "done" },
-        { "text": "第 2 段階：計算途中の値を f32 に（PR #27、レビュー修正済み）", "status": "active" },
+        { "text": "第 2 段階：計算途中の値を f32 に（PR #27、オプトインでマージ済み）", "status": "done" },
         { "text": "PR #27：本番の木で f64 / f32 / f32+wide-totals の時間・メモリ・EV・exploitability を比べる（M4 の後）", "status": "todo" },
-        { "text": "PR #27 を採用するか決めてマージ", "status": "todo" },
+        { "text": "比較の結果を見て、f32 を本番で使うか決める", "status": "todo" },
         { "text": "i16 保存を標準にするか、精度への影響を測って決める", "status": "todo" }
       ]
     },
