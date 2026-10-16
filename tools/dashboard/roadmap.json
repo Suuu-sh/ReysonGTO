@@ -1,0 +1,107 @@
+{
+  "updated": "2026-10-16",
+  "goal": "6max 100BB キャッシュの全 HU ポストフロップ（SRP と 3BET ポット）を、規則で決めたサイズで解き、ReysonAI で表示する",
+  "milestones": [
+    {
+      "id": "M1",
+      "title": "最小のソルバー",
+      "detail": "cards・tree・cfr の最小版。リバーだけ、ターンからのサブゲーム、トイゲームのテスト",
+      "status": "done",
+      "tasks": []
+    },
+    {
+      "id": "M2",
+      "title": "フロップから解く",
+      "detail": "外部ソルバーと同じ設定で比べ、戦略の差と速さを確認",
+      "status": "done",
+      "tasks": []
+    },
+    {
+      "id": "M3",
+      "title": "本番の設定",
+      "detail": "レーキ、ドンクなし、2.5 倍レイズ、オールインへのまとめ、サイズの規則の差し込み。1 ボードを 0.3% まで 15 分以内",
+      "status": "done",
+      "tasks": []
+    },
+    {
+      "id": "M4",
+      "title": "ベットサイズの規則づくり",
+      "detail": "候補サイズごとに解いて EV で選び、特徴から決める表にする。損失の目標は平均でポットの 0.1% 未満、最大 0.5% 未満",
+      "status": "active",
+      "tasks": [
+        { "text": "フロップ 20 ボードの試行（m4a）", "status": "done" },
+        { "text": "フロップ 120 ボード：4 サイズを 5% → 上位 2 つを 0.5%（m4b, Mac）", "status": "active", "live": "m4b" },
+        { "text": "EC2 で 280 ボードに広げる仕組み（シャード・一発セットアップ）", "status": "done" },
+        { "text": "120 ボードの結果から、フロップの規則の表を作る（特徴ごとに多数決）", "status": "todo" },
+        { "text": "確認用 40 ボードを解き、規則のサイズと最適なサイズの損失を測る", "status": "todo" },
+        { "text": "ベットする側（IP / OOP）と、チェックのあとかどうかで規則を分ける", "status": "todo" },
+        { "text": "フロップの均衡からターン開始時の到達レンジを取り出す API", "status": "todo" },
+        { "text": "ターンのサイズ比較（流れ 2 × カードの種類 6 × ベットする側 2、約 4,800 状況、EC2）", "status": "todo" },
+        { "text": "リバーのサイズ比較", "status": "todo" },
+        { "text": "ターン・リバーの規則の表と確認", "status": "todo" }
+      ]
+    },
+    {
+      "id": "PERF",
+      "title": "高速化（M4〜M7 を支える）",
+      "detail": "本番の木での時間・メモリを下げる",
+      "status": "active",
+      "tasks": [
+        { "text": "第 1 段階：解を変えない高速化（PR #26）", "status": "done" },
+        { "text": "第 2 段階：計算途中の値を f32 に（PR #27、レビュー修正済み）", "status": "active" },
+        { "text": "PR #27：本番の木で f64 / f32 / f32+wide-totals の時間・メモリ・EV・exploitability を比べる（M4 の後）", "status": "todo" },
+        { "text": "PR #27 を採用するか決めてマージ", "status": "todo" },
+        { "text": "i16 保存を標準にするか、精度への影響を測って決める", "status": "todo" }
+      ]
+    },
+    {
+      "id": "M5",
+      "title": "プリフロップのソルバー v1",
+      "detail": "エクイティ × 実現率。レンジを ReysonAI の形式で出す",
+      "status": "active",
+      "tasks": [
+        { "text": "P1–P3：プリフロップ木・エクイティ・BTN vs BB の HU DCFR", "status": "done" },
+        { "text": "P4：6 人全体を解く", "status": "todo" },
+        { "text": "レンジを ReysonAI の形式で出力", "status": "todo" }
+      ]
+    },
+    {
+      "id": "M6",
+      "title": "実現率をポストフロップから学ぶ（v2）",
+      "detail": "ポストフロップの解から実現率を学び、プリフロップと交互に回してレンジを確定",
+      "status": "todo",
+      "tasks": []
+    },
+    {
+      "id": "M7",
+      "title": "まとめて解く：BTN vs BB SRP",
+      "detail": "確定したレンジで全 1,755 フロップを 0.3% 以下まで。再開でき、EC2 でも動く",
+      "status": "todo",
+      "tasks": [
+        { "text": "本番の精度を 0.3% にするか 0.2% にするか決める", "status": "todo" },
+        { "text": "1,755 フロップの batch 実行と再開", "status": "todo" }
+      ]
+    },
+    {
+      "id": "M8",
+      "title": "API と ReysonAI での表示",
+      "detail": "結果の受け渡しと画面での表示",
+      "status": "todo",
+      "tasks": [
+        { "text": "API の呼び方を決める（ブラウザから直接か、Worker 経由か）", "status": "todo" },
+        { "text": "ターン・リバーをその場で解く場所を決める（WebAssembly かサーバーか）", "status": "todo" }
+      ]
+    },
+    {
+      "id": "M9",
+      "title": "すべての HU 局面",
+      "detail": "BTN vs BB 以外の HU SRP と 3BET ポット（4BET 以降は対象外）",
+      "status": "todo",
+      "tasks": [
+        { "text": "ほかの HU SRP の組み合わせ（ポジションごと）のサイズ規則と batch", "status": "todo" },
+        { "text": "3BET ポットのサイズ規則（候補 25 / 33 / 66 / 100 / 125%）", "status": "todo" },
+        { "text": "3BET ポットの batch", "status": "todo" }
+      ]
+    }
+  ]
+}

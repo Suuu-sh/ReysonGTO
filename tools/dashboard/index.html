@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReysonGTO 進捗</title>
+<style>
+:root {
+  --bg: #f6f5f1;
+  --panel: #ffffff;
+  --ink: #1d1d1b;
+  --muted: #6c6a63;
+  --faint: #a29f96;
+  --line: #e4e1d8;
+  --track: #ecebe5;
+  --accent: #2f6f5e;
+  --accent-soft: #dcebe5;
+  --s33: #3d6fb6;
+  --s66: #c2742f;
+  --s100: #7d55a8;
+  --s125: #3f8f8a;
+  --s33-soft: #dde7f5;
+  --s66-soft: #f6e4d3;
+  --s100-soft: #ebe1f4;
+  --s125-soft: #d9eeec;
+  --run: #2f6f5e;
+  --warn: #b4472f;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #151614;
+    --panel: #1e1f1c;
+    --ink: #ecebe6;
+    --muted: #a3a198;
+    --faint: #6e6c65;
+    --line: #2e2f2b;
+    --track: #2a2b27;
+    --accent: #6fbca4;
+    --accent-soft: #24372f;
+    --s33: #7fa6e0;
+    --s66: #e2a067;
+    --s100: #b593de;
+    --s125: #74c6bf;
+    --s33-soft: #22304a;
+    --s66-soft: #45301d;
+    --s100-soft: #352a46;
+    --s125-soft: #1f3b39;
+    --run: #6fbca4;
+    --warn: #e5826b;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: .01em; }
+h2 { font-size: 13px; font-weight: 600; margin: 0 0 14px; color: var(--muted); letter-spacing: .04em; }
+.goal { color: var(--muted); margin: 6px 0 0; max-width: 760px; }
+.stamp { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+.dot.on { background: var(--run); box-shadow: 0 0 0 0 var(--run); animation: pulse 2s infinite; }
+.dot.off { background: var(--warn); }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--run) 50%, transparent); } 70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+.grid2 { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; margin-top: 20px; }
+@media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+section { margin-top: 16px; }
+
+/* Overall roadmap strip */
+.roadstrip { display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; margin-top: 20px; }
+.roadstrip div { height: 30px; border-radius: 6px; display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer; }
+.roadstrip .done { background: var(--accent); color: var(--panel); }
+.roadstrip .active { background: var(--accent-soft); color: var(--accent); outline: 1.5px solid var(--accent); outline-offset: -1.5px; }
+.roadstrip .todo { background: var(--track); color: var(--faint); }
+@media (max-width: 600px) { .roadstrip { grid-template-columns: repeat(5, 1fr); } }
+
+/* M4 run */
+.runhead { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.big { font-size: 40px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.big small { font-size: 16px; color: var(--muted); font-weight: 500; letter-spacing: 0; }
+.bar { height: 10px; background: var(--track); border-radius: 99px; overflow: hidden; margin: 14px 0 18px; }
+.bar i { display: block; height: 100%; background: var(--accent); border-radius: 99px; transition: width .6s ease; }
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+@media (max-width: 600px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+.kpi .k { font-size: 12px; color: var(--muted); }
+.kpi .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.kpi .s { font-size: 12px; color: var(--faint); }
+
+.now { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); display: grid; grid-template-columns: 1fr 220px; gap: 16px; align-items: center; }
+@media (max-width: 600px) { .now { grid-template-columns: 1fr; } }
+.now .flop { font-family: var(--mono); font-size: 18px; font-weight: 600; }
+.now .meta { color: var(--muted); font-size: 13px; }
+svg.spark { width: 100%; height: 64px; display: block; }
+
+/* Board map */
+.cells { display: grid; grid-template-columns: repeat(auto-fill, minmax(62px, 1fr)); gap: 4px; }
+.cell { border-radius: 6px; padding: 5px 4px 4px; text-align: center; font-family: var(--mono); font-size: 11px;
+  background: var(--track); color: var(--faint); cursor: default; position: relative; }
+.cell b { display: block; font-weight: 600; font-size: 11px; }
+.cell span { font-size: 10px; opacity: .85; }
+.cell.w33 { background: var(--s33-soft); color: var(--s33); }
+.cell.w66 { background: var(--s66-soft); color: var(--s66); }
+.cell.w100 { background: var(--s100-soft); color: var(--s100); }
+.cell.w125 { background: var(--s125-soft); color: var(--s125); }
+.cell.close { opacity: .62; }
+.cell.running { background: var(--accent-soft); color: var(--accent); outline: 1.5px solid var(--accent); outline-offset: -1.5px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: -4px 0 12px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+
+/* Split summary */
+.split { display: flex; height: 26px; border-radius: 6px; overflow: hidden; font-size: 12px; font-weight: 600; }
+.split div { display: flex; align-items: center; padding: 0 10px; white-space: nowrap; }
+.split div { color: var(--panel); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.tall { max-height: 460px; overflow: auto; }
+.tall th { position: sticky; top: 0; background: var(--panel); }
+td.num, th.num { text-align: right; }
+tr:last-child td { border-bottom: 0; }
+.mini { display: inline-flex; width: 90px; height: 7px; border-radius: 4px; overflow: hidden; vertical-align: middle; background: var(--track); }
+
+.tag { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+.tag.t33 { background: var(--s33-soft); color: var(--s33); }
+.tag.t66 { background: var(--s66-soft); color: var(--s66); }
+.tag.t100 { background: var(--s100-soft); color: var(--s100); }
+.tag.t125 { background: var(--s125-soft); color: var(--s125); }
+.scroll { overflow-x: auto; }
+.feat { color: var(--muted); font-size: 12px; }
+.tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+.tabs button { font: inherit; font-size: 12px; border: 1px solid var(--line); background: transparent; color: var(--muted);
+  padding: 3px 10px; border-radius: 99px; cursor: pointer; }
+.tabs button.on { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+
+/* Roadmap */
+.ms { display: grid; grid-template-columns: 56px 1fr; gap: 0 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.ms:last-child { border-bottom: 0; padding-bottom: 0; }
+.ms:first-child { padding-top: 0; }
+.ms .id { font-family: var(--mono); font-weight: 650; font-size: 13px; padding-top: 1px; }
+.ms.done .id { color: var(--accent); }
+.ms.active .id { color: var(--accent); }
+.ms.todo .id { color: var(--faint); }
+.ms .t { font-weight: 600; }
+.ms .d { color: var(--muted); font-size: 13px; }
+.badge { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 99px; margin-left: 8px; vertical-align: 1px; }
+.badge.done { background: var(--accent); color: var(--panel); }
+.badge.active { background: var(--accent-soft); color: var(--accent); }
+.badge.todo { background: var(--track); color: var(--faint); }
+ul.tasks { list-style: none; margin: 8px 0 0; padding: 0; }
+ul.tasks li { display: grid; grid-template-columns: 18px 1fr; gap: 6px; padding: 3px 0; font-size: 13px; }
+ul.tasks li.done { color: var(--muted); }
+ul.tasks li.done .tx { text-decoration: line-through; text-decoration-color: var(--faint); }
+.chk { width: 14px; height: 14px; border-radius: 4px; border: 1.5px solid var(--faint); margin-top: 3px; }
+li.done .chk { background: var(--accent); border-color: var(--accent); position: relative; }
+li.done .chk::after { content: ""; position: absolute; left: 3.5px; top: 0.5px; width: 4px; height: 8px; border: solid var(--panel); border-width: 0 1.8px 1.8px 0; transform: rotate(45deg); }
+li.active .chk { border-color: var(--accent); background: linear-gradient(90deg, var(--accent) 50%, transparent 50%); }
+li .live { color: var(--accent); font-weight: 600; margin-left: 6px; font-variant-numeric: tabular-nums; }
+.counts { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.err { color: var(--warn); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>ReysonGTO 進捗</h1>
+      <p class="goal" id="goal"></p>
+    </div>
+    <div class="stamp" id="stamp">読み込み中…</div>
+  </header>
+
+  <div class="roadstrip" id="strip"></div>
+
+  <div class="grid2">
+    <div class="panel">
+      <div class="runhead">
+        <h2 style="margin:0">M4 フロップのサイズ比較（120 ボード）</h2>
+        <span class="counts" id="alive"></span>
+      </div>
+      <div style="margin-top:12px" class="big" id="count">–</div>
+      <div class="bar"><i id="bar" style="width:0"></i></div>
+      <div class="kpis">
+        <div class="kpi"><div class="k">残り</div><div class="v" id="left">–</div><div class="s" id="leftS"></div></div>
+        <div class="kpi"><div class="k">1 ボードあたり</div><div class="v" id="pace">–</div><div class="s">直近 10 ボード</div></div>
+        <div class="kpi"><div class="k">完了の見込み</div><div class="v" id="eta">–</div><div class="s" id="etaS"></div></div>
+        <div class="kpi"><div class="k">勝ったサイズ</div><div class="v" id="wins">–</div><div class="s">EV が高かった数</div></div>
+      </div>
+      <div class="now" id="now"></div>
+    </div>
+
+    <div class="panel">
+      <h2>どちらのサイズが勝ったか</h2>
+      <div class="split" id="split"></div>
+      <p class="feat" style="margin:10px 0 14px">EV の差が 0.01BB 未満のボードは薄く表示しています。0.5% の精度では誤差と区別しにくい差です。</p>
+      <div class="tabs" id="tabs"></div>
+      <div class="scroll"><table id="byfeat"></table></div>
+    </div>
+  </div>
+
+  <section class="panel">
+    <h2>ボードごと</h2>
+    <div class="legend">
+      <span><i style="background:var(--s33)"></i>33% が上</span>
+      <span><i style="background:var(--s66)"></i>66% が上</span>
+      <span><i style="background:var(--s100)"></i>100% が上</span>
+      <span><i style="background:var(--s125)"></i>125% が上</span>
+      <span><i style="background:var(--accent)"></i>計算中</span>
+      <span><i style="background:var(--track)"></i>まだ</span>
+    </div>
+    <div class="cells" id="cells"></div>
+  </section>
+
+  <section class="panel">
+    <h2>結果（完了したボード）</h2>
+    <div class="scroll tall"><table id="results"></table></div>
+  </section>
+
+  <section class="panel">
+    <h2>全 HU 完了までのロードマップ</h2>
+    <div id="roadmap"></div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const CLOSE = 0.01;
+const SIZES = [33, 66, 100, 125];
+const FEATURES = [
+  ["suits", "スート", { Rainbow: "レインボー", TwoTone: "ツートーン", Monotone: "モノトーン" }],
+  ["pairing", "ペア", { Unpaired: "なし", Paired: "ペア", Trips: "トリップス" }],
+  ["height", "高さ", { Ace: "A", King: "K", QueenJack: "Q・J", TenEight: "T〜8", Low: "7 以下" }],
+  ["connectivity", "つながり", { Disconnected: "弱い", Gapped: "中くらい", Connected: "強い" }],
+];
+const LABEL = { done: "完了", active: "進行中", todo: "未着手" };
+let feature = "suits";
+
+function dur(sec) {
+  if (sec == null) return "–";
+  const m = Math.round(sec / 60);
+  if (m < 60) return `${m} 分`;
+  const h = Math.floor(m / 60);
+  return `${h} 時間 ${m % 60} 分`;
+}
+function clock(unix) {
+  const d = new Date(unix * 1000), now = new Date();
+  const day = d.toDateString() === now.toDateString() ? "今日" :
+    d.toDateString() === new Date(now.getTime() + 864e5).toDateString() ? "明日" : `${d.getMonth() + 1}/${d.getDate()}`;
+  return `${day} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+const fmt = (v, n = 3) => (v == null ? "–" : v.toFixed(n));
+
+function spark(trail, target) {
+  const pts = trail.filter((p) => p[1] != null && p[1] > 0);
+  if (pts.length < 2) return `<div class="meta">収束のグラフは数回の測定のあとに出ます</div>`;
+  const W = 220, H = 64, pad = 4;
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => Math.log10(p[1]));
+  const lt = Math.log10(target);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const y0 = Math.min(lt, ...ys), y1 = Math.max(...ys);
+  const X = (x) => pad + ((x - x0) / (x1 - x0 || 1)) * (W - 2 * pad);
+  const Y = (y) => pad + (1 - (y - y0) / (y1 - y0 || 1)) * (H - 2 * pad);
+  const d = pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(Math.log10(p[1])).toFixed(1)}`).join("");
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="exploitability の推移">
+    <line x1="0" x2="${W}" y1="${Y(lt)}" y2="${Y(lt)}" stroke="var(--faint)" stroke-dasharray="3 3" stroke-width="1"/>
+    <path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.8" vector-effect="non-scaling-stroke"/>
+  </svg><div class="meta" style="text-align:right">点線＝目標 ${target}%（対数目盛）</div>`;
+}
+
+function render(s) {
+  const r = s.roadmap || { milestones: [] };
+  $("goal").textContent = r.goal || "";
+  $("stamp").textContent = `更新 ${new Date(s.now * 1000).toLocaleTimeString("ja-JP")}・15 秒ごと`;
+
+  // Roadmap strip
+  $("strip").innerHTML = r.milestones.map((m) =>
+    `<div class="${m.status}" title="${esc(m.title)}・${LABEL[m.status]}" onclick="document.getElementById('ms-${m.id}').scrollIntoView({behavior:'smooth'})">${esc(m.id)}</div>`).join("");
+
+  // Run summary
+  const pct = s.total ? (s.done / s.total) * 100 : 0;
+  $("count").innerHTML = `${s.done}<small> / ${s.total} ボード・${pct.toFixed(0)}%</small>`;
+  $("bar").style.width = pct + "%";
+  $("alive").innerHTML = s.alive ? `<span class="dot on"></span>実行中` : `<span class="dot off"></span>${s.done === s.total ? "完了" : "停止中"}`;
+  const left = s.total - s.done;
+  $("left").textContent = `${left} ボード`;
+  $("leftS").textContent = s.seconds_per_board ? `約 ${dur(left * s.seconds_per_board)}` : "";
+  $("pace").textContent = dur(s.seconds_per_board);
+  $("eta").textContent = s.eta ? clock(s.eta) : s.done === s.total ? "完了" : "–";
+  $("etaS").textContent = s.deadline ? `上限 ${clock(s.deadline)}` : "";
+
+  const done = s.boards.filter((b) => b.state === "done");
+  const wins = Object.fromEntries(SIZES.map((z) => [z, done.filter((b) => b.winner === z).length]));
+  const shown = SIZES.filter((z) => wins[z]);
+  $("wins").innerHTML = shown.map((z) => `<span style="color:var(--s${z})" title="${z}%">${wins[z]}</span>`).join(" / ") || "–";
+
+  // Current solve
+  const run = s.running;
+  if (run) {
+    const live = run.live || {};
+    const target = run.stage === 1 ? 5 : 0.5;
+    $("now").innerHTML = `<div>
+        <div class="meta">いま解いているもの</div>
+        <div class="flop">${esc(run.flop)}</div>
+        <div class="meta">${run.stage === 1 ? "第 1 段階（4 サイズを粗く）" : "第 2 段階（上位 2 つを細かく）"}・ベット ${run.size}%</div>
+        <div class="meta" style="margin-top:4px">exploitability <b style="color:var(--ink)">${fmt(live.exploit_pct, 2)}%</b>・${live.iteration ?? 0} 回・${dur(live.elapsed)}</div>
+      </div><div>${spark(live.trail || [], target)}</div>`;
+  } else {
+    $("now").innerHTML = `<div class="meta">${s.alive ? "次のボードを準備中" : "計算は動いていません"}</div><div></div>`;
+  }
+
+  // Split + by feature
+  const tot = done.length || 1;
+  $("split").innerHTML = done.length ?
+    shown.map((z) => `<div style="width:${(wins[z] / tot) * 100}%;background:var(--s${z})" title="${z}%・${wins[z]}">${wins[z] / tot > 0.12 ? `${z}%・${wins[z]}` : ""}</div>`).join("") :
+    `<div class="feat">まだ結果がありません</div>`;
+  $("tabs").innerHTML = FEATURES.map(([k, l]) => `<button class="${k === feature ? "on" : ""}" data-k="${k}">${l}</button>`).join("");
+  $("tabs").querySelectorAll("button").forEach((b) => (b.onclick = () => { feature = b.dataset.k; render(s); }));
+  const [, , names] = FEATURES.find((f) => f[0] === feature);
+  const groups = {};
+  for (const b of done) {
+    const v = b.features[feature];
+    (groups[v] ||= { n: 0, w: {}, m: [] });
+    groups[v].n++;
+    groups[v].w[b.winner] = (groups[v].w[b.winner] || 0) + 1;
+    groups[v].m.push(b.margin_bb);
+  }
+  const order = Object.keys(names);
+  $("byfeat").innerHTML = `<tr><th></th>${shown.map((z) => `<th class="num">${z}%</th>`).join("")}<th></th><th class="num">差の中央値</th></tr>` +
+    order.filter((k) => groups[k]).map((k) => {
+      const g = groups[k], n = g.n, m = g.m.sort((x, y) => x - y)[Math.floor(n / 2)];
+      return `<tr><td>${names[k]}</td>${shown.map((z) => `<td class="num">${g.w[z] || ""}</td>`).join("")}
+        <td><span class="mini">${shown.map((z) => `<i style="width:${((g.w[z] || 0) / n) * 100}%;background:var(--s${z})"></i>`).join("")}</span></td>
+        <td class="num">${fmt(m, 3)} BB</td></tr>`;
+    }).join("");
+
+  // Cells
+  $("cells").innerHTML = s.boards.map((b) => {
+    let cls = "", sub = "";
+    if (b.state === "done") {
+      cls = `w${b.winner}${b.margin_bb < CLOSE ? " close" : ""}`;
+      sub = `${b.winner}%`;
+    } else if (b.state === "running") { cls = "running"; sub = "計算中"; }
+    const tip = `${b.flop}・${FEATURES.map(([k, , n]) => n[b.features[k]] || b.features[k]).join("・")}` +
+      (b.state === "done" ? `・${b.winner}% が ${fmt(b.margin_bb)}BB 上` : "");
+    return `<div class="cell ${cls}" title="${esc(tip)}"><b>${esc(b.flop)}</b><span>${sub || "&nbsp;"}</span></div>`;
+  }).join("");
+
+  // Results table
+  const rows = done.slice().sort((a, b) => b.finished - a.finished);
+  $("results").innerHTML = `<tr><th>ボード</th><th>特徴</th><th>1 位</th><th class="num">EV (BB)</th><th>2 位</th><th class="num">EV (BB)</th><th class="num">差 (BB)</th><th class="num">時間</th><th class="num">完了</th></tr>` +
+    rows.map((b) => {
+      const [a, c] = b.stage2.filter((x) => x.status === "complete").sort((x, y) => y.ev_bb - x.ev_bb);
+      const secs = (a.seconds || 0) + (c.seconds || 0);
+      return `<tr><td style="font-family:var(--mono)">${esc(b.flop)}</td>
+        <td class="feat">${FEATURES.map(([k, , n]) => n[b.features[k]] || b.features[k]).join("・")}</td>
+        <td><span class="tag t${a.size}">${a.size}%</span></td><td class="num">${fmt(a.ev_bb)}</td>
+        <td><span class="tag t${c.size}">${c.size}%</span></td><td class="num">${fmt(c.ev_bb)}</td>
+        <td class="num" style="${b.margin_bb < CLOSE ? "color:var(--faint)" : ""}">${fmt(b.margin_bb)}</td>
+        <td class="num">${dur(secs)}</td><td class="num feat">${clock(b.finished)}</td></tr>`;
+    }).join("");
+
+  // Roadmap detail
+  $("roadmap").innerHTML = r.milestones.map((m) => {
+    const tasks = m.tasks || [];
+    const dn = tasks.filter((t) => t.status === "done").length;
+    return `<div class="ms ${m.status}" id="ms-${m.id}">
+      <div class="id">${esc(m.id)}</div>
+      <div>
+        <div><span class="t">${esc(m.title)}</span><span class="badge ${m.status}">${LABEL[m.status]}</span>
+          ${tasks.length ? `<span class="counts" style="margin-left:8px">${dn} / ${tasks.length}</span>` : ""}</div>
+        <div class="d">${esc(m.detail || "")}</div>
+        ${tasks.length ? `<ul class="tasks">${tasks.map((t) => `<li class="${t.status}"><span class="chk"></span><span class="tx">${esc(t.text)}${t.live === "m4b" ? `<span class="live">${s.done} / ${s.total}</span>` : ""}</span></li>`).join("")}</ul>` : ""}
+      </div></div>`;
+  }).join("");
+}
+
+async function tick() {
+  try {
+    const res = await fetch("/api/status", { cache: "no-store" });
+    render(await res.json());
+  } catch (e) {
+    $("stamp").innerHTML = `<span class="err">サーバーに接続できません</span>`;
+  }
+}
+tick();
+setInterval(tick, 15000);
+</script>
+</body>
+</html>
