@@ -29,6 +29,7 @@ pub struct KernelWorkload {
     pub showdown_evaluated_combos: u64,
     /// Actual sorted opposing prefix entries visited (not all active opponent hands).
     pub showdown_prefix_combos: u64,
+    /// Logical terminal demand, including reach-scoped Totals cache hits.
     pub terminal_totals_dense_combos: u64,
     pub terminal_totals_active_combos: u64,
     pub chance_visits: u64,
@@ -52,6 +53,10 @@ pub struct KernelTimes {
     /// Actual zero contributions skipped; static workload fields are logical
     /// dense/packed visits. These counters are collected only when opted in.
     pub terminal_totals_zero_combos: u64,
+    /// Actual opposing dense entries scanned on cache misses.
+    pub terminal_totals_scanned_combos: u64,
+    /// Terminal calls reusing exactly unchanged opposing reach totals.
+    pub terminal_totals_cache_hits: u64,
     pub showdown_prefix_zero_combos: u64,
 }
 impl KernelTimes {
@@ -64,6 +69,8 @@ impl KernelTimes {
         self.chance_ns += rhs.chance_ns;
         self.decision_transport_ns += rhs.decision_transport_ns;
         self.terminal_totals_zero_combos += rhs.terminal_totals_zero_combos;
+        self.terminal_totals_scanned_combos += rhs.terminal_totals_scanned_combos;
+        self.terminal_totals_cache_hits += rhs.terminal_totals_cache_hits;
         self.showdown_prefix_zero_combos += rhs.showdown_prefix_zero_combos;
     }
     pub(super) fn section(&mut self, section: usize, ns: u128) {

@@ -16,7 +16,7 @@ pub struct GameSpec {
     pub engine: EngineConfig,
 }
 
-/// Opt-in cadence for exact average-EV and best-response evaluations.
+/// Adaptive cadence for exact average-EV and best-response evaluations.
 #[derive(Clone, Debug, Serialize)]
 pub struct AdaptiveMetrics {
     pub early_every: usize,
@@ -28,18 +28,38 @@ impl Default for AdaptiveMetrics {
     fn default() -> Self {
         Self {
             early_every: 25,
-            near_every: 5,
+            near_every: 10,
             near_target_multiplier: 2.0,
         }
     }
 }
 impl AdaptiveMetrics {
-    fn interval(&self, near: bool) -> usize {
+    fn interval(
+        &self,
+        near: bool,
+        previous: Option<(usize, f64)>,
+        current: (usize, f64),
+        target: f64,
+    ) -> usize {
         if near {
-            self.near_every
-        } else {
-            self.early_every
+            return self.near_every;
         }
+        let Some((iteration, exploitability)) = previous else {
+            return self.early_every;
+        };
+        let improvement = exploitability - current.1;
+        if current.0 <= iteration || !improvement.is_finite() || improvement <= 0.0 {
+            return self.early_every;
+        }
+        // A local slope is only a scheduling hint, never a substitute for exact
+        // EV/BR or a stopping decision. Check halfway to the predicted near
+        // boundary; cap both ends because convergence can be noisy/nonlinear.
+        let remaining = (current.1 - target * self.near_target_multiplier)
+            * (current.0 - iteration) as f64
+            / improvement;
+        ((remaining * 0.5) as usize)
+            .max(self.near_every)
+            .min(self.early_every)
     }
 }
 
@@ -354,6 +374,7 @@ pub fn solve_with_progress(
             },
         })?;
         let mut measured_iteration = 0;
+        let mut previous_measurement = None;
         let mut near_target = stop_conditions
             .adaptive_metrics
             .as_ref()
@@ -398,14 +419,20 @@ pub fn solve_with_progress(
             engine.iterate();
             let iteration_seconds = iter_start.elapsed().as_secs_f64();
             training_seconds += iteration_seconds;
-            let interval = stop_conditions
-                .adaptive_metrics
-                .as_ref()
-                .map_or(stop_conditions.metrics_every, |schedule| {
-                    schedule.interval(near_target)
-                });
+            let interval = stop_conditions.adaptive_metrics.as_ref().map_or(
+                stop_conditions.metrics_every,
+                |schedule| {
+                    schedule.interval(
+                        near_target,
+                        previous_measurement,
+                        (measured_iteration, metrics.exploitability_pct),
+                        stop_conditions.target_exploitability_pct,
+                    )
+                },
+            );
             let fresh = engine.iterations() - measured_iteration >= interval;
             if fresh {
+                previous_measurement = Some((measured_iteration, metrics.exploitability_pct));
                 let metric_start = Instant::now();
                 metrics = engine.metrics();
                 metrics_seconds += metric_start.elapsed().as_secs_f64();
@@ -1123,14 +1150,169 @@ mod tests {
             assert!(checkpoints.windows(2).all(|pair| pair[0] < pair[1]));
             let interval = if near { 2 } else { 3 };
             assert!(checkpoints
-                .iter()
-                .all(|&i| i == final_iteration || i % interval == 0));
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] <= interval));
             if let Some(record) = result.history.last() {
                 assert_eq!(
                     record.metrics.as_ref().unwrap().exploitability_pct,
                     result.metrics.exploitability_pct
                 );
             }
+        }
+    }
+    #[test]
+    fn adaptive_prediction_is_bounded_and_near_cadence_is_stable() {
+        let schedule = AdaptiveMetrics {
+            early_every: 100,
+            near_every: 10,
+            near_target_multiplier: 2.0,
+        };
+        assert_eq!(schedule.interval(false, None, (0, 10.0), 1.0), 100);
+        // Slope 0.1 per iteration: near boundary in 30 iterations; check halfway.
+        assert_eq!(schedule.interval(false, Some((0, 6.0)), (10, 5.0), 1.0), 15);
+        assert_eq!(schedule.interval(false, Some((0, 6.0)), (10, 2.1), 1.0), 10);
+        assert_eq!(
+            schedule.interval(false, Some((0, 6.0)), (10, 5.99), 1.0),
+            100
+        );
+        assert_eq!(
+            schedule.interval(false, Some((0, 6.0)), (10, 6.0), 1.0),
+            100
+        );
+        assert_eq!(
+            schedule.interval(false, Some((0, 6.0)), (10, 7.0), 1.0),
+            100
+        );
+        assert_eq!(schedule.interval(true, Some((0, 6.0)), (10, 7.0), 1.0), 10);
+    }
+    #[test]
+    fn metric_cadences_leave_training_strategy_ev_and_br_identical() {
+        let (game, ranges) = example();
+        let stop = StopConditions {
+            target_exploitability_pct: 0.0,
+            max_iterations: 7,
+            max_seconds: 30.0,
+            metrics_every: 1,
+            ..Default::default()
+        };
+        let mut initial_exploitability = 0.0;
+        let dense = solve_with_progress(game.clone(), ranges.clone(), stop.clone(), |event| {
+            if let ProgressEvent::Checkpoint { record } = event {
+                if record.iteration == 0 {
+                    initial_exploitability = record.metrics.as_ref().unwrap().exploitability_pct;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(dense.engine.iterations(), 7);
+        for adaptive_metrics in [
+            None,
+            Some(AdaptiveMetrics {
+                early_every: 4,
+                near_every: 2,
+                near_target_multiplier: 2.0,
+            }),
+        ] {
+            let sparse = solve(
+                game.clone(),
+                ranges.clone(),
+                StopConditions {
+                    metrics_every: 4,
+                    adaptive_metrics,
+                    ..stop.clone()
+                },
+            )
+            .unwrap();
+            assert_eq!(sparse.engine.iterations(), dense.engine.iterations());
+            assert_eq!(sparse.stopped_by, "max_iterations");
+            assert_eq!(
+                serde_json::to_value(&sparse.metrics).unwrap(),
+                serde_json::to_value(&dense.metrics).unwrap()
+            );
+            for (id, node) in dense.tree().nodes.iter().enumerate() {
+                if matches!(node.kind, NodeKind::Decision { .. }) {
+                    assert_eq!(
+                        serde_json::to_value(sparse.strategy(id).unwrap()).unwrap(),
+                        serde_json::to_value(dense.strategy(id).unwrap()).unwrap()
+                    );
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(sparse.history.last().unwrap().metrics.as_ref().unwrap())
+                    .unwrap(),
+                serde_json::to_value(&sparse.metrics).unwrap()
+            );
+        }
+        assert!(dense.metrics.exploitability_pct < initial_exploitability);
+        let target = (initial_exploitability + dense.metrics.exploitability_pct) / 2.0;
+        let mut checkpoints = Vec::new();
+        let targeted = solve_with_progress(
+            game,
+            ranges,
+            StopConditions {
+                target_exploitability_pct: target,
+                adaptive_metrics: Some(AdaptiveMetrics {
+                    early_every: 2,
+                    near_every: 1,
+                    ..Default::default()
+                }),
+                ..stop
+            },
+            |event| {
+                if let ProgressEvent::Checkpoint { record } = event {
+                    checkpoints.push(record.iteration);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(targeted.stopped_by, "target");
+        assert!(targeted.engine.iterations() > 0);
+        assert!(targeted.metrics.exploitability_pct <= target);
+        assert_eq!(checkpoints.last(), Some(&targeted.engine.iterations()));
+        assert!(checkpoints.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            serde_json::to_value(targeted.history.last().unwrap().metrics.as_ref().unwrap())
+                .unwrap(),
+            serde_json::to_value(&targeted.metrics).unwrap()
+        );
+    }
+    #[test]
+    fn initial_target_time_and_iteration_limits_keep_fresh_metrics() {
+        for (target, max_seconds, max_iterations, reason) in [
+            (1e9, 30.0, 10, "target"),
+            (0.0, 0.0, 10, "max_seconds"),
+            (0.0, 30.0, 0, "max_iterations"),
+        ] {
+            let (game, ranges) = example();
+            let mut checkpoints = Vec::new();
+            let result = solve_with_progress(
+                game,
+                ranges,
+                StopConditions {
+                    target_exploitability_pct: target,
+                    max_iterations,
+                    max_seconds,
+                    adaptive_metrics: Some(AdaptiveMetrics::default()),
+                    ..Default::default()
+                },
+                |event| {
+                    if let ProgressEvent::Checkpoint { record } = event {
+                        checkpoints.push(record.clone());
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(result.stopped_by, reason);
+            assert!(result.history.is_empty());
+            assert_eq!(checkpoints.len(), 1);
+            assert_eq!(checkpoints[0].iteration, 0);
+            assert_eq!(
+                serde_json::to_value(checkpoints[0].metrics.as_ref().unwrap()).unwrap(),
+                serde_json::to_value(&result.metrics).unwrap()
+            );
         }
     }
     #[test]

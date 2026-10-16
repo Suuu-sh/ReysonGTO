@@ -66,7 +66,16 @@ cargo run --release -p cli -- solve --help
 `--raise-multiplier` は既定 2.5。`--no-allin-merge` は 67% まとめを無効にします
 （未指定では `--allin-merge-ratio 0.67`）。追加の強制 all-in／枝の頻度まとめ閾値はありません。
 `--dcfr-alpha`, `--dcfr-beta`, `--dcfr-gamma` で DCFR の係数を指定できます。
-`--metrics-every 10` が既定で、初期・10 反復ごと・終了時に EV / BR を再計算します。
+production では adaptive metrics が既定です。遠い間は最大 25 反復間隔、
+直近 2 回の正確な exploitability の減少から近傍到達を予測できる場合は、その手前で再測定します
+（予測は間隔選択だけに使用し、停止判定には使用しません）。
+目標の 2 倍以下に達した後は `--metrics-every 10` の従来間隔を維持します。
+`--metrics-early-every`、`--metrics-near-every`、`--metrics-near-target-multiplier` で上書き可能です。
+`--no-adaptive-metrics` は固定間隔に戻し、benchmark preset は固定間隔が既定です
+（`--adaptive-metrics` で有効化できます）。初期・終了時は必ず現在の戦略の正確な EV / BR を計算します。
+ノード単位の詳細タイマーは既定 OFF、`--profiling` で ON です。`--no-profiling` も互換用に受理します。
+学習・metrics の全体時間、反復数、メモリの記録は OFF でも残ります。
+診断専用の `bench` サブコマンドは例外で、terminal 処理の時間比率を出すため詳細計時を明示的に有効化します。
 セットアップと精度チェックの進捗は stderr に JSONL で出し、
 `--progress-jsonl /path/to/new-file.jsonl` でも逐次 flush して保存できます（既存ファイルは上書きしません）。
 
