@@ -924,6 +924,9 @@ impl Engine {
         self.wall_profile.training_seconds += start.elapsed().as_secs_f64();
     }
     fn run(&mut self, player: usize, mode: Mode) -> f64 {
+        self.run_with_cache(player, mode, TotalsCache::default())
+    }
+    fn run_with_cache(&mut self, player: usize, mode: Mode, mut totals_cache: TotalsCache) -> f64 {
         let start = Instant::now();
         self.scratch[0].reach[0].copy_from_slice(&self.initial_reach[0]);
         self.scratch[0].reach[1].copy_from_slice(&self.initial_reach[1]);
@@ -966,6 +969,7 @@ impl Engine {
                 player,
                 mode,
                 true,
+                &mut totals_cache,
                 &mut diagnostics,
             );
         } else {
@@ -978,6 +982,7 @@ impl Engine {
                     player,
                     mode,
                     true,
+                    &mut totals_cache,
                     &mut diagnostics,
                 )
             });
@@ -1164,6 +1169,7 @@ impl Engine {
                 player,
                 mode,
                 false,
+                &mut TotalsCache::default(),
                 &mut RunDiagnostics::default(),
             );
             self.scratch[0].value[..reach[player].len()]
@@ -1753,6 +1759,7 @@ fn traverse(
     target: usize,
     mode: Mode,
     parallel: bool,
+    totals_cache: &mut TotalsCache,
     diagnostics: &mut RunDiagnostics,
 ) {
     let (level, desc_scratch) = scratch.split_first_mut().expect("depth scratch");
@@ -1768,6 +1775,7 @@ fn traverse(
                 level,
                 target,
                 *winner,
+                totals_cache,
                 ctx.config
                     .kernel_diagnostics
                     .then_some(&mut diagnostics.times),
@@ -1805,6 +1813,7 @@ fn traverse(
                     mode,
                     probability,
                     state.id,
+                    totals_cache,
                 );
                 if let Some(t) = batch_start {
                     child_diagnostics.batch(state.id, target, t.elapsed().as_nanos());
@@ -1865,6 +1874,7 @@ fn traverse(
                         target,
                         mode,
                         false,
+                        &mut totals_cache.fresh(),
                         diagnostics,
                     );
                     let start =
@@ -1927,6 +1937,14 @@ fn traverse(
                 }
                 let (child_buffers, rest) = descendants.split(child.span);
                 descendants = rest;
+                // Only target-player actions leave opposing reach unchanged.
+                // A different opponent action must never inherit the parent's totals.
+                let mut changed_reach_cache = totals_cache.fresh();
+                let child_cache = if actor == target {
+                    &mut *totals_cache
+                } else {
+                    &mut changed_reach_cache
+                };
                 traverse(
                     ctx,
                     child,
@@ -1935,6 +1953,7 @@ fn traverse(
                     target,
                     mode,
                     parallel,
+                    child_cache,
                     diagnostics,
                 );
                 let transport = ctx.config.kernel_diagnostics.then(Instant::now);
@@ -2151,6 +2170,30 @@ fn chance_reach(
         }
     }
 }
+// Contiguous partitions keep slab borrows disjoint and leave the later
+// child/orbit accumulation order untouched. Slab span approximates subtree work;
+// a terminal-only child still costs one unit. No extra nested scratch is allocated.
+fn weighted_chance_split(children: &[State]) -> usize {
+    debug_assert!(children.len() > 1);
+    let total: u128 = children.iter().map(|c| c.span.max(1) as u128).sum();
+    let mut prefix = 0u128;
+    let mut best = 1;
+    let mut distance = u128::MAX;
+    for (i, child) in children[..children.len() - 1].iter().enumerate() {
+        prefix += child.span.max(1) as u128;
+        let next_distance = (2 * prefix).abs_diff(total);
+        if next_distance < distance {
+            best = i + 1;
+            distance = next_distance;
+        }
+        // Positive weights make all subsequent prefixes farther from halfway.
+        if 2 * prefix >= total {
+            break;
+        }
+    }
+    best
+}
+
 #[allow(clippy::too_many_arguments)]
 fn visit_parallel_chance(
     ctx: &Context<'_>,
@@ -2162,10 +2205,11 @@ fn visit_parallel_chance(
     mode: Mode,
     probability: f64,
     boundary_node: usize,
+    totals_cache: &TotalsCache,
 ) -> RunDiagnostics {
     let mut diagnostics = RunDiagnostics::default();
     if children.len() > ctx.config.parallel_grain {
-        let mid = children.len() / 2;
+        let mid = weighted_chance_split(children);
         let span = children[..mid].iter().map(|s| s.span).sum();
         let (a, b) = buffers.split(span);
         let (left, right) = children.split_at_mut(mid);
@@ -2182,6 +2226,7 @@ fn visit_parallel_chance(
                     mode,
                     probability,
                     boundary_node,
+                    totals_cache,
                 )
             },
             || {
@@ -2195,6 +2240,7 @@ fn visit_parallel_chance(
                     mode,
                     probability,
                     boundary_node,
+                    totals_cache,
                 )
             },
         );
@@ -2232,6 +2278,7 @@ fn visit_parallel_chance(
                 target,
                 mode,
                 false,
+                &mut totals_cache.fresh(),
                 &mut diagnostics,
             );
         }
@@ -2253,6 +2300,51 @@ fn visit_parallel_chance(
         }
     }
     diagnostics
+}
+
+// Stack-local and reach-scoped: no cache is retained by State/Level, and no
+// combo-sized scratch or memory-limit estimate changes. Only target-player
+// decisions may share this cache; chance/opponent actions create a fresh one.
+#[derive(Default)]
+struct TotalsCache {
+    value: Option<Totals>,
+    #[cfg(test)]
+    disabled: bool,
+}
+impl TotalsCache {
+    fn fresh(&self) -> Self {
+        Self {
+            value: None,
+            #[cfg(test)]
+            disabled: self.disabled,
+        }
+    }
+    fn get(
+        &mut self,
+        cards: &[[Card; 2]],
+        reach: &[f64],
+        mut diagnostics: Option<&mut diagnostics::KernelTimes>,
+    ) -> &Totals {
+        #[cfg(test)]
+        if self.disabled {
+            self.value = None;
+        }
+        if self.value.is_none() {
+            if let Some(d) = diagnostics.as_deref_mut() {
+                d.terminal_totals_scanned_combos += reach.len() as u64;
+            }
+            self.value = Some(totals_nonzero(
+                cards,
+                reach,
+                diagnostics
+                    .as_deref_mut()
+                    .map(|d| &mut d.terminal_totals_zero_combos),
+            ));
+        } else if let Some(d) = diagnostics {
+            d.terminal_totals_cache_hits += 1;
+        }
+        self.value.as_ref().expect("initialized opposing totals")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2306,16 +2398,15 @@ fn terminal(
     level: &mut Level,
     target: usize,
     winner: Option<usize>,
+    totals_cache: &mut TotalsCache,
     mut diagnostics: Option<&mut diagnostics::KernelTimes>,
 ) {
     let node = &ctx.tree.nodes[id];
     let reach = &level.reach[1 - target];
-    let all = totals_nonzero(
+    let all = totals_cache.get(
         &ctx.hand_cards[1 - target],
         reach,
-        diagnostics
-            .as_deref_mut()
-            .map(|d| &mut d.terminal_totals_zero_combos),
+        diagnostics.as_deref_mut(),
     );
     let pot = node.pot as f64 - ctx.tree.config.rake(node.pot);
     let base = node.invested[target] as f64 + ctx.tree.config.starting_pot as f64 / 2.0;
@@ -2327,7 +2418,7 @@ fn terminal(
             level.value[i] = if ctx.masks[target][i] & board != 0 {
                 0.0
             } else {
-                payoff * compatible(cards, &all, same)
+                payoff * compatible(cards, all, same)
             };
         }
         return;
@@ -2379,7 +2470,7 @@ fn terminal(
             } else {
                 reach[hand.same as usize]
             };
-            let total = compatible(hand.cards, &all, same);
+            let total = compatible(hand.cards, all, same);
             let before = level.value[i];
             // The identical opposing combo belongs to the equal prefix only.
             let after = compatible(hand.cards, &weak, same);
@@ -3073,7 +3164,15 @@ mod tests {
                     .iter()
                     .filter(|&&r| r == 0.0)
                     .count() as u64;
-                terminal(&ctx, id, &mut level, target, winner, Some(&mut diagnostic));
+                terminal(
+                    &ctx,
+                    id,
+                    &mut level,
+                    target,
+                    winner,
+                    &mut TotalsCache::default(),
+                    Some(&mut diagnostic),
+                );
                 assert_eq!(diagnostic.terminal_totals_zero_combos, expected_total_skips);
                 assert_eq!(
                     diagnostic.showdown_prefix_zero_combos,
@@ -3182,7 +3281,15 @@ mod tests {
                             iteration: 0,
                             run_start: Instant::now(),
                         };
-                        terminal(&ctx, id, &mut level, target, winner, None);
+                        terminal(
+                            &ctx,
+                            id,
+                            &mut level,
+                            target,
+                            winner,
+                            &mut TotalsCache::default(),
+                            None,
+                        );
                         assert_eq!(
                             level.value[..expected.len()]
                                 .iter()
@@ -3282,7 +3389,15 @@ mod tests {
                             iteration: 0,
                             run_start: Instant::now(),
                         };
-                        terminal(&ctx, id, &mut level, target, winner, None);
+                        terminal(
+                            &ctx,
+                            id,
+                            &mut level,
+                            target,
+                            winner,
+                            &mut TotalsCache::default(),
+                            None,
+                        );
                         assert_eq!(
                             level.value[..expected.len()]
                                 .iter()
@@ -3357,6 +3472,203 @@ mod tests {
         assert!((legal as f64 / (52 - b.len() - 4) as f64 - 1.0).abs() < 1e-12);
     }
     #[test]
+    fn reach_scoped_totals_match_uncached_serial_ev_br_and_strategy_bits() {
+        let b = board("2c 7c 9c Jc");
+        let tree = GameTree::build(
+            b.clone(),
+            TreeConfig {
+                starting_pot: 1000,
+                effective_stack: 500,
+                allow_raises: false,
+                rake_rate: 0.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Nontrivial suit orbits, future blockers, and fractional opposing reach.
+        let rr = [
+            range(&[("AcAd", 0.7), ("AcAh", 0.7), ("AcAs", 0.7)], &b),
+            range(&[("KcKd", 0.3), ("KcKh", 0.3), ("KcKs", 0.3)], &b),
+        ];
+        for storage_mode in [StorageMode::F32, StorageMode::I16] {
+            for suit_isomorphism in [false, true] {
+                let config = EngineConfig {
+                    storage_mode,
+                    suit_isomorphism,
+                    ..Default::default()
+                };
+                let mut reference = Engine::new(tree.clone(), rr.clone(), config.clone()).unwrap();
+                for _ in 0..12 {
+                    reference.iterations += 1;
+                    for target in 0..2 {
+                        reference.run_with_cache(
+                            target,
+                            Mode::Train,
+                            TotalsCache {
+                                disabled: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                let expected_average = std::array::from_fn::<_, 2, _>(|p| {
+                    reference.run_with_cache(
+                        p,
+                        Mode::Average,
+                        TotalsCache {
+                            disabled: true,
+                            ..Default::default()
+                        },
+                    )
+                });
+                let expected_br = std::array::from_fn::<_, 2, _>(|p| {
+                    reference.run_with_cache(
+                        p,
+                        Mode::BestResponse,
+                        TotalsCache {
+                            disabled: true,
+                            ..Default::default()
+                        },
+                    )
+                });
+                let expected_chips = ((expected_br[0] - expected_average[0])
+                    + (expected_br[1] - expected_average[1]))
+                    .max(0.0)
+                    / 2.0;
+                for threads in [1, 4] {
+                    let mut actual = Engine::new(
+                        tree.clone(),
+                        rr.clone(),
+                        EngineConfig {
+                            threads,
+                            kernel_diagnostics: true,
+                            ..config.clone()
+                        },
+                    )
+                    .unwrap();
+                    for _ in 0..12 {
+                        actual.iterate();
+                    }
+                    assert_eq!(actual.regret.bits(), reference.regret.bits());
+                    assert_eq!(actual.average.bits(), reference.average.bits());
+                    for (id, node) in tree.nodes.iter().enumerate() {
+                        if matches!(node.kind, NodeKind::Decision { .. }) {
+                            assert_eq!(
+                                actual
+                                    .strategy(id)
+                                    .unwrap()
+                                    .iter()
+                                    .map(|v| v.to_bits())
+                                    .collect::<Vec<_>>(),
+                                reference
+                                    .strategy(id)
+                                    .unwrap()
+                                    .iter()
+                                    .map(|v| v.to_bits())
+                                    .collect::<Vec<_>>()
+                            );
+                        }
+                    }
+                    let metrics = actual.metrics();
+                    assert_eq!(
+                        metrics.average_ev.map(f64::to_bits),
+                        expected_average.map(f64::to_bits)
+                    );
+                    assert_eq!(
+                        metrics.best_response_ev.map(f64::to_bits),
+                        expected_br.map(f64::to_bits)
+                    );
+                    assert_eq!(
+                        metrics.exploitability_chips.to_bits(),
+                        expected_chips.to_bits()
+                    );
+                    assert_eq!(
+                        metrics.exploitability_pct.to_bits(),
+                        (100.0 * expected_chips / 1000.0).to_bits()
+                    );
+                    let d = actual.kernel_diagnostics().unwrap();
+                    assert!(d.training.terminal_totals_cache_hits > 0);
+                    assert!(
+                        d.training.terminal_totals_scanned_combos
+                            < 12 * d.per_iteration_workload.terminal_totals_dense_combos
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn totals_cache_reuse_counts_actual_scans_and_preserves_sum_bits() {
+        let cards = [[Card(0), Card(1)], [Card(2), Card(3)], [Card(0), Card(3)]];
+        let reach = [0.7, -0.0, f64::from_bits(1)];
+        let original = totals_nonzero(&cards, &reach, None);
+        let mut cache = TotalsCache::default();
+        let mut diagnostic = diagnostics::KernelTimes::default();
+        for _ in 0..3 {
+            let actual = cache.get(&cards, &reach, Some(&mut diagnostic));
+            assert_eq!(actual.sum.to_bits(), original.sum.to_bits());
+            assert_eq!(
+                actual.cards.map(f64::to_bits),
+                original.cards.map(f64::to_bits)
+            );
+        }
+        assert_eq!(diagnostic.terminal_totals_cache_hits, 2);
+        assert_eq!(diagnostic.terminal_totals_scanned_combos, 3);
+        assert_eq!(diagnostic.terminal_totals_zero_combos, 1);
+        // Fresh scopes cannot reuse the previous reach, even at the same address.
+        cache = cache.fresh();
+        let next = [0.0, 0.9, 0.2];
+        let actual = cache.get(&cards, &next, Some(&mut diagnostic));
+        let expected = totals_nonzero(&cards, &next, None);
+        assert_eq!(actual.sum.to_bits(), expected.sum.to_bits());
+        assert_eq!(
+            actual.cards.map(f64::to_bits),
+            expected.cards.map(f64::to_bits)
+        );
+        assert_eq!(diagnostic.terminal_totals_scanned_combos, 6);
+    }
+    #[test]
+    fn default_profiling_is_opt_in() {
+        assert!(!EngineConfig::default().profiling);
+        let (tree, ranges) = toy();
+        let mut e = Engine::new(tree, ranges, EngineConfig::default()).unwrap();
+        e.iterate();
+        e.metrics();
+        let p = e.profile();
+        assert_eq!(
+            [
+                p.showdown_seconds,
+                p.fold_seconds,
+                p.regret_seconds,
+                p.chance_seconds
+            ],
+            [0.0; 4]
+        );
+    }
+    #[test]
+    fn weighted_chance_split_balances_skew_and_terminal_only_children() {
+        let state = |span| State {
+            id: 0,
+            children: Vec::new(),
+            offset: 0,
+            own_len: 0,
+            span,
+            scales: [1.0; 2],
+            work: [0; 4],
+            orbits: Vec::new(),
+            parallel_scratch: Vec::new(),
+        };
+        for (weights, expected) in [
+            (vec![1, 1, 1, 9], 3),
+            (vec![9, 1, 1, 1], 1),
+            (vec![0, 0, 0, 0], 2),
+            (vec![1, 1], 1),
+            (vec![usize::MAX, usize::MAX, 1], 1),
+        ] {
+            let children: Vec<_> = weights.into_iter().map(state).collect();
+            assert_eq!(weighted_chance_split(&children), expected);
+        }
+    }
+    #[test]
     fn parallel_grain_preserves_storage_and_metrics_bits() {
         let b = board("2c 7d 9h Js");
         let tree = GameTree::build(
@@ -3380,7 +3692,7 @@ mod tests {
                 rr.clone(),
                 EngineConfig {
                     storage_mode,
-                    threads: 3,
+                    threads: 1,
                     ..Default::default()
                 },
             )
@@ -3389,13 +3701,13 @@ mod tests {
                 reference.iterate();
             }
             let expected = reference.metrics();
-            for grain in [2, 4, 7, 64] {
+            for (threads, grain) in [(1, 1), (4, 1), (4, 2), (4, 4), (4, 7), (4, 64)] {
                 let mut actual = Engine::new(
                     tree.clone(),
                     rr.clone(),
                     EngineConfig {
                         storage_mode,
-                        threads: 3,
+                        threads,
                         parallel_grain: grain,
                         ..Default::default()
                     },

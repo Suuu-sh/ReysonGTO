@@ -113,15 +113,19 @@ struct SolveArgs {
     allin_merge: bool,
     #[arg(long, default_value_t = 10)]
     metrics_every: usize,
-    /// Opt in to sparse early exact metrics, then denser checks near the target.
-    #[arg(long)]
+    /// Enable sparse early exact metrics (already enabled for production).
+    #[arg(long, conflicts_with = "no_adaptive_metrics")]
     adaptive_metrics: bool,
-    #[arg(long, default_value_t = 25, requires = "adaptive_metrics")]
+    /// Use fixed --metrics-every cadence, including in production.
+    #[arg(long)]
+    no_adaptive_metrics: bool,
+    #[arg(long, default_value_t = 25)]
     metrics_early_every: usize,
-    #[arg(long, default_value_t = 5, requires = "adaptive_metrics")]
-    metrics_near_every: usize,
+    /// Near-target cadence; defaults to --metrics-every.
+    #[arg(long)]
+    metrics_near_every: Option<usize>,
     /// Switch permanently to near cadence at target times this multiplier.
-    #[arg(long, default_value_t = 2.0, requires = "adaptive_metrics")]
+    #[arg(long, default_value_t = 2.0)]
     metrics_near_target_multiplier: f64,
     /// Flush setup and fresh metric checkpoint JSONL while solving.
     #[arg(long)]
@@ -157,7 +161,10 @@ struct SolveArgs {
     out: PathBuf,
     #[arg(long, default_value_t = 10)]
     threads: usize,
-    /// Disable fine-grained worker timers (the selected mode is recorded in engine metadata).
+    /// Enable fine-grained per-node worker timers (off by default).
+    #[arg(long, conflicts_with = "no_profiling")]
+    profiling: bool,
+    /// Compatibility flag: fine-grained worker timers are already off by default.
     #[arg(long)]
     no_profiling: bool,
     /// Opt-in phase-isolated kernel workload and chance-task diagnostics.
@@ -352,7 +359,7 @@ impl SolveArgs {
                 .memory_mb
                 .checked_mul(1024 * 1024)
                 .ok_or_else(|| anyhow!("memory limit overflow"))?,
-            profiling: !self.no_profiling,
+            profiling: self.profiling,
             kernel_diagnostics: self.kernel_diagnostics,
             storage_mode: match self.storage.unwrap_or(if benchmark {
                 Storage::I16
@@ -399,9 +406,11 @@ impl SolveArgs {
             max_iterations: self.max_iters,
             max_seconds: self.max_seconds,
             metrics_every: self.metrics_every,
-            adaptive_metrics: self.adaptive_metrics.then_some(AdaptiveMetrics {
+            adaptive_metrics: (!self.no_adaptive_metrics
+                && (self.adaptive_metrics || self.preset != Some(Preset::Benchmark)))
+            .then_some(AdaptiveMetrics {
                 early_every: self.metrics_early_every,
-                near_every: self.metrics_near_every,
+                near_every: self.metrics_near_every.unwrap_or(self.metrics_every),
                 near_target_multiplier: self.metrics_near_target_multiplier,
             }),
         }
@@ -774,10 +783,33 @@ mod tests {
             .is_err());
     }
     #[test]
-    fn solve_performance_options_remain_opt_in() {
+    fn production_metrics_and_opt_in_profiling() {
         let defaults = args("solve", &[]);
+        assert!(!defaults.profiling && !defaults.no_profiling && !defaults.kernel_diagnostics);
+        assert!(!defaults.engine_config().unwrap().profiling);
+        let schedule = defaults.stop_conditions().adaptive_metrics.unwrap();
+        assert_eq!((schedule.early_every, schedule.near_every), (25, 10));
+        assert!(args("solve", &["--preset", "benchmark"])
+            .stop_conditions()
+            .adaptive_metrics
+            .is_none());
+        assert!(args("solve", &["--no-adaptive-metrics"])
+            .stop_conditions()
+            .adaptive_metrics
+            .is_none());
+        assert_eq!(
+            args("solve", &["--metrics-every", "7"])
+                .stop_conditions()
+                .adaptive_metrics
+                .unwrap()
+                .near_every,
+            7
+        );
         assert!(
-            !defaults.no_profiling && !defaults.adaptive_metrics && !defaults.kernel_diagnostics
+            args("solve", &["--profiling"])
+                .engine_config()
+                .unwrap()
+                .profiling
         );
         assert_eq!(defaults.parallel_grain, 1);
         let explicit = args(
@@ -793,7 +825,16 @@ mod tests {
         );
         assert!(explicit.no_profiling && explicit.adaptive_metrics);
         assert_eq!(explicit.parallel_grain, 8);
-        assert_eq!(explicit.metrics_near_every, 3);
+        assert_eq!(explicit.metrics_near_every, Some(3));
+        assert!(!explicit.engine_config().unwrap().profiling);
+        assert_eq!(
+            explicit
+                .stop_conditions()
+                .adaptive_metrics
+                .unwrap()
+                .near_every,
+            3
+        );
     }
     #[test]
     fn subgame_requires_turn_or_river_and_explicit_chip_state() {
