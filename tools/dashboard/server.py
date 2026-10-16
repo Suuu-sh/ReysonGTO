@@ -95,6 +95,72 @@ def stage_results(board_dir: Path, stage: int):
     return out
 
 
+RANKS = "23456789TJQKA"
+_board_cache: dict = {}
+
+
+def hand_class(combo: str) -> str:
+    """'AdKd' -> 'AKs', 'Kh9c' -> 'K9o', '7s7d' -> '77'."""
+    (r1, s1), (r2, s2) = (combo[0], combo[1]), (combo[2], combo[3])
+    if RANKS.index(r1) < RANKS.index(r2):
+        r1, r2 = r2, r1
+    if r1 == r2:
+        return r1 + r2
+    return r1 + r2 + ("s" if s1 == s2 else "o")
+
+
+def action_label(action) -> str:
+    if isinstance(action, str):
+        return action
+    (kind, amount), = action.items()
+    return f"{kind} {amount}"
+
+
+def board_detail(data: Path, flop: str):
+    """BTN's first flop decision (after the forced check) for each finished top-two size."""
+    out = []
+    for d in sorted((data / "runs" / flop).glob("stage2-*")):
+        result = read_json(d / "result.json")
+        if not result or result.get("status") != "complete":
+            continue
+        path = Path(result.get("solution_path") or "")
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        key = (str(path), mtime)
+        if key not in _board_cache:
+            solution = read_json(path) or {}
+            node = solution.get("after_check_strategy") or {}
+            actions = [action_label(a) for a in node.get("actions", [])]
+            classes: dict = {}
+            total = [0.0] * len(actions)
+            reach_sum = 0.0
+            for combo in node.get("combos", []):
+                w = combo.get("reach_weight") or 0.0
+                c = classes.setdefault(hand_class(combo["combo"]), {"reach": 0.0, "mix": [0.0] * len(actions)})
+                c["reach"] += w
+                reach_sum += w
+                for i, p in enumerate(combo["probabilities"]):
+                    c["mix"][i] += w * p
+                    total[i] += w * p
+            for c in classes.values():
+                c["mix"] = [m / c["reach"] if c["reach"] else 0.0 for m in c["mix"]]
+            # Keep the cache to the boards someone actually opened recently.
+            if len(_board_cache) > 64:
+                _board_cache.clear()
+            _board_cache[key] = {
+                "size": result["size"],
+                "ev_bb": result.get("btn_ev_bb"),
+                "exploit_pct": result.get("exploitability_pct"),
+                "actions": actions,
+                "overall": [t / reach_sum if reach_sum else 0.0 for t in total],
+                "classes": classes,
+            }
+        out.append(_board_cache[key])
+    return sorted(out, key=lambda r: -(r["ev_bb"] or 0))
+
+
 def collect(data: Path):
     manifest = read_json(data / "manifest.json") or {}
     selection = manifest.get("selection") or {}
@@ -174,6 +240,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/status"):
             body = json.dumps(collect(self.data)).encode()
+            ctype = "application/json"
+        elif self.path.startswith("/api/board?flop="):
+            flop = self.path.split("=", 1)[1]
+            if not (len(flop) == 6 and flop.isalnum()):
+                self.send_error(400)
+                return
+            body = json.dumps(board_detail(self.data, flop)).encode()
             ctype = "application/json"
         elif self.path in ("/", "/index.html"):
             body = (HERE / "index.html").read_bytes()
