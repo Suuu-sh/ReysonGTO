@@ -1,5 +1,5 @@
 {
-  "updated": "2026-10-16",
+  "updated": "2026-10-17",
   "goal": "6max 100BB キャッシュの全 HU ポストフロップ（SRP と 3BET ポット）を、規則で決めたサイズで解き、ReysonAI で表示する",
   "milestones": [
     {
@@ -30,10 +30,11 @@
       "status": "active",
       "tasks": [
         { "text": "フロップ 20 ボードの試行（m4a）", "status": "done" },
-        { "text": "フロップ 120 ボード：4 サイズを 5% → 上位 2 つを 0.5%（m4b, Mac）", "status": "active", "live": "m4b" },
+        { "text": "フロップ 120 ボード：4 サイズを 5% → 上位 2 つを 0.5%（m4b, Mac）", "status": "done", "live": "training" },
         { "text": "EC2 で 280 ボードに広げる仕組み（シャード・一発セットアップ）", "status": "done" },
         { "text": "120 ボードの結果から、フロップの規則の表を作る（特徴ごとに多数決）", "status": "todo" },
-        { "text": "確認用 40 ボードを解き、規則のサイズと最適なサイズの損失を測る", "status": "todo" },
+        { "text": "確認用 40 ボードを同じ方法で解く（m4b の続き）", "status": "active", "live": "validation" },
+        { "text": "規則のサイズと最適なサイズの損失を確認用ボードで測る", "status": "todo" },
         { "text": "ベットする側（IP / OOP）と、チェックのあとかどうかで規則を分ける", "status": "todo" },
         { "text": "フロップの均衡からターン開始時の到達レンジを取り出す API", "status": "todo" },
         { "text": "ターンのサイズ比較（流れ 2 × カードの種類 6 × ベットする側 2、約 4,800 状況、EC2）", "status": "todo" },

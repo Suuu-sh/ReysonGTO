@@ -99,8 +99,11 @@ def collect(data: Path):
     manifest = read_json(data / "manifest.json") or {}
     selection = manifest.get("selection") or {}
     training = selection.get("training") or []
+    # The runner solves the training boards first, then the held-out validation set.
+    items = [(item, "training") for item in training] + [
+        (item, "validation") for item in selection.get("validation") or []]
     boards, running = [], None
-    for item in training:
+    for item, role in items:
         flop = item["flop"]
         bdir = data / "runs" / flop
         s1 = stage_results(bdir, 1) if bdir.exists() else {}
@@ -119,6 +122,7 @@ def collect(data: Path):
         finished = max((r.get("finished", 0) for r in done2), default=None) if state == "done" else None
         board = {
             "flop": flop,
+            "role": role,
             "features": item.get("features", {}),
             "weight": item.get("weight"),
             "state": state,
@@ -151,7 +155,10 @@ def collect(data: Path):
         "alive": runner_alive(data),
         "total": len(boards),
         "done": len(done),
-        "validation": len(selection.get("validation") or []),
+        "training_total": len(training),
+        "training_done": sum(b["state"] == "done" for b in boards if b["role"] == "training"),
+        "validation_total": len(items) - len(training),
+        "validation_done": sum(b["state"] == "done" for b in boards if b["role"] == "validation"),
         "seconds_per_board": rate,
         "eta": (time.time() + rate * remaining) if rate and remaining else None,
         "first_finished": finished_times[0] if finished_times else None,
