@@ -71,6 +71,8 @@ h2 { font-size: 13px; font-weight: 600; margin: 0 0 14px; color: var(--muted); l
 
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
 .grid2 { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; margin-top: 20px; }
+.grid2 > * { min-width: 0; }
+@media (max-width: 600px) { .wrap { padding: 20px 16px 48px; } .panel { padding: 16px; } .big { font-size: 34px; } }
 @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
 section { margin-top: 16px; }
 
@@ -112,6 +114,7 @@ svg.spark { width: 100%; height: 64px; display: block; }
 .cell.w100 { background: var(--s100-soft); color: var(--s100); }
 .cell.w125 { background: var(--s125-soft); color: var(--s125); }
 .cell.close { opacity: .62; }
+.cell.val { border: 1px dashed var(--faint); }
 .cell.running { background: var(--accent-soft); color: var(--accent); outline: 1.5px solid var(--accent); outline-offset: -1.5px; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: -4px 0 12px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
@@ -183,11 +186,12 @@ li .live { color: var(--accent); font-weight: 600; margin-left: 6px; font-varian
   <div class="grid2">
     <div class="panel">
       <div class="runhead">
-        <h2 style="margin:0">M4 フロップのサイズ比較（120 ボード）</h2>
+        <h2 style="margin:0" id="runtitle">M4 フロップのサイズ比較</h2>
         <span class="counts" id="alive"></span>
       </div>
       <div style="margin-top:12px" class="big" id="count">–</div>
-      <div class="bar"><i id="bar" style="width:0"></i></div>
+      <div class="bar" style="margin-bottom:8px"><i id="bar" style="width:0"></i></div>
+      <div class="counts" id="split2" style="margin-bottom:16px"></div>
       <div class="kpis">
         <div class="kpi"><div class="k">残り</div><div class="v" id="left">–</div><div class="s" id="leftS"></div></div>
         <div class="kpi"><div class="k">1 ボードあたり</div><div class="v" id="pace">–</div><div class="s">直近 10 ボード</div></div>
@@ -215,12 +219,13 @@ li .live { color: var(--accent); font-weight: 600; margin-left: 6px; font-varian
       <span><i style="background:var(--s125)"></i>125% が上</span>
       <span><i style="background:var(--accent)"></i>計算中</span>
       <span><i style="background:var(--track)"></i>まだ</span>
+      <span><i style="border:1px dashed var(--faint)"></i>確認用（規則づくりに使わない）</span>
     </div>
     <div class="cells" id="cells"></div>
   </section>
 
   <section class="panel">
-    <h2>結果（完了したボード）</h2>
+    <h2>結果（完了したボード・新しい順）</h2>
     <div class="scroll tall"><table id="results"></table></div>
   </section>
 
@@ -287,7 +292,9 @@ function render(s) {
 
   // Run summary
   const pct = s.total ? (s.done / s.total) * 100 : 0;
+  $("runtitle").textContent = `M4 フロップのサイズ比較（規則用 ${s.training_total}＋確認用 ${s.validation_total} ボード）`;
   $("count").innerHTML = `${s.done}<small> / ${s.total} ボード・${pct.toFixed(0)}%</small>`;
+  $("split2").innerHTML = `規則用 <b>${s.training_done} / ${s.training_total}</b>　確認用 <b>${s.validation_done} / ${s.validation_total}</b>`;
   $("bar").style.width = pct + "%";
   $("alive").innerHTML = s.alive ? `<span class="dot on"></span>実行中` : `<span class="dot off"></span>${s.done === s.total ? "完了" : "停止中"}`;
   const left = s.total - s.done;
@@ -351,6 +358,7 @@ function render(s) {
     } else if (b.state === "running") { cls = "running"; sub = "計算中"; }
     const tip = `${b.flop}・${FEATURES.map(([k, , n]) => n[b.features[k]] || b.features[k]).join("・")}` +
       (b.state === "done" ? `・${b.winner}% が ${fmt(b.margin_bb)}BB 上` : "");
+    if (b.role === "validation") cls += " val";
     return `<div class="cell ${cls}" title="${esc(tip)}"><b>${esc(b.flop)}</b><span>${sub || "&nbsp;"}</span></div>`;
   }).join("");
 
@@ -378,7 +386,7 @@ function render(s) {
         <div><span class="t">${esc(m.title)}</span><span class="badge ${m.status}">${LABEL[m.status]}</span>
           ${tasks.length ? `<span class="counts" style="margin-left:8px">${dn} / ${tasks.length}</span>` : ""}</div>
         <div class="d">${esc(m.detail || "")}</div>
-        ${tasks.length ? `<ul class="tasks">${tasks.map((t) => `<li class="${t.status}"><span class="chk"></span><span class="tx">${esc(t.text)}${t.live === "m4b" ? `<span class="live">${s.done} / ${s.total}</span>` : ""}</span></li>`).join("")}</ul>` : ""}
+        ${tasks.length ? `<ul class="tasks">${tasks.map((t) => `<li class="${t.status}"><span class="chk"></span><span class="tx">${esc(t.text)}${t.live ? `<span class="live">${s[t.live + "_done"]} / ${s[t.live + "_total"]}</span>` : ""}</span></li>`).join("")}</ul>` : ""}
       </div></div>`;
   }).join("");
 }
