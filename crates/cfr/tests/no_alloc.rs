@@ -1,6 +1,6 @@
 //! Separate test binary avoids concurrent tests contaminating global allocation counts.
 use cards::{Card, Combo};
-use cfr::{Engine, EngineConfig, StorageMode};
+use cfr::{Engine, EngineConfig, ScratchPrecision, StorageMode};
 use ranges::Range;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -124,11 +124,19 @@ fn warm_serial_and_parallel_iterations_allocate_nothing() {
     let mut live_engines = Vec::new();
     #[cfg(target_os = "macos")]
     let mut known_workers = Vec::new();
-    for (threads, storage_mode) in [
-        (1, StorageMode::F32),
-        (2, StorageMode::F32),
-        (1, StorageMode::I16),
-        (2, StorageMode::I16),
+    for (threads, storage_mode, scratch_precision) in [
+        (1, StorageMode::F32, ScratchPrecision::F64),
+        (2, StorageMode::F32, ScratchPrecision::F64),
+        (1, StorageMode::I16, ScratchPrecision::F64),
+        (2, StorageMode::I16, ScratchPrecision::F64),
+        (1, StorageMode::F32, ScratchPrecision::F32),
+        (2, StorageMode::F32, ScratchPrecision::F32),
+        (1, StorageMode::I16, ScratchPrecision::F32),
+        (2, StorageMode::I16, ScratchPrecision::F32),
+        (1, StorageMode::F32, ScratchPrecision::F32WideTotals),
+        (2, StorageMode::F32, ScratchPrecision::F32WideTotals),
+        (1, StorageMode::I16, ScratchPrecision::F32WideTotals),
+        (2, StorageMode::I16, ScratchPrecision::F32WideTotals),
     ] {
         let board: Vec<_> = "2c 7d 9h Js"
             .split_whitespace()
@@ -158,6 +166,7 @@ fn warm_serial_and_parallel_iterations_allocate_nothing() {
             EngineConfig {
                 threads,
                 storage_mode,
+                scratch_precision,
                 ..Default::default()
             },
         )
@@ -194,7 +203,7 @@ fn warm_serial_and_parallel_iterations_allocate_nothing() {
             assert_eq!(
                 ALLOCS.load(Ordering::Relaxed),
                 0,
-                "threads={threads}, bytes={}",
+                "threads={threads}, storage={storage_mode:?}, scratch={scratch_precision:?}, bytes={}",
                 BYTES.load(Ordering::Relaxed)
             );
         });
