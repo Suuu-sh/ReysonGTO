@@ -1,6 +1,8 @@
 //! Public solving API. Input ranges remain external; chip amounts are integers.
+mod hand_ev;
 use cards::{Card, Combo};
 use cfr::{Engine, EngineConfig, Metrics};
+pub use hand_ev::{ClassValue, ComboValue, HandEvReport, PlayerHandValues};
 use ranges::Range;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

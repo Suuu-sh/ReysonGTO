@@ -155,6 +155,9 @@ struct SolveArgs {
     reach_requests: Option<PathBuf>,
     #[arg(long, requires = "reach_selector")]
     reach_out: Option<PathBuf>,
+    /// Optional exact per-combo root EV and full-runout equity JSON.
+    #[arg(long)]
+    hand_ev_out: Option<PathBuf>,
     /// Optionally deal one card before exporting the snapshot.
     #[arg(long, requires = "reach_selector")]
     reach_card: Option<Card>,
@@ -541,6 +544,9 @@ fn snapshot_bytes(
 }
 
 fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
+    if args.hand_ev_out.as_ref() == Some(&args.out) {
+        bail!("--hand-ev-out must differ from --out");
+    }
     if !subgame && args.state.is_some() {
         bail!("--state is only supported by solve-subgame");
     }
@@ -642,7 +648,7 @@ fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
         }
         Ok(())
     };
-    let solution = if let Some(snapshot) = snapshot {
+    let mut solution = if let Some(snapshot) = snapshot {
         solver::solve_subgame_with_progress(
             snapshot,
             args.engine_config()?,
@@ -683,6 +689,12 @@ fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
         write_atomic(
             &request.out,
             &snapshot_bytes(snapshot, size_rules.as_ref())?,
+        )?;
+    }
+    if let Some(path) = &args.hand_ev_out {
+        write_atomic(
+            path,
+            &serde_json::to_vec_pretty(&solution.hand_ev_report())?,
         )?;
     }
     let mut serialized_spec = solution.game_spec.clone();
@@ -1319,6 +1331,72 @@ mod tests {
             "solution.json"
         ])
         .is_err());
+    }
+    #[test]
+    fn hand_ev_cli_is_opt_in_and_keeps_legacy_output_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "reyson-hand-ev-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let range = dir.join("range.json");
+        fs::write(&range, r#"{"2c3c":1,"2d3d":1}"#).unwrap();
+        let mut reports = Vec::new();
+        for enabled in [false, true] {
+            let output = dir.join(format!("report-{enabled}.json"));
+            let hand = dir.join("hands.json");
+            let mut argv = vec![
+                "cli",
+                "solve-subgame",
+                "--board",
+                "AsKsQsJsTs",
+                "--pot",
+                "2",
+                "--stack",
+                "0",
+                "--oop-range",
+                range.to_str().unwrap(),
+                "--ip-range",
+                range.to_str().unwrap(),
+                "--threads",
+                "1",
+                "--max-iters",
+                "1",
+                "--out",
+                output.to_str().unwrap(),
+            ];
+            if enabled {
+                argv.extend(["--hand-ev-out", hand.to_str().unwrap()]);
+            }
+            let Command::SolveSubgame(a) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!()
+            };
+            assert_eq!(a.hand_ev_out.is_some(), enabled);
+            run_solve(a, true).unwrap();
+            assert_eq!(hand.exists(), enabled);
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+            assert!(report.get("players").is_none());
+            reports.push(report);
+        }
+        // Wall clocks naturally vary across separate solves; every deterministic
+        // numerical result and existing policy serialization remains bit-identical.
+        for key in [
+            "root_ev_chips",
+            "metrics",
+            "root_strategy",
+            "after_check_strategy",
+            "game_spec",
+            "iterations",
+        ] {
+            assert!(reports[0].get(key).is_some(), "missing legacy field {key}");
+            assert!(reports[1].get(key).is_some(), "missing legacy field {key}");
+            assert_eq!(reports[0][key], reports[1][key], "{key}");
+        }
     }
     #[test]
     fn river_cli_reach_export_and_snapshot_replay() {

@@ -6,6 +6,8 @@
 //! Persistent regret/average slabs are f32 or per-node scaled i16; traversal scratch
 //! is depth-local (and independent only at the first parallel chance boundary).
 mod diagnostics;
+mod hand_ev;
+pub use hand_ev::HandValue;
 #[cfg(test)]
 mod golden_tests;
 use cards::{evaluate7, Card, SuitPermutation};
@@ -2955,6 +2957,10 @@ impl Engine {
     }
     pub fn metrics(&mut self) -> Metrics {
         dispatch_engine_mut!(self, e => e.metrics())
+    }
+    /// Exact conditional root EV and full-runout showdown equity.
+    pub fn root_hand_values(&mut self) -> [Vec<HandValue>; 2] {
+        dispatch_engine_mut!(self, e => e.root_hand_values())
     }
     pub fn metrics_at_node(
         &mut self,
