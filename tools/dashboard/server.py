@@ -177,6 +177,14 @@ def time_l(stderr: Path):
     return wall, rss
 
 
+def process_running(needle: str) -> bool:
+    try:
+        out = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(needle in line for line in out.splitlines())
+
+
 def tail(path: Path, n: int = 6):
     try:
         lines = [l for l in path.read_text(errors="replace").splitlines() if l.strip()]
@@ -232,15 +240,71 @@ def p4_job(root: Path):
     if log and steps[1]["state"] == "pending":
         steps[1]["state"] = "running"
     elif steps[1]["state"] == "done" and steps[2]["state"] == "pending":
-        steps[2]["state"] = "running"
+        steps[2]["state"] = "running" if process_running("preflop solve") else "stopped"
     return {"steps": steps, "log": log[-6:], "equity_tail": tail(root / "equity.err", 3),
             "solve_tail": tail(root / "solve.err", 4)}
+
+
+def running_attempt(root: Path):
+    """Newest attempt directory without a result: the solve in progress, if any."""
+    attempts = [d for d in root.glob("**/attempt-*") if d.is_dir() and not (d / "result.json").exists()]
+    if not attempts:
+        return None
+    d = max(attempts, key=lambda p: p.stat().st_mtime)
+    last, trail = last_checkpoint(d / "progress.jsonl")
+    rel = d.relative_to(root).parts
+    info = {"path": "/".join(rel[:-1]), "started": d.stat().st_mtime}
+    if last:
+        info.update(iteration=last.get("iteration"), elapsed=last.get("elapsed_seconds"),
+                    exploit_pct=last["metrics"].get("exploitability_pct"), trail=trail)
+    return info
+
+
+def turn_job(root: Path):
+    data = root / "data"
+    log = tail(root / "log.txt", 10)
+    flops, spots, expected = [], [], 0
+    for cards in sorted((data / "cards").glob("*/result.json")):
+        record = read_json(cards) or {}
+        groups = ((record.get("cards") or {}).get("groups")) or []
+        n_cards = sum(len(g.get("cards", [])) for g in groups)
+        expected += n_cards * 2 * 2  # lines (XX, BC) x bettors (OOP lead, IP after check)
+        flop = cards.parent.name
+        flop_result = read_json(data / "flops" / flop / "result.json") or {}
+        flops.append({"flop": flop, "status": flop_result.get("status", "running"),
+                      "kinds": {g["kind"]: g.get("cards", []) for g in groups}})
+    for summary in sorted((data / "spots").glob("*/summary.json")):
+        s = read_json(summary) or {}
+        fine = {r.get("size"): r.get("bettor_ev_bb") for r in s.get("fine", [])}
+        spots.append({k: s.get(k) for k in ("flop", "line", "card", "kind", "bettor", "complete",
+                                             "observed_winner", "gap_bb", "indistinguishable_by_proxy")}
+                     | {"fine": fine,
+                        "seconds": sum(((r.get("resource") or {}).get("wall_seconds") or 0)
+                                       for r in s.get("coarse", []) + s.get("fine", []))})
+    return {"log": log[-4:], "flops": flops, "spots": spots, "expected": expected,
+            "running": running_attempt(data) if data.exists() else None,
+            "finished": any(l.startswith("done") for l in log)}
+
+
+def codex_jobs():
+    """`codex exec` processes and the worktree each is working in."""
+    try:
+        out = subprocess.run(["ps", "-eo", "etime=,args="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    jobs = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) > 3 and parts[1].endswith("codex") and "exec" in parts[2:4] and "-C" in parts:
+            jobs.append({"elapsed": parts[0], "dir": Path(parts[parts.index("-C") + 1]).name})
+    return jobs
 
 
 def collect_jobs(jobs: Path | None):
     if not jobs:
         return None
-    return {"f32cmp": f32_job(jobs / "f32cmp"), "p4": p4_job(jobs / "p4")}
+    return {"f32cmp": f32_job(jobs / "f32cmp"), "p4": p4_job(jobs / "p4"),
+            "turn": turn_job(jobs / "turnpilot"), "codex": codex_jobs()}
 
 
 def collect(data: Path):
