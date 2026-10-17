@@ -24,6 +24,8 @@ pub struct SizeContext<'a> {
     pub player: usize,
     pub first_bet: bool,
     pub after_check: bool,
+    /// Any bet/raise on the immediately preceding street; unknown at standalone roots.
+    pub previous_street_bet: Option<bool>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub enum SizeRule {
@@ -104,37 +106,42 @@ impl SizeRule {
             for player in 0..2 {
                 for first_bet in [false, true] {
                     for after_check in [false, true] {
-                        let context = SizeContext {
-                            board,
-                            street,
-                            player,
-                            first_bet,
-                            after_check,
-                        };
-                        let expected = self.fraction(&context);
-                        if !expected.is_finite() || expected <= 0.0 {
-                            return Err(format!("invalid sizing fraction in sample {sample}"));
-                        }
-                        for a in 0..4 {
-                            for b in 0..4 {
-                                for c in 0..4 {
-                                    if a == b || a == c || b == c {
-                                        continue;
-                                    }
-                                    let d = 6 - a - b - c;
-                                    let permutation = [a, b, c, d];
-                                    let mapped = board
-                                        .iter()
-                                        .map(|&card| card / 4 * 4 + permutation[card as usize % 4])
-                                        .collect::<Vec<_>>();
-                                    let actual = self.fraction(&SizeContext {
-                                        board: &mapped,
-                                        ..context.clone()
-                                    });
-                                    if actual != expected {
-                                        return Err(format!(
+                        for previous_street_bet in [None, Some(false), Some(true)] {
+                            let context = SizeContext {
+                                board,
+                                street,
+                                player,
+                                first_bet,
+                                after_check,
+                                previous_street_bet,
+                            };
+                            let expected = self.fraction(&context);
+                            if !expected.is_finite() || expected <= 0.0 {
+                                return Err(format!("invalid sizing fraction in sample {sample}"));
+                            }
+                            for a in 0..4 {
+                                for b in 0..4 {
+                                    for c in 0..4 {
+                                        if a == b || a == c || b == c {
+                                            continue;
+                                        }
+                                        let d = 6 - a - b - c;
+                                        let permutation = [a, b, c, d];
+                                        let mapped = board
+                                            .iter()
+                                            .map(|&card| {
+                                                card / 4 * 4 + permutation[card as usize % 4]
+                                            })
+                                            .collect::<Vec<_>>();
+                                        let actual = self.fraction(&SizeContext {
+                                            board: &mapped,
+                                            ..context.clone()
+                                        });
+                                        if actual != expected {
+                                            return Err(format!(
                                             "sizing rule changes under suit permutation in sample {sample} ({street:?}, player {player}, first_bet {first_bet}, after_check {after_check})"
                                         ));
+                                        }
                                     }
                                 }
                             }
@@ -148,6 +155,8 @@ impl SizeRule {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TreeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_street_bet: Option<bool>,
     pub starting_pot: i64,
     pub effective_stack: i64,
     pub oop_can_lead_flop: bool,
@@ -165,6 +174,7 @@ pub struct TreeConfig {
 impl Default for TreeConfig {
     fn default() -> Self {
         Self {
+            previous_street_bet: None,
             starting_pot: 5_500,
             effective_stack: 97_500,
             oop_can_lead_flop: false,
@@ -234,6 +244,7 @@ struct State {
     stacks: [i64; 2],
     invested: [i64; 2],
     street_paid: [i64; 2],
+    previous_street_bet: Option<bool>,
 }
 impl GameTree {
     /// Constructs an explicit arena for synthetic games.
@@ -284,11 +295,16 @@ impl GameTree {
             return Err("invalid tree configuration".into());
         }
         let state = State {
-            board,
+            board: board.clone(),
             pot: config.starting_pot,
             stacks: [config.effective_stack; 2],
             invested: [0; 2],
             street_paid: [0; 2],
+            previous_street_bet: if board.len() == 3 {
+                None
+            } else {
+                config.previous_street_bet
+            },
         };
         let mut tree = Self {
             config,
@@ -302,6 +318,42 @@ impl GameTree {
             tree.decision(state, 0, false)?
         };
         Ok(tree)
+    }
+    /// Recover preceding-street action history, including pre-deal chance nodes.
+    pub fn previous_street_bet_at(&self, target: NodeId) -> Option<bool> {
+        let previous = if self.nodes.get(self.root)?.board.len() == 3 {
+            None
+        } else {
+            self.config.previous_street_bet
+        };
+        let mut pending = vec![(self.root, previous, false)];
+        while let Some((id, previous, bet)) = pending.pop() {
+            let node = self.nodes.get(id)?;
+            let boundary = matches!(node.kind, NodeKind::Chance { .. });
+            if id == target {
+                return if boundary { Some(bet) } else { previous };
+            }
+            match &node.kind {
+                NodeKind::Decision {
+                    actions, children, ..
+                } => {
+                    for (action, &child) in actions.iter().zip(children) {
+                        pending.push((
+                            child,
+                            previous,
+                            bet || matches!(action, Action::Bet(_) | Action::Raise(_)),
+                        ));
+                    }
+                }
+                NodeKind::Chance { children, .. } => {
+                    for &child in children {
+                        pending.push((child, Some(bet), false));
+                    }
+                }
+                NodeKind::Terminal { .. } => {}
+            }
+        }
+        None
     }
     fn push(&mut self, s: &State, kind: NodeKind) -> Result<NodeId, String> {
         if self.nodes.len() >= self.max_nodes {
@@ -351,6 +403,7 @@ impl GameTree {
             }
             let mut next = s.clone();
             next.board.push(card);
+            next.previous_street_bet = Some(s.street_paid.iter().any(|&paid| paid > 0));
             next.street_paid = [0; 2];
             cards.push(card);
             children.push(if next.stacks[0] == 0 || next.stacks[1] == 0 {
@@ -407,6 +460,7 @@ impl GameTree {
                     player: p,
                     first_bet: true,
                     after_check: checked,
+                    previous_street_bet: s.previous_street_bet,
                 });
                 if !fraction.is_finite() || fraction <= 0.0 {
                     return Err("bet size must be finite and positive".into());
@@ -450,6 +504,49 @@ mod tests {
             _ => panic!("not decision"),
         }
     }
+    #[test]
+    fn previous_street_history_tracks_checks_bets_and_raises() {
+        let cfg = TreeConfig {
+            previous_street_bet: Some(true),
+            allow_raises: false,
+            bet_size: SizeRule::SuitInvariant(Arc::new(|c| {
+                if c.previous_street_bet == Some(true) {
+                    1.0
+                } else {
+                    0.5
+                }
+            })),
+            ..config()
+        };
+        let tree = GameTree::build(vec![0, 5, 10], cfg).unwrap();
+        assert_eq!(tree.previous_street_bet_at(tree.root), None);
+        let follow = |id, index| actions(&tree, id).1[index];
+        let xx = follow(follow(tree.root, 0), 0);
+        let bc = follow(follow(follow(tree.root, 0), 1), 1);
+        for (chance, history) in [(xx, false), (bc, true)] {
+            assert_eq!(tree.previous_street_bet_at(chance), Some(history));
+            let turn = match &tree.nodes[chance].kind {
+                NodeKind::Chance { children, .. } => children[0],
+                _ => panic!("chance"),
+            };
+            assert_eq!(tree.previous_street_bet_at(turn), Some(history));
+            let bet = actions(&tree, turn).0[1];
+            assert_eq!(
+                bet,
+                Action::Bet(
+                    (tree.nodes[turn].pot as f64 * if history { 1.0 } else { 0.5 }).round() as i64
+                )
+            );
+            let river_chance = follow(follow(turn, 0), 0);
+            assert_eq!(tree.previous_street_bet_at(river_chance), Some(false));
+        }
+        let tree = GameTree::build(vec![0, 5, 10, 15], config()).unwrap();
+        let bet = actions(&tree, tree.root).1[1];
+        let raise = actions(&tree, bet).1[2];
+        let call = actions(&tree, raise).1[1];
+        assert_eq!(tree.previous_street_bet_at(call), Some(true));
+    }
+
     #[test]
     fn raise_targets_street_total_and_merge_is_incremental() {
         let t = GameTree::build(vec![0, 5, 10, 15, 20], config()).unwrap();
@@ -572,6 +669,7 @@ mod tests {
                     player: 0,
                     first_bet: true,
                     after_check: false,
+                    previous_street_bet: None,
                 }),
                 fraction
             );

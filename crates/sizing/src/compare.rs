@@ -152,7 +152,8 @@ mod tests {
                     street,
                     player: 1,
                     first_bet: true,
-                    after_check: true
+                    after_check: true,
+                    previous_street_bet: None,
                 }),
                 expected
             );

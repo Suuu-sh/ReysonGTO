@@ -16,6 +16,7 @@ pub struct Rule {
     pub player: Option<usize>,
     /// The first bet of the street (not a raise). Rules only size first bets; raises use the multiplier.
     pub after_check: Option<bool>,
+    pub previous_street_bet: Option<bool>,
     pub height: Option<Height>,
     pub pairing: Option<Pairing>,
     pub suits: Option<SuitPattern>,
@@ -45,6 +46,7 @@ pub struct Situation {
     pub street: Street,
     pub player: usize,
     pub after_check: bool,
+    pub previous_street_bet: Option<bool>,
     pub height: Height,
     pub pairing: Pairing,
     pub suits: SuitPattern,
@@ -65,6 +67,7 @@ impl Situation {
             street: c.street,
             player: c.player,
             after_check: c.after_check,
+            previous_street_bet: c.previous_street_bet,
             height: flop.height,
             pairing: flop.pairing,
             suits: flop.suits,
@@ -91,6 +94,12 @@ impl Rule {
         check!(street, s.street);
         check!(player, s.player);
         check!(after_check, s.after_check);
+        if let Some(value) = self.previous_street_bet {
+            if s.previous_street_bet != Some(value) {
+                return None;
+            }
+            n += 1;
+        }
         check!(height, s.height);
         check!(pairing, s.pairing);
         check!(suits, s.suits);
@@ -191,6 +200,7 @@ mod tests {
             player: 1,
             first_bet: true,
             after_check: true,
+            previous_street_bet: None,
         }))
     }
 
@@ -206,7 +216,7 @@ mod tests {
     #[test]
     fn btn_vs_bb_flop_rule_from_m4() {
         let t: RuleTable =
-            serde_json::from_str(include_str!("../../../configs/sizing/srp-btn-vs-bb-flop.json"))
+            serde_json::from_str(include_str!("../../../configs/sizing/srp-btn-vs-bb.json"))
                 .unwrap();
         t.validate().unwrap();
         // Connected, unpaired, 8-high or lower: 66%. Everything else: 33%.
@@ -215,10 +225,90 @@ mod tests {
         assert_eq!(fraction_on(&t, "KcQdTh", Street::Flop), 0.33);
         assert_eq!(fraction_on(&t, "7c7d6h", Street::Flop), 0.33);
         assert_eq!(fraction_on(&t, "AcKd4h", Street::Flop), 0.33);
-        // Turn and river stay at the 66% the flop sizes were compared under.
+        // Unknown turn history and all river contexts retain the 66% fallback.
         assert_eq!(fraction_on(&t, "7c6d5dKs", Street::Turn), 0.66);
         assert_eq!(fraction_on(&t, "7c6d5dKs2h", Street::River), 0.66);
-        t.into_size_rule().check_suit_invariance(20261017, 64).unwrap();
+        t.into_size_rule()
+            .check_suit_invariance(20261017, 64)
+            .unwrap();
+    }
+
+    #[test]
+    fn turn_rules_cover_runouts_players_and_previous_street_histories() {
+        let table: RuleTable =
+            serde_json::from_str(include_str!("../../../configs/sizing/srp-btn-vs-bb.json"))
+                .unwrap();
+        let cases = [
+            ("Qh8d2c8s", RunoutCard::BoardPair, [0.33, 0.66, 0.66, 0.33]),
+            (
+                "Qh8h2c3h",
+                RunoutCard::FlushComplete,
+                [1.25, 0.33, 0.66, 0.66],
+            ),
+            ("Qh8d2cAs", RunoutCard::Overcard, [1.25, 0.33, 1.0, 0.33]),
+            (
+                "Qh8d2cTc",
+                RunoutCard::StraightComplete,
+                [1.0, 0.33, 0.66, 0.66],
+            ),
+            ("Qh8d2c3h", RunoutCard::FlushDraw, [0.33, 0.33, 1.25, 0.33]),
+            ("Qh8h2c3s", RunoutCard::Blank, [0.33, 0.33, 1.25, 0.33]),
+        ];
+        for (board, kind, expected) in cases {
+            let ids: Vec<u8> = board
+                .as_bytes()
+                .chunks(2)
+                .map(|c| std::str::from_utf8(c).unwrap().parse::<Card>().unwrap().0)
+                .collect();
+            for (i, (player, history)) in [(0, true), (0, false), (1, true), (1, false)]
+                .into_iter()
+                .enumerate()
+            {
+                let context = SizeContext {
+                    board: &ids,
+                    street: Street::Turn,
+                    player,
+                    first_bet: true,
+                    after_check: player == 1,
+                    previous_street_bet: Some(history),
+                };
+                let situation = Situation::from_context(&context);
+                assert_eq!(situation.runout, Some(kind), "{board}");
+                assert_eq!(
+                    table.fraction(&situation),
+                    expected[i],
+                    "{board} p{player} history={history}"
+                );
+                assert_eq!(
+                    table.fraction(&Situation {
+                        previous_street_bet: None,
+                        ..situation
+                    }),
+                    0.66
+                );
+                assert_eq!(
+                    table.fraction(&Situation {
+                        street: Street::River,
+                        ..situation
+                    }),
+                    0.66
+                );
+            }
+        }
+        for row in table
+            .rules
+            .iter()
+            .filter(|r| r.street == Some(Street::Turn))
+        {
+            assert!(row
+                .sources
+                .iter()
+                .any(|s| s == "data: M4 turn 20 flops, all sizes at 0.1%"));
+        }
+        table
+            .into_size_rule()
+            .check_suit_invariance(20261018, 64)
+            .unwrap();
     }
 
     #[test]

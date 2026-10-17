@@ -242,7 +242,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name, default in [('binary', ROOT/'target/release/cli'), ('sizing-binary', ROOT/'target/release/sizing'),
                           ('out', ROOT/'data/m4-turn'), ('report', ROOT/'docs/benchmarks/m4-turn.md'),
-                          ('flop-rule', ROOT/'configs/sizing/srp-btn-vs-bb-flop.json'),
+                          ('flop-rule', ROOT/'configs/sizing/srp-btn-vs-bb.json'),
                           ('manifest', ROOT/'data/m4b/manifest.json'), ('oop-range', ROOT/'data/ranges/bb_call.json'),
                           ('ip-range', ROOT/'data/ranges/btn_open.json')]:
         parser.add_argument('--'+name, type=Path, default=default)
