@@ -96,6 +96,7 @@ def stage_results(board_dir: Path, stage: int):
 
 
 RANKS = "23456789TJQKA"
+JOBS: Path | None = None
 _board_cache: dict = {}
 
 
@@ -159,6 +160,87 @@ def board_detail(data: Path, flop: str):
             }
         out.append(_board_cache[key])
     return sorted(out, key=lambda r: -(r["ev_bb"] or 0))
+
+
+def time_l(stderr: Path):
+    """Wall seconds and peak RSS from a macOS `/usr/bin/time -l` trailer."""
+    wall = rss = None
+    try:
+        for line in stderr.read_text(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "real":
+                wall = float(parts[0])
+            elif line.strip().endswith("maximum resident set size"):
+                rss = int(parts[0])
+    except (OSError, ValueError):
+        pass
+    return wall, rss
+
+
+def tail(path: Path, n: int = 6):
+    try:
+        lines = [l for l in path.read_text(errors="replace").splitlines() if l.strip()]
+    except OSError:
+        return []
+    return lines[-n:]
+
+
+F32_BOARDS = ("3d3c2c", "7c4d2h", "Qc6d5c")
+F32_MODES = ("f64", "f32", "wide")
+
+
+def f32_job(root: Path):
+    log = tail(root / "log.txt", 20)
+    runs = []
+    for board in F32_BOARDS:
+        for mode in F32_MODES:
+            d = root / f"{board}-{mode}"
+            run = {"board": board, "mode": mode, "state": "pending"}
+            ended = any(l.startswith(f"{board} {mode} exit=") for l in log)
+            if d.exists():
+                last, trail = last_checkpoint(d / "progress.jsonl")
+                run["state"] = "done" if ended else "running"
+                if last:
+                    run.update(iteration=last.get("iteration"), elapsed=last.get("elapsed_seconds"),
+                               exploit_pct=last["metrics"].get("exploitability_pct"), trail=trail)
+                if ended:
+                    wall, rss = time_l(d / "stderr.log")
+                    solution = read_json(d / "solution.json") or {}
+                    ev = solution.get("root_ev_chips") or [None, None]
+                    units = ((solution.get("game_spec") or {}).get("units_per_bb")) or 1000
+                    run.update(wall=wall, rss=rss, iterations=solution.get("iterations"),
+                               exploit_pct=(solution.get("metrics") or {}).get("exploitability_pct", run.get("exploit_pct")),
+                               btn_ev_bb=ev[1] / units if ev[1] is not None else None)
+                    if not solution:
+                        run["state"] = "failed"
+            runs.append(run)
+    return {"runs": runs, "log": log[-6:]}
+
+
+def p4_job(root: Path):
+    log = tail(root / "log.txt", 20)
+    def step(name, marker):
+        if any(l.startswith(marker) for l in log):
+            ok = any(l.startswith(marker) and "exit=0" in l for l in log)
+            return {"name": name, "state": "done" if ok else "failed"}
+        return {"name": name, "state": "pending"}
+    steps = [
+        {"name": "f32 の比較が終わるのを待つ", "state": "done" if log else "waiting"},
+        step("3 人のエクイティ表を作る", "equity exit="),
+        step("6 人の木を 200 反復解く", "solve exit="),
+    ]
+    if log and steps[1]["state"] == "pending":
+        steps[1]["state"] = "running"
+    elif steps[1]["state"] == "done" and steps[2]["state"] == "pending":
+        steps[2]["state"] = "running"
+    return {"steps": steps, "log": log[-6:], "equity_tail": tail(root / "equity.err", 3),
+            "solve_tail": tail(root / "solve.err", 4)}
+
+
+def collect_jobs(jobs: Path | None):
+    if not jobs:
+        return None
+    return {"f32cmp": f32_job(jobs / "f32cmp"), "p4": p4_job(jobs / "p4")}
 
 
 def collect(data: Path):
@@ -231,6 +313,7 @@ def collect(data: Path):
         "running": running,
         "boards": boards,
         "roadmap": read_json(HERE / "roadmap.json"),
+        "jobs": collect_jobs(JOBS),
     }
 
 
@@ -269,8 +352,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data", default=os.environ.get("M4_DATA", "data/m4b"))
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--jobs", help="directory holding the f32cmp/ and p4/ background job outputs")
     args = parser.parse_args()
     Handler.data = Path(args.data).resolve()
+    global JOBS
+    JOBS = Path(args.jobs).resolve() if args.jobs else None
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"http://127.0.0.1:{args.port}/  (data: {Handler.data})", flush=True)
     server.serve_forever()
