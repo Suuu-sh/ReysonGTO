@@ -244,13 +244,13 @@ pre.logt { margin: 10px 0 0; padding: 10px; background: var(--bg); border-radius
         <div class="kpi"><div class="k">残り</div><div class="v" id="left">–</div><div class="s" id="leftS"></div></div>
         <div class="kpi"><div class="k">1 ボードあたり</div><div class="v" id="pace">–</div><div class="s">直近 10 ボード</div></div>
         <div class="kpi"><div class="k">完了の見込み</div><div class="v" id="eta">–</div><div class="s" id="etaS"></div></div>
-        <div class="kpi"><div class="k">勝ったサイズ</div><div class="v" id="wins">–</div><div class="s">EV が高かった数</div></div>
+        <div class="kpi"><div class="k">勝ったサイズ</div><div class="v" id="wins">–</div><div class="s">規則用ボードで EV が高かった数</div></div>
       </div>
       <div class="now" id="now"></div>
     </div>
 
     <div class="panel">
-      <h2>どちらのサイズが勝ったか</h2>
+      <h2>どのサイズが勝ったか（規則用ボードのみ）</h2>
       <div class="split" id="split"></div>
       <p class="feat" style="margin:10px 0 14px">EV の差が 0.01BB 未満のボードは薄く表示しています。0.5% の精度では誤差と区別しにくい差です。</p>
       <div class="tabs" id="tabs"></div>
@@ -372,7 +372,9 @@ function render(s) {
   $("etaS").textContent = s.deadline ? `上限 ${clock(s.deadline)}` : "";
 
   const done = s.boards.filter((b) => b.state === "done");
-  const wins = Object.fromEntries(SIZES.map((z) => [z, done.filter((b) => b.winner === z).length]));
+  // Aggregates feed the sizing rule, so held-out validation boards stay out of them.
+  const rule = done.filter((b) => b.role === "training");
+  const wins = Object.fromEntries(SIZES.map((z) => [z, rule.filter((b) => b.winner === z).length]));
   const shown = SIZES.filter((z) => wins[z]);
   $("wins").innerHTML = shown.map((z) => `<span style="color:var(--s${z})" title="${z}%">${wins[z]}</span>`).join(" / ") || "–";
 
@@ -392,15 +394,15 @@ function render(s) {
   }
 
   // Split + by feature
-  const tot = done.length || 1;
-  $("split").innerHTML = done.length ?
+  const tot = rule.length || 1;
+  $("split").innerHTML = rule.length ?
     shown.map((z) => `<div style="width:${(wins[z] / tot) * 100}%;background:var(--s${z})" title="${z}%・${wins[z]}">${wins[z] / tot > 0.12 ? `${z}%・${wins[z]}` : ""}</div>`).join("") :
     `<div class="feat">まだ結果がありません</div>`;
   $("tabs").innerHTML = FEATURES.map(([k, l]) => `<button class="${k === feature ? "on" : ""}" data-k="${k}">${l}</button>`).join("");
   $("tabs").querySelectorAll("button").forEach((b) => (b.onclick = () => { feature = b.dataset.k; render(s); }));
   const [, , names] = FEATURES.find((f) => f[0] === feature);
   const groups = {};
-  for (const b of done) {
+  for (const b of rule) {
     const v = b.features[feature];
     (groups[v] ||= { n: 0, w: {}, m: [] });
     groups[v].n++;
@@ -436,7 +438,7 @@ function render(s) {
     rows.map((b) => {
       const [a, c] = b.stage2.filter((x) => x.status === "complete").sort((x, y) => y.ev_bb - x.ev_bb);
       const secs = (a.seconds || 0) + (c.seconds || 0);
-      return `<tr data-flop="${esc(b.flop)}"><td style="font-family:var(--mono)">${esc(b.flop)}</td>
+      return `<tr data-flop="${esc(b.flop)}"><td style="font-family:var(--mono)">${esc(b.flop)}${b.role === "validation" ? ` <span class="feat" style="font-family:inherit">確認用</span>` : ""}</td>
         <td class="feat">${FEATURES.map(([k, , n]) => n[b.features[k]] || b.features[k]).join("・")}</td>
         <td><span class="tag t${a.size}">${a.size}%</span></td><td class="num">${fmt(a.ev_bb)}</td>
         <td><span class="tag t${c.size}">${c.size}%</span></td><td class="num">${fmt(c.ev_bb)}</td>
