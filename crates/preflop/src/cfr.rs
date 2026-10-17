@@ -6,6 +6,7 @@ use crate::{
     tree::{Action, Node, PreflopTree, TerminalKind},
 };
 use cards::Combo;
+use rayon::prelude::*;
 use serde::Serialize;
 use std::time::Instant;
 
@@ -91,6 +92,7 @@ pub struct PreflopSolver {
     realization: RealizationConfig,
     equity: EquityTable,
     three_way: Option<ThreeWayEquityTable>,
+    ordered_three: Option<std::sync::Arc<Vec<f64>>>,
 }
 impl PreflopSolver {
     pub fn new(
@@ -236,6 +238,13 @@ impl PreflopSolver {
             training_seconds: 0.0,
             equity_metadata: equity.metadata.clone(),
             equity,
+            ordered_three: three_way
+                .as_ref()
+                .filter(|_| {
+                    std::env::var_os("PREFLOP_REFERENCE_TERMINALS").is_none()
+                        && std::env::var_os("PREFLOP_REFERENCE_LOOKUP").is_none()
+                })
+                .map(|t| std::sync::Arc::new(t.ordered_hero_shares())),
             three_way,
             realization,
         })
@@ -263,7 +272,7 @@ impl PreflopSolver {
             best,
             update,
             true,
-            &mut RangeCache::new(),
+            &mut RangeCache::training(self.ordered_three.clone()),
         )
     }
     fn multi_evaluate(
@@ -288,7 +297,7 @@ impl PreflopSolver {
             best,
             false,
             true,
-            &mut RangeCache::new(),
+            &mut RangeCache::with_dense(self.ordered_three.clone()),
         )
     }
     pub fn iterations(&self) -> u64 {
@@ -337,7 +346,14 @@ impl PreflopSolver {
             );
         }
         self.iterations += 1;
-        self.training_seconds += start.elapsed().as_secs_f64();
+        let seconds = start.elapsed().as_secs_f64();
+        self.training_seconds += seconds;
+        if std::env::var_os("PREFLOP_PROFILE_TERMINALS").is_some() {
+            eprintln!(
+                "training_step iteration={} seconds={seconds}",
+                self.iterations
+            );
+        }
     }
     fn strategies(&self, average: bool) -> Vec<Vec<f64>> {
         self.states
@@ -379,18 +395,30 @@ impl PreflopSolver {
         let strategy = self.strategies(true);
         let mut profile = vec![0.0; self.tree.config.players];
         let mut br = vec![0.0; self.tree.config.players];
-        for p in 0..self.tree.config.players {
-            for (best_response, target) in [(false, &mut profile[p]), (true, &mut br[p])] {
-                *target = if self.tree.config.players > 2 {
-                    self.multi_evaluate(
-                        self.tree.root,
-                        p,
-                        &strategy,
-                        &vec![vec![1.0; COMBO_COUNT]; self.tree.config.players],
-                        best_response,
-                    )
-                } else {
-                    evaluate(
+        if self.tree.config.players > 2 {
+            // Each counterfactual traversal is independent and owns bounded
+            // caches. Indexed collection preserves seat order; HU and the
+            // alternating training updates retain their original serial path.
+            let values: Vec<_> = (0..self.tree.config.players)
+                .into_par_iter()
+                .map(|p| {
+                    let reach = vec![vec![1.0; COMBO_COUNT]; self.tree.config.players];
+                    [false, true].map(|best| {
+                        self.multi_evaluate(self.tree.root, p, &strategy, &reach, best)
+                            .iter()
+                            .sum::<f64>()
+                            / COMBO_COUNT as f64
+                    })
+                })
+                .collect();
+            for (p, value) in values.into_iter().enumerate() {
+                profile[p] = value[0];
+                br[p] = value[1];
+            }
+        } else {
+            for p in 0..self.tree.config.players {
+                for (best_response, target) in [(false, &mut profile[p]), (true, &mut br[p])] {
+                    *target = evaluate(
                         &self.tree,
                         &self.classes,
                         &self.kernels,
@@ -400,10 +428,10 @@ impl PreflopSolver {
                         &vec![1.0; COMBO_COUNT],
                         best_response,
                     )
+                    .iter()
+                    .sum::<f64>()
+                        / COMBO_COUNT as f64;
                 }
-                .iter()
-                .sum::<f64>()
-                    / COMBO_COUNT as f64;
             }
         }
         let gains: Vec<_> = br
@@ -611,7 +639,202 @@ impl PreflopSolver {
         }
     }
 }
-type RangeCache = std::collections::HashMap<Vec<u64>, (Vec<f64>, Vec<f64>)>;
+type EquityIntegral = (Vec<f64>, Vec<f64>);
+type SharedIntegral = std::sync::Arc<EquityIntegral>;
+#[derive(Default)]
+struct RangeCache {
+    pairs: std::collections::HashMap<Vec<u64>, EquityIntegral>,
+    triples: std::collections::HashMap<Vec<u64>, EquityIntegral>,
+    contractions: std::collections::HashMap<Vec<u64>, SharedIntegral>,
+    contraction_fifo: std::collections::VecDeque<Vec<u64>>,
+    contraction_hits: u64,
+    contraction_seconds: f64,
+    reference: bool,
+    reference_lookup: bool,
+    reference_integral: bool,
+    dense: Option<std::sync::Arc<Vec<f64>>>,
+    profile: bool,
+    pair_calls: u64,
+    pair_hits: u64,
+    pair_seconds: f64,
+    triple_calls: u64,
+    triple_hits: u64,
+    triple_seconds: f64,
+}
+impl RangeCache {
+    fn new() -> Self {
+        Self {
+            pairs: Default::default(),
+            triples: Default::default(),
+            contractions: Default::default(),
+            contraction_fifo: Default::default(),
+            contraction_hits: 0,
+            contraction_seconds: 0.0,
+            reference: std::env::var_os("PREFLOP_REFERENCE_TERMINALS").is_some(),
+            reference_lookup: std::env::var_os("PREFLOP_REFERENCE_LOOKUP").is_some(),
+            reference_integral: std::env::var_os("PREFLOP_REFERENCE_INTEGRAL").is_some(),
+            dense: None,
+            profile: std::env::var_os("PREFLOP_PROFILE_TERMINALS").is_some(),
+            pair_calls: 0,
+            pair_hits: 0,
+            pair_seconds: 0.0,
+            triple_calls: 0,
+            triple_hits: 0,
+            triple_seconds: 0.0,
+        }
+    }
+    fn with_dense(dense: Option<std::sync::Arc<Vec<f64>>>) -> Self {
+        let mut cache = Self::new();
+        cache.dense = dense;
+        cache
+    }
+    fn training(dense: Option<std::sync::Arc<Vec<f64>>>) -> Self {
+        // Sparse learned reaches make original-order integration cheaper than
+        // building a full contraction. Keep training bit-exact; contraction
+        // is reserved for repeated EV/BR reports unless the oracle is selected.
+        let mut cache = Self::with_dense(dense);
+        cache.reference_integral = true;
+        cache
+    }
+    #[cfg(test)]
+    fn reference_mode(mut self, reference: bool) -> Self {
+        self.reference = reference;
+        self
+    }
+    fn len(&self) -> usize {
+        self.pairs.len()
+    }
+}
+impl Drop for RangeCache {
+    fn drop(&mut self) {
+        if self.profile {
+            eprintln!(
+                "terminal_contraction_profile hits={} seconds={} entries={}",
+                self.contraction_hits,
+                self.contraction_seconds,
+                self.contractions.len()
+            );
+            eprintln!(
+                "terminal_pair_profile calls={} hits={} seconds={}",
+                self.pair_calls, self.pair_hits, self.pair_seconds
+            );
+            eprintln!("terminal_profile triple_calls={} triple_hits={} triple_integral_seconds={} triple_entries={} pair_entries={} reference={}", self.triple_calls, self.triple_hits, self.triple_seconds, self.triples.len(), self.pairs.len(), self.reference);
+        }
+    }
+}
+// Contract one opponent into a 169x169 hero/other-opponent matrix. FIFO
+// keeps at most 128 matrices (~58.5 MB). Values use the same independent-class
+// game, but reassociate floating sums; reference modes retain original order.
+fn contracted_opponent(
+    dense: &[f64],
+    b: &[f64],
+    total_b: f64,
+    cache: &mut RangeCache,
+) -> std::sync::Arc<(Vec<f64>, Vec<f64>)> {
+    let key: Vec<_> = b.iter().map(|v| v.to_bits()).collect();
+    if let Some(value) = cache.contractions.get(&key) {
+        cache.contraction_hits += u64::from(cache.profile);
+        return value.clone();
+    }
+    let start = cache.profile.then(Instant::now);
+    let mut share = vec![0.0; CLASS_COUNT * CLASS_COUNT];
+    let mut legal = vec![0.0; CLASS_COUNT * CLASS_COUNT];
+    if total_b > 0.0 {
+        for hx in 0..CLASS_COUNT * CLASS_COUNT {
+            for y in 0..CLASS_COUNT {
+                if b[y] == 0.0 {
+                    continue;
+                }
+                let e = dense[hx * CLASS_COUNT + y];
+                if !e.is_nan() {
+                    let w = b[y] / total_b;
+                    share[hx] += e * w;
+                    legal[hx] += w;
+                }
+            }
+        }
+    }
+    if let Some(start) = start {
+        cache.contraction_seconds += start.elapsed().as_secs_f64();
+    }
+    let value = std::sync::Arc::new((share, legal));
+    if cache.contractions.len() == 128 {
+        let oldest = cache.contraction_fifo.pop_front().unwrap();
+        cache.contractions.remove(&oldest);
+    }
+    cache.contraction_fifo.push_back(key.clone());
+    cache.contractions.insert(key, value.clone());
+    value
+}
+// Exact raw weights in seat order form the key, without quantization or
+// normalization. A traversal owns its cache, so table identity is implicit.
+fn triple_expectation(
+    three: &ThreeWayEquityTable,
+    a: &[f64],
+    b: &[f64],
+    total_a: f64,
+    total_b: f64,
+    cache: &mut RangeCache,
+) -> (Vec<f64>, Vec<f64>) {
+    cache.triple_calls += u64::from(cache.profile);
+    let key: Vec<u64> = a.iter().chain(b).map(|x| x.to_bits()).collect();
+    if !cache.reference {
+        if let Some(result) = cache.triples.get(&key) {
+            cache.triple_hits += u64::from(cache.profile);
+            return result.clone();
+        }
+    }
+    let start = cache.profile.then(Instant::now);
+    let mut shares = vec![0.0; CLASS_COUNT];
+    let mut legal = vec![0.0; CLASS_COUNT];
+    if !cache.reference && !cache.reference_lookup && cache.dense.is_none() {
+        cache.dense = Some(std::sync::Arc::new(three.ordered_hero_shares()));
+    }
+    let dense = cache.dense.clone();
+    if let Some(dense) = dense.as_ref().filter(|_| !cache.reference_integral) {
+        let contracted = contracted_opponent(dense, b, total_b, cache);
+        if total_a > 0.0 {
+            for h in 0..CLASS_COUNT {
+                for (x, &weight) in a.iter().enumerate() {
+                    let w = weight / total_a;
+                    shares[h] += contracted.0[h * CLASS_COUNT + x] * w;
+                    legal[h] += contracted.1[h * CLASS_COUNT + x] * w;
+                }
+            }
+        }
+    } else if total_a > 0.0 && total_b > 0.0 {
+        for h in 0..CLASS_COUNT {
+            for x in 0..CLASS_COUNT {
+                if a[x] == 0.0 {
+                    continue;
+                }
+                for y in 0..CLASS_COUNT {
+                    if b[y] == 0.0 {
+                        continue;
+                    }
+                    let e = if let Some(dense) = &dense {
+                        dense[(h * CLASS_COUNT + x) * CLASS_COUNT + y]
+                    } else {
+                        three.get(h, x, y).map_or(f64::NAN, |e| e[0])
+                    };
+                    if !e.is_nan() {
+                        legal[h] += a[x] / total_a * b[y] / total_b;
+                        shares[h] += e * a[x] / total_a * b[y] / total_b;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(start) = start {
+        cache.triple_seconds += start.elapsed().as_secs_f64();
+    }
+    let result = (shares, legal);
+    // Separate bounded budget: ~89 MB including exact 338-u64 keys and values.
+    if !cache.reference && cache.triples.len() < 16384 {
+        cache.triples.insert(key, result.clone());
+    }
+    result
+}
 fn range_expectation(
     classes: &HandClasses,
     equity: &EquityTable,
@@ -619,15 +842,18 @@ fn range_expectation(
     blockers: bool,
     cache: &mut RangeCache,
 ) -> (Vec<f64>, Vec<f64>) {
+    cache.pair_calls += u64::from(cache.profile);
     let mut key: Vec<_> = classes
         .combos
         .iter()
         .map(|c| reach[c[0].id()].to_bits())
         .collect();
     key.push(blockers as u64);
-    if let Some(value) = cache.get(&key) {
+    if let Some(value) = cache.pairs.get(&key) {
+        cache.pair_hits += u64::from(cache.profile);
         return value.clone();
     }
+    let start = cache.profile.then(Instant::now);
     static COUNTS: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
     let counts = COUNTS.get_or_init(|| {
         (0..CLASS_COUNT)
@@ -656,10 +882,13 @@ fn range_expectation(
             mass[h] += weight;
         }
     }
+    if let Some(start) = start {
+        cache.pair_seconds += start.elapsed().as_secs_f64();
+    }
     let result = (expected, mass);
     // Bounded cache: at most about17MB, never scales with the public tree.
     if cache.len() < 4096 {
-        cache.insert(key, result.clone());
+        cache.pairs.insert(key, result.clone());
     }
     result
 }
@@ -890,38 +1119,25 @@ fn multi_terminal_cached(
     let opponents: Vec<_> = active.iter().copied().filter(|&p| p != player).collect();
     let mut shares = vec![0.0; CLASS_COUNT];
     let mut legal_mass = vec![1.0; CLASS_COUNT];
-    let pair_expected: Vec<_> = opponents
-        .iter()
-        .map(|&p| range_expectation(classes, equity, &reach[p], false, cache).0)
-        .collect();
-    for h in 0..CLASS_COUNT {
-        if let Some(three) = three.filter(|_| active.len() == 3) {
-            legal_mass[h] = 0.0;
-            let a = opponents[0];
-            let b = opponents[1];
-            if totals[a] > 0.0 && totals[b] > 0.0 {
-                for x in 0..CLASS_COUNT {
-                    if weights[a][x] == 0.0 {
-                        continue;
-                    }
-                    for y in 0..CLASS_COUNT {
-                        if weights[b][y] == 0.0 {
-                            continue;
-                        }
-                        if let Some(e) = three.get(h, x, y) {
-                            legal_mass[h] += weights[a][x] / totals[a] * weights[b][y] / totals[b];
-                            shares[h] +=
-                                e[0] * weights[a][x] / totals[a] * weights[b][y] / totals[b];
-                        }
-                    }
-                }
-            }
-        } else {
+    if let Some(three) = three.filter(|_| active.len() == 3) {
+        (shares, legal_mass) = triple_expectation(
+            three,
+            &weights[opponents[0]],
+            &weights[opponents[1]],
+            totals[opponents[0]],
+            totals[opponents[1]],
+            cache,
+        );
+    } else {
+        let pair_expected: Vec<_> = opponents
+            .iter()
+            .map(|&p| range_expectation(classes, equity, &reach[p], false, cache).0)
+            .collect();
+        for h in 0..CLASS_COUNT {
             shares[h] = 1.0;
             for (index, &p) in opponents.iter().enumerate() {
-                let expected = &pair_expected[index];
                 let e = if totals[p] > 0.0 {
-                    expected[h] * COMBO_COUNT as f64 / totals[p]
+                    pair_expected[index][h] * COMBO_COUNT as f64 / totals[p]
                 } else {
                     0.0
                 };
@@ -1206,6 +1422,242 @@ mod tests {
             .fold(0xcbf29ce484222325u64, |h, b| {
                 (h ^ *b as u64).wrapping_mul(0x100000001b3)
             })
+    }
+    #[test]
+    fn three_way_reference_and_cached_training_within_tolerance() {
+        let table = ThreeWayEquityTable::generate(1, 71).unwrap();
+        let make = || {
+            PreflopSolver::new_with_three_way(
+                PreflopTree::push_fold(config_three()).unwrap(),
+                synthetic_equity(),
+                RealizationConfig::default(),
+                Some(table.clone()),
+            )
+            .unwrap()
+        };
+        let mut fast = make();
+        let mut reference = make();
+        let mut max_strategy_error = 0.0_f64;
+        let mut max_value_error = 0.0_f64;
+        for _ in 0..3 {
+            fast.step();
+            for p in 0..reference.tree.config.players {
+                for (node, state) in reference.tree.nodes.iter().zip(&mut reference.states) {
+                    if let (Node::Decision { actor, .. }, Some(state)) = (node, state) {
+                        if *actor == p {
+                            discount_state(state, reference.iterations + 1);
+                        }
+                    }
+                }
+                let strategy = reference.strategies(false);
+                let mut cache = RangeCache::default().reference_mode(true);
+                multi_traverse(
+                    &reference.tree,
+                    &reference.classes,
+                    &reference.equity,
+                    reference.three_way.as_ref(),
+                    &reference.realization,
+                    &strategy,
+                    &mut reference.states,
+                    reference.tree.root,
+                    p,
+                    &vec![vec![1.0; COMBO_COUNT]; 3],
+                    false,
+                    true,
+                    true,
+                    &mut cache,
+                );
+            }
+            reference.iterations += 1;
+            for (actual, expected) in fast.states.iter().zip(&reference.states) {
+                match (actual, expected) {
+                    (Some(a), Some(b)) => {
+                        for (x, y) in a
+                            .regret
+                            .iter()
+                            .chain(&a.average)
+                            .zip(b.regret.iter().chain(&b.average))
+                        {
+                            assert_eq!(
+                                x.to_bits(),
+                                y.to_bits(),
+                                "training state must remain bit-exact"
+                            );
+                        }
+                    }
+                    (None, None) => {}
+                    _ => panic!("decision state shape changed"),
+                }
+            }
+            for average in [false, true] {
+                for (a, b) in fast
+                    .strategies(average)
+                    .iter()
+                    .flatten()
+                    .zip(reference.strategies(average).iter().flatten())
+                {
+                    max_strategy_error = max_strategy_error.max((a - b).abs());
+                    assert!((a - b).abs() < 1e-10, "strategy {a} != {b}");
+                }
+            }
+        }
+        // Compare all player EV and BR with uncached/original get, not merely
+        // a second optimized report. Reassociated sums use 1e-10 tolerance.
+        let strategy = reference.strategies(true);
+        for p in 0..3 {
+            for best in [false, true] {
+                let reach = vec![vec![1.0; COMBO_COUNT]; 3];
+                let mut cache = RangeCache::default().reference_mode(true);
+                let expected = multi_traverse(
+                    &reference.tree,
+                    &reference.classes,
+                    &reference.equity,
+                    reference.three_way.as_ref(),
+                    &reference.realization,
+                    &strategy,
+                    &mut [],
+                    reference.tree.root,
+                    p,
+                    &reach,
+                    best,
+                    false,
+                    true,
+                    &mut cache,
+                );
+                for (a, b) in fast
+                    .multi_evaluate(fast.tree.root, p, &strategy, &reach, best)
+                    .iter()
+                    .zip(expected)
+                {
+                    max_value_error = max_value_error.max((a - b).abs());
+                    assert!((a - b).abs() < 1e-10, "value {a} != {b}");
+                }
+            }
+        }
+        let reports: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| fast.report_summary())
+            })
+            .collect();
+        assert_eq!(reports[0].profile_ev_bb, reports[1].profile_ev_bb);
+        assert_eq!(
+            reports[0].best_response_ev_bb,
+            reports[1].best_response_ev_bb
+        );
+        assert_eq!(reports[0].nash_conv_bb, reports[1].nash_conv_bb);
+        eprintln!("synthetic_reference iterations=3 max_strategy_error={max_strategy_error} max_ev_br_error={max_value_error} tolerance=1e-10");
+    }
+    #[test]
+    fn three_way_cached_integral_matches_reference() {
+        let three = ThreeWayEquityTable::generate(1, 71).unwrap();
+        let classes = HandClasses::new();
+        for sparse in [false, true] {
+            let a: Vec<_> = (0..CLASS_COUNT)
+                .map(|h| {
+                    if sparse && h % 19 != 0 {
+                        0.0
+                    } else {
+                        classes.combos[h].len() as f64 * (h + 1) as f64 / 169.0
+                    }
+                })
+                .collect();
+            let b: Vec<_> = a.iter().rev().copied().collect();
+            let (ta, tb) = (a.iter().sum(), b.iter().sum());
+            let mut reference = RangeCache::default().reference_mode(true);
+            let expected = triple_expectation(&three, &a, &b, ta, tb, &mut reference);
+            let mut dense_reference = RangeCache::default().reference_mode(false);
+            dense_reference.reference_integral = true;
+            assert_eq!(
+                triple_expectation(&three, &a, &b, ta, tb, &mut dense_reference),
+                expected
+            );
+            let mut cached = RangeCache::default();
+            let actual = triple_expectation(&three, &a, &b, ta, tb, &mut cached);
+            for (a, b) in actual
+                .0
+                .iter()
+                .chain(&actual.1)
+                .zip(expected.0.iter().chain(&expected.1))
+            {
+                assert!((a - b).abs() < 1e-12, "integral {a} != {b}");
+            }
+            assert_eq!(
+                triple_expectation(&three, &a, &b, ta, tb, &mut cached),
+                actual
+            );
+            assert_eq!(cached.triples.len(), 1);
+            // A different first opponent must miss the pair cache but reuse
+            // the second-opponent contraction, with an independent oracle.
+            let mut changed = a.clone();
+            changed[0] += 0.25;
+            let changed_total = changed.iter().sum();
+            let expected =
+                triple_expectation(&three, &changed, &b, changed_total, tb, &mut reference);
+            let actual = triple_expectation(&three, &changed, &b, changed_total, tb, &mut cached);
+            for (a, b) in actual
+                .0
+                .iter()
+                .chain(&actual.1)
+                .zip(expected.0.iter().chain(&expected.1))
+            {
+                assert!((a - b).abs() < 1e-12);
+            }
+            assert_eq!(cached.triples.len(), 2);
+            assert_eq!(cached.contractions.len(), 1);
+        }
+        let aa = classes.names.iter().position(|name| name == "AA").unwrap();
+        let mut concentrated = vec![0.0; CLASS_COUNT];
+        concentrated[aa] = 1.0;
+        let zero = vec![0.0; CLASS_COUNT];
+        for (a, b) in [
+            (&zero, &concentrated),
+            (&concentrated, &zero),
+            (&concentrated, &concentrated),
+        ] {
+            let mut oracle = RangeCache::default().reference_mode(true);
+            let mut fast = RangeCache::default();
+            let expected =
+                triple_expectation(&three, a, b, a.iter().sum(), b.iter().sum(), &mut oracle);
+            let actual =
+                triple_expectation(&three, a, b, a.iter().sum(), b.iter().sum(), &mut fast);
+            assert_eq!(actual, expected);
+            assert_eq!(actual.0[aa], 0.0);
+            assert_eq!(actual.1[aa], 0.0); // impossible AA/AA/AA excludes investment too
+        }
+    }
+    #[test]
+    #[ignore = "bounded production-table profiling; external readonly inputs required"]
+    fn production_terminal_probe() {
+        let three =
+            ThreeWayEquityTable::load(std::env::var("PREFLOP_THREE_WAY_TABLE").unwrap()).unwrap();
+        let classes = HandClasses::new();
+        let a: Vec<_> = classes.combos.iter().map(|cs| cs.len() as f64).collect();
+        for reference in [true, false] {
+            let mut cache = RangeCache::default().reference_mode(reference);
+            cache.profile = true;
+            let start = Instant::now();
+            let mut last = None;
+            for _ in 0..20 {
+                last = Some(triple_expectation(
+                    &three,
+                    &a,
+                    &a,
+                    COMBO_COUNT as f64,
+                    COMBO_COUNT as f64,
+                    &mut cache,
+                ));
+            }
+            eprintln!(
+                "production_probe reference={reference} seconds={} checksum={}",
+                start.elapsed().as_secs_f64(),
+                last.unwrap().0.iter().sum::<f64>()
+            );
+        }
     }
     #[test]
     fn full_legacy_hu_40bb_bit_exact_golden() {
