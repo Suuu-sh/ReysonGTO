@@ -22,8 +22,8 @@
 1. **スートの同型との両立は実装済み**：規則の表と street 上書きは M3 の `SizeRule::SuitInvariant` を返す。
    上書き元もスートに依存しない規則を使う。M3 のサンプル検査と実木検査に失敗した場合は、規則を維持したまま同型削減を無効にする。
    EV の BB 換算は `GameSpec.units_per_bb` に従う。
-2. **ターン・リバーの比較**：フロップの均衡から、ターン（リバー）開始時の両者の到達レンジを取り出す API を solver に足し、
-   そのレンジからターン（リバー）だけを解いて比べる。
+2. **ターン・リバーの比較**：到達レンジの API とターン用の逐次 runner は実装済み（後述）。
+   提供済みフロップ規則を使う実レンジ計測と、リバー用 runner は残る。
 3. **規則の作成**：代表の状況での比較結果から、表の行を作る（同じ特徴の組み合わせで多数決、EV の差が小さいものはまとめる）。
 4. **確認**：確認用の状況で、規則のサイズと最適なサイズの EV の差（損失）を測る。目標は平均でポットの 0.1% 未満、最大 0.5% 未満。
 
@@ -43,7 +43,7 @@ target/release/sizing compare-flops --out data/m4 --report docs/benchmarks/m4-tr
 フロップ選択は既存の `select_flops(20, 0, 20261015)` のままで、
 20 枚では全 61 特徴 bucket の網羅はできない。選択アルゴリズムや製品レンジは変更しない。
 
-## ターン・リバーのサイズの比べ方（M4 の後半、計画）
+## ターン・リバーのサイズの比べ方（M4 の後半）
 
 フロップの規則が決まったあとに行う。M3 の「途中から解く」機能（ストリート開始時の到達レンジの取り出し、`solve-subgame`）を使う。
 
@@ -58,3 +58,66 @@ target/release/sizing compare-flops --out data/m4 --report docs/benchmarks/m4-tr
 4. **リバー**：ターンの代表の状況から、同じ考え方でリバーのカードの種類ごとに比べる（リバーだけの木は小さく速い）。
 5. **規則**：特徴（フロップの特徴 ＋ カードの種類 ＋ 流れ ＋ ベットする側）ごとに、選ばれたサイズを多数決でまとめ、規則の表の行にする。
 6. **量の目安**：代表 200 フロップ × 2 つの流れ × 6 種類 × 2 つのベットする側 ＝ 約 4,800 の状況（ターン）。1 状況あたり候補 4 つの粗い解（数十秒）＋ 上位 2 つの細かい解（数分）。EC2 で並べて回す前提。
+
+### ターンカードと複数の到達レンジの取り出し
+
+```sh
+target/release/sizing turn-cards --flop 7c6d5d
+target/release/sizing turn-cards --flop 7c6d5d --per-kind 2 --seed 20261015
+```
+
+JSON は `flop`、`features`、`seed`、`per_kind`、`groups` を持つ。
+`groups` は `{kind, cards}` の配列で、上記の優先順に 6 種類を出し、該当しない種類は空配列になる。
+通常は残り 49 枚を重複なく列挙する。`--per-kind N` の指定時だけ、
+フロップ全体（順序なし）を保つスート置換による同型をまとめ、種類ごとに最大 N 枚を選ぶ。
+シードが同じなら再現できる。これはボードの同型であり、任意の非対称な入力レンジの同型を保証するものではない。
+
+`cli solve` / `cli solve-subgame` は `--size-rules PATH` で `RuleTable` JSON を読み込める。
+`fraction` はポットの割合（例：`0.66`）で、CLI の `--bet 66` の単位とは異なる。
+`--size-rules` と `--bet` / `--bet-flop` / `--bet-turn` / `--bet-river` は同時指定できない。
+使用した規則の全体は report の `game_spec.size_rules` に残る。
+コールバック自体は JSON 化できないため、report の `game_spec.tree.bet_size` と snapshot の
+`tree_config.bet_size` は `Fixed(default_fraction)` の保存用代替値になる。
+規則の正本は report の `game_spec.size_rules` / snapshot のトップレベル `size_rules` で、
+CLI は snapshot から再開するときにこの表を復元する。代替値だけを実際の規則と解釈しない。
+
+フロップのアクション列は `X`（チェック）、`B`（ベット）、`C`（コール）などで指定する。
+`--reach-line 'X,X' --reach-out PATH` または `--reach-line 'X,B,C' --reach-out PATH` で取り出し、
+必要なら `--reach-card 2c` を加える。一度の solve から複数取り出すときは、
+次の配列を JSON ファイルに保存して `--reach-requests PATH` で渡す（`card` は省略可能）。
+
+```json
+[
+  {"line": "X,X", "card": "2c", "out": "/tmp/turn-xx-2c.json"},
+  {"line": "X,B,C", "card": "2c", "out": "/tmp/turn-bc-2c.json"}
+]
+```
+
+### ターンの逐次比較 runner
+
+```sh
+python3 tools/m4_turn.py \
+  --flop-rule /path/to/supplied-flop-rules.json \
+  --flops 20 --per-kind 1 --lines XX,BC --threads 4 \
+  --coarse-target 5 --fine-target 0.5 --flop-target 1 \
+  --out data/m4-turn --report docs/benchmarks/m4-turn.md
+```
+
+`--flops N` は `--manifest`（既定 `data/m4b/manifest.json`）の training から先頭 N 枚を使う。
+`--flops 7c6d5d,As7d2c` のように明示することもできる。既定のフロップ規則のパスは
+`configs/sizing/srp-btn-vs-bb-flop.json` だが、未提供なら停止する。
+過去の比較結果から規則を捏造したり、都合のよい固定サイズに置き換えたりしない。
+`--oop-range` / `--ip-range` で外部レンジを指定でき、製品レンジはコミットしない。
+
+各フロップは提供された規則で一度だけ解く（後続ストリートは 66%）。
+その解から XX と BC（OOP チェック、IP ベット、OOP コール）の到達レンジをまとめて取り出し、
+カード・流れごとに OOP の先打ちと OOP チェック後の IP ベットを別々に比べる。
+比較対象側のターンの当該判断だけを 33 / 66 / 100 / 125% に変え、他の判断とリバーは 66% に固定する。
+4 候補の粗い解がすべて目標精度に達した場合だけ、ベット側の EV が高い上位 2 候補を細かく解く。
+両者が細かい目標に達した場合だけ勝者を採用し、時間切れや目標未達を成功扱いしない。
+
+計算は逐次で、`--max-hours`（既定 8 時間）が全体の予算、`--max-iters` が各 solve の上限になる。
+再実行は同じ `--out` から再開できるが、規則・レンジ・選択・設定・実行バイナリ・ソースの由来が
+一致しない場合は停止する。成功した成果物もハッシュを照合し、失敗・中断の attempt とログは残す。
+再開で元の予算期限を延長しない。終了時には JSON の進捗集計と Markdown report を出す。
+この runner の実装完了は、本番レンジでの比較完了や規則確定を意味しない。

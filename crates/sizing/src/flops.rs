@@ -20,7 +20,7 @@ impl CanonicalFlop {
     }
 }
 
-const PERMUTATIONS: [[u8; 4]; 24] = {
+pub(crate) const PERMUTATIONS: [[u8; 4]; 24] = {
     let mut out = [[0u8; 4]; 24];
     let mut n = 0;
     let mut a = 0;
@@ -79,7 +79,7 @@ pub fn canonical_flops() -> Vec<CanonicalFlop> {
 }
 
 /// Deterministic pseudo-random order (splitmix64) so selections are reproducible.
-fn mix(mut x: u64) -> u64 {
+pub(crate) fn mix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

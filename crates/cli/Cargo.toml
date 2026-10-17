@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sizing = { path = "../sizing" }
 cards.workspace = true
 ranges.workspace = true
 tree.workspace = true
