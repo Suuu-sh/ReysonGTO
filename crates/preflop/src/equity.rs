@@ -281,8 +281,22 @@ impl ThreeWayEquityTable {
         Some(result)
     }
     fn compute_hash(&self) -> Result<String, String> {
-        let bytes = serde_json::to_vec(&(&self.metadata, &self.classes, &self.values))
+        // Hash the values' bit patterns, not their JSON text: serde_json's default
+        // float parser is not guaranteed to round-trip every f64 bit-exactly, so a
+        // text hash computed before saving could mismatch after loading.
+        let mut bytes = serde_json::to_vec(&(&self.metadata, &self.classes))
             .map_err(|e| e.to_string())?;
+        for value in &self.values {
+            match value {
+                None => bytes.push(0),
+                Some(e) => {
+                    bytes.push(1);
+                    for v in e {
+                        bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                }
+            }
+        }
         let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
         });
