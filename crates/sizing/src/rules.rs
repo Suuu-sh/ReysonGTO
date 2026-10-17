@@ -176,12 +176,16 @@ mod tests {
     }
 
     fn ctx(board: &str, street: Street) -> f64 {
+        fraction_on(&table(), board, street)
+    }
+
+    fn fraction_on(table: &RuleTable, board: &str, street: Street) -> f64 {
         let ids: Vec<u8> = board
             .as_bytes()
             .chunks(2)
             .map(|c| std::str::from_utf8(c).unwrap().parse::<Card>().unwrap().0)
             .collect();
-        table().fraction(&Situation::from_context(&SizeContext {
+        table.fraction(&Situation::from_context(&SizeContext {
             board: &ids,
             street,
             player: 1,
@@ -197,6 +201,21 @@ mod tests {
         assert_eq!(ctx("Kd8c3s", Street::Flop), 0.66);
         assert_eq!(ctx("Kh9h4c2s3h", Street::River), 1.25);
         assert_eq!(ctx("Kh9h4c2s", Street::Turn), 0.66); // default
+    }
+
+    #[test]
+    fn btn_vs_bb_flop_rule_from_m4() {
+        let t: RuleTable =
+            serde_json::from_str(include_str!("../../../configs/sizing/srp-btn-vs-bb-flop.json"))
+                .unwrap();
+        t.validate().unwrap();
+        // Connected, unpaired, 8-high or lower: 66%. Everything else: 33%.
+        assert_eq!(fraction_on(&t, "7c6d5d", Street::Flop), 0.66);
+        assert_eq!(fraction_on(&t, "8c5d4h", Street::Flop), 0.66);
+        assert_eq!(fraction_on(&t, "KcQdTh", Street::Flop), 0.33);
+        assert_eq!(fraction_on(&t, "7c7d6h", Street::Flop), 0.33);
+        assert_eq!(fraction_on(&t, "AcKd4h", Street::Flop), 0.33);
+        t.into_size_rule().check_suit_invariance(20261017, 64).unwrap();
     }
 
     #[test]
