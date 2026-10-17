@@ -281,12 +281,28 @@ impl ThreeWayEquityTable {
         Some(result)
     }
     fn compute_hash(&self) -> Result<String, String> {
+        // Hash the values' bit patterns, not their JSON text: serde_json's default
+        // float parser is not guaranteed to round-trip every f64 bit-exactly, so a
+        // text hash computed before saving could mismatch after loading.
+        let mut bytes =
+            serde_json::to_vec(&(&self.metadata, &self.classes)).map_err(|e| e.to_string())?;
+        for value in &self.values {
+            match value {
+                None => bytes.push(0),
+                Some(e) => {
+                    bytes.push(1);
+                    for v in e {
+                        bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                }
+            }
+        }
+        Ok(fnv1a64(&bytes))
+    }
+    fn legacy_json_hash(&self) -> Result<String, String> {
         let bytes = serde_json::to_vec(&(&self.metadata, &self.classes, &self.values))
             .map_err(|e| e.to_string())?;
-        let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-            (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
-        });
-        Ok(format!("fnv1a64:{hash:016x}"))
+        Ok(fnv1a64(&bytes))
     }
     pub fn validate(&self) -> Result<(), String> {
         let m = &self.metadata;
@@ -335,7 +351,11 @@ impl ThreeWayEquityTable {
                 }
             }
         }
-        if self.content_hash != self.compute_hash()? {
+        // Tables saved before the bit-pattern hash carry a hash of their JSON text;
+        // with float_roundtrip they reload bit-exactly, so that hash still verifies.
+        if self.content_hash != self.compute_hash()?
+            && self.content_hash != self.legacy_json_hash()?
+        {
             return Err("three-way content hash mismatch".into());
         }
         Ok(())
@@ -355,6 +375,12 @@ impl ThreeWayEquityTable {
         table.validate()?;
         Ok(table)
     }
+}
+fn fnv1a64(bytes: &[u8]) -> String {
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
+    });
+    format!("fnv1a64:{hash:016x}")
 }
 fn triple_index(a: usize, b: usize, c: usize) -> usize {
     // Subtract all triples whose first class is at least a, then skip the
@@ -787,6 +813,11 @@ mod tests {
         table.save(&path).unwrap();
         let loaded = ThreeWayEquityTable::load(&path).unwrap();
         assert_eq!(loaded.values, table.values);
+        // A table saved with the earlier JSON-text hash still validates.
+        let mut legacy = table.clone();
+        legacy.content_hash = legacy.legacy_json_hash().unwrap();
+        assert_ne!(legacy.content_hash, table.content_hash);
+        legacy.validate().unwrap();
         // Preserve valid probability sums: checksum still detects altered data.
         let mut bad = table.clone();
         let i = triple_index(a, b, c);
