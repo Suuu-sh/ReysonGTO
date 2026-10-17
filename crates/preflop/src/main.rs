@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use preflop::{
     cfr::{PreflopSolver, RealizationConfig},
     config::PreflopConfig,
-    equity::{class_index, EquityTable},
+    equity::{class_index, EquityTable, ThreeWayEquityTable},
     tree::PreflopTree,
 };
 use serde_json::{json, Value};
@@ -17,7 +17,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     name = "preflop",
-    about = "Clean-room M5 preflop tree, equity and heads-up DCFR"
+    about = "Clean-room preflop tree, equity and multiway DCFR"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -46,13 +46,35 @@ enum Command {
         #[arg(long, default_value = "data/equity/hu169.json")]
         out: PathBuf,
     },
+    /// Sample every unordered three-class matchup with independent deterministic seeds.
+    #[command(name = "equity-build-3way")]
+    EquityBuild3way {
+        #[arg(long)]
+        samples: u64,
+        #[arg(long)]
+        seed: u64,
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Validate a saved table and print three familiar matchup diagnostics.
     EquityCheck {
         #[arg(long)]
         table: PathBuf,
     },
-    /// Solve only BTN versus BB, using a saved table and explicit realization table.
+    /// Solve the configured seats using saved equity and explicit realization.
     Solve {
+        #[arg(long)]
+        heads_up: bool,
+        #[arg(long)]
+        equity_3way: Option<PathBuf>,
+        /// Omit per-node class arrays to keep large-tree smoke reports bounded.
+        #[arg(long)]
+        summary_only: bool,
+        /// Use the frozen M5 betting tree for historical two-player regression.
+        #[arg(long)]
+        legacy_hu: bool,
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -67,7 +89,7 @@ enum Command {
         max_seconds: f64,
         #[arg(long, default_value_t = 50)]
         metrics_every: u64,
-        /// Stop when SUM of both unilateral BR gains is below this many BB.
+        /// Stop when SUM of all unilateral BR gains is below this many BB.
         #[arg(long, default_value_t = 0.001)]
         target_bb: f64,
         #[arg(long)]
@@ -174,6 +196,31 @@ fn main() -> Result<()> {
                 }))?
             );
         }
+        Command::EquityBuild3way {
+            samples,
+            seed,
+            threads,
+            out,
+        } => {
+            if threads == 0 {
+                bail!("threads must be positive");
+            }
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()?;
+            let started = Instant::now();
+            let table = pool
+                .install(|| ThreeWayEquityTable::generate(samples, seed))
+                .map_err(anyhow::Error::msg)?;
+            table.save(&out).map_err(anyhow::Error::msg)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "out": out, "wall_seconds": started.elapsed().as_secs_f64(),
+                    "threads": threads, "metadata": table.metadata,
+                }))?
+            );
+        }
         Command::EquityCheck { table } => {
             let table = EquityTable::load(table).map_err(anyhow::Error::msg)?;
             let known = [("AA", "KK"), ("AKs", "22"), ("AKo", "QQ")].map(|(a,b)| {
@@ -185,6 +232,10 @@ fn main() -> Result<()> {
             );
         }
         Command::Solve {
+            heads_up,
+            equity_3way,
+            summary_only,
+            legacy_hu,
             config,
             equity,
             realization,
@@ -197,22 +248,42 @@ fn main() -> Result<()> {
         } => {
             validate_solve_limits(max_iters, max_seconds, metrics_every, target_bb)?;
             let started = Instant::now();
-            let tree = build_tree(read_config(&config, true)?, push_fold)?;
+            let config = read_config(&config, heads_up)?;
+            if legacy_hu && (config.players != 2 || push_fold) {
+                bail!("--legacy-hu requires two seats and cannot be combined with --push-fold");
+            }
+            let tree = if legacy_hu {
+                PreflopTree::build_legacy(config).map_err(anyhow::Error::msg)?
+            } else {
+                build_tree(config, push_fold)?
+            };
             let stats = serde_json::to_value(tree.stats())?;
             let table = EquityTable::load(equity).map_err(anyhow::Error::msg)?;
             let realization =
                 RealizationConfig::from_path(realization).map_err(anyhow::Error::msg)?;
-            let mut solver =
-                PreflopSolver::new(tree, table, realization).map_err(anyhow::Error::msg)?;
+            let three_way = equity_3way
+                .map(ThreeWayEquityTable::load)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            let mut solver = PreflopSolver::new_with_three_way(tree, table, realization, three_way)
+                .map_err(anyhow::Error::msg)?;
             let mut checkpoints = Vec::new();
-            let initial = serde_json::to_value(solver.report())?;
+            let initial = serde_json::to_value(if summary_only {
+                solver.report_summary()
+            } else {
+                solver.report()
+            })?;
             eprintln!("{}", compact_report(&initial));
             checkpoints.push(compact_report(&initial));
             for iteration in 1..=max_iters {
                 solver.step();
                 let timed_out = started.elapsed().as_secs_f64() >= max_seconds;
                 if iteration % metrics_every == 0 || iteration == max_iters || timed_out {
-                    let mut report = serde_json::to_value(solver.report())?;
+                    let mut report = serde_json::to_value(if summary_only {
+                        solver.report_summary()
+                    } else {
+                        solver.report()
+                    })?;
                     let gap = report["nash_conv_bb"]
                         .as_f64()
                         .ok_or_else(|| anyhow!("missing NashConv"))?;
@@ -230,6 +301,13 @@ fn main() -> Result<()> {
                     };
                     report["checkpoints"] = json!(checkpoints);
                     report["tree_stats"] = stats.clone();
+                    report["betting_tree"] = json!(if legacy_hu {
+                        "m5_legacy_hu"
+                    } else if push_fold {
+                        "push_fold"
+                    } else {
+                        "p4"
+                    });
                     report["wall_seconds"] = json!(started.elapsed().as_secs_f64());
                     report["stop_reason"] = json!(stop_reason);
                     report["target_nash_conv_bb"] = json!(target_bb);
@@ -353,6 +431,7 @@ mod cli_tests {
                 metrics_every,
                 target_bb,
                 out,
+                ..
             } => {
                 assert_eq!(config, PathBuf::from("external.json"));
                 assert_eq!(equity, PathBuf::from("hu169.json"));
@@ -380,6 +459,53 @@ mod cli_tests {
         ] {
             assert!(validate_solve_limits(limits.0, limits.1, limits.2, limits.3).is_err());
         }
+    }
+
+    #[test]
+    fn three_way_build_and_multiway_solve_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "preflop",
+            "equity-build-3way",
+            "--samples",
+            "2",
+            "--seed",
+            "7",
+            "--out",
+            "three.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::EquityBuild3way {
+                samples: 2,
+                seed: 7,
+                threads: 4,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "preflop",
+            "solve",
+            "--config",
+            "six.json",
+            "--equity",
+            "hu.json",
+            "--equity-3way",
+            "three.json",
+            "--realization",
+            "realization.json",
+            "--out",
+            "report.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Solve {
+                heads_up: false,
+                equity_3way: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
