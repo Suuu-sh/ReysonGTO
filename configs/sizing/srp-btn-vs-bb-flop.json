@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "candidates": [0.33, 0.66, 1.0, 1.25],
+  "default_fraction": 0.66,
+  "rules": [
+    {
+      "street": "Flop",
+      "player": 1,
+      "after_check": true,
+      "height": "Low",
+      "pairing": "Unpaired",
+      "connectivity": "Connected",
+      "fraction": 0.66,
+      "sources": ["data/m4b training: 7c4d3h", "7c6d5d", "7c6d3c"]
+    },
+    {
+      "street": "Flop",
+      "player": 1,
+      "after_check": true,
+      "height": "TenEight",
+      "pairing": "Unpaired",
+      "connectivity": "Connected",
+      "fraction": 0.66,
+      "sources": ["data/m4b training: 8c6d4c", "8c5d4h"]
+    },
+    {
+      "street": "Flop",
+      "player": 1,
+      "after_check": true,
+      "fraction": 0.33,
+      "sources": ["data/m4b training: 65 of 120 boards best at 33%"]
+    }
+  ]
+}

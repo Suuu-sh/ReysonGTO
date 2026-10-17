@@ -70,6 +70,7 @@ enum Preset {
     Benchmark,
 }
 #[derive(Args)]
+#[group(id = "solve_args", multiple = true)]
 struct SolveArgs {
     /// Three cards for solve; four or five for solve-subgame.
     #[arg(long, required_unless_present = "state", conflicts_with = "state")]
@@ -94,6 +95,9 @@ struct SolveArgs {
     /// Percentage of the pot, e.g. 50 for a half-pot bet.
     #[arg(long)]
     bet: Option<f64>,
+    /// JSON RuleTable; mutually exclusive with explicit bet percentages.
+    #[arg(long, conflicts_with_all = ["bet", "bet_flop", "bet_turn", "bet_river"])]
+    size_rules: Option<PathBuf>,
     #[arg(long)]
     bet_flop: Option<f64>,
     #[arg(long)]
@@ -136,12 +140,26 @@ struct SolveArgs {
     #[arg(long)]
     progress_jsonl: Option<PathBuf>,
     /// Export average-policy own-reach ranges and exact node chip state.
-    #[arg(long, requires = "reach_out")]
+    #[arg(
+        long,
+        requires = "reach_out",
+        conflicts_with = "reach_line",
+        group = "reach_selector"
+    )]
     reach_node: Option<usize>,
-    #[arg(long, requires = "reach_node")]
+    /// Root action path, e.g. X,X or X,B,C.
+    #[arg(long, requires = "reach_out", group = "reach_selector")]
+    reach_line: Option<String>,
+    /// JSON array of {line, card?, out} exports from this one solve.
+    #[arg(long)]
+    reach_requests: Option<PathBuf>,
+    #[arg(long, requires = "reach_selector")]
     reach_out: Option<PathBuf>,
+    /// Optional exact per-combo root EV and full-runout equity JSON.
+    #[arg(long)]
+    hand_ev_out: Option<PathBuf>,
     /// Optionally deal one card before exporting the snapshot.
-    #[arg(long, requires = "reach_node")]
+    #[arg(long, requires = "reach_selector")]
     reach_card: Option<Card>,
     #[arg(long, value_enum)]
     storage: Option<Storage>,
@@ -354,7 +372,24 @@ impl SolveArgs {
                     .unwrap_or_else(|| fraction(tree::Street::River)),
             };
         }
+        if let Some(table) = self.load_size_rules()? {
+            config.bet_size = table.into_size_rule();
+        }
         Ok(config)
+    }
+    fn load_size_rules(&self) -> Result<Option<sizing::rules::RuleTable>> {
+        self.size_rules
+            .as_ref()
+            .map(|path| {
+                let table: sizing::rules::RuleTable = serde_json::from_slice(
+                    &fs::read(path)
+                        .with_context(|| format!("cannot read size rules {}", path.display()))?,
+                )
+                .with_context(|| format!("invalid size rules {}", path.display()))?;
+                table.validate().map_err(|e| anyhow!(e))?;
+                Ok(table)
+            })
+            .transpose()
     }
     fn engine_config(&self) -> Result<EngineConfig> {
         let benchmark = self.preset == Some(Preset::Benchmark);
@@ -441,12 +476,114 @@ fn bet_fraction(percentage: f64) -> Result<f64> {
     }
     Ok(percentage / 100.0)
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReachRequest {
+    line: String,
+    card: Option<String>,
+    out: PathBuf,
+}
+
+fn resolve_reach_line(tree: &tree::GameTree, line: &str) -> Result<usize> {
+    let tokens: Vec<_> = line
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        bail!("reach line must contain actions");
+    }
+    let mut node = tree.root;
+    for token in tokens {
+        if !matches!(token, "X" | "B" | "C" | "F" | "R") {
+            bail!("unknown reach action {token}; use X, B, C, F, R");
+        }
+        let tree::NodeKind::Decision {
+            actions, children, ..
+        } = &tree.nodes[node].kind
+        else {
+            bail!("reach line crosses a chance or terminal node at {node}");
+        };
+        let matches: Vec<_> = actions
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                matches!(
+                    (token, a),
+                    ("X", tree::Action::Check)
+                        | ("B", tree::Action::Bet(_))
+                        | ("C", tree::Action::Call)
+                        | ("F", tree::Action::Fold)
+                        | ("R", tree::Action::Raise(_))
+                )
+            })
+            .collect();
+        if matches.len() != 1 {
+            bail!(
+                "reach action {token} at node {node} has {} matches; exactly one required",
+                matches.len()
+            );
+        }
+        node = children[matches[0].0];
+    }
+    Ok(node)
+}
+
+fn snapshot_bytes(
+    mut snapshot: solver::ReachSnapshot,
+    rules: Option<&sizing::rules::RuleTable>,
+) -> Result<Vec<u8>> {
+    if let Some(table) = rules {
+        // Closures are intentionally not serializable; full table is the authoritative rule.
+        snapshot.tree_config.bet_size = SizeRule::Fixed(table.default_fraction);
+        let mut value = serde_json::to_value(snapshot)?;
+        value["size_rules"] = serde_json::to_value(table)?;
+        Ok(serde_json::to_vec_pretty(&value)?)
+    } else {
+        Ok(serde_json::to_vec_pretty(&snapshot)?)
+    }
+}
+
 fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
+    if args.hand_ev_out.as_ref() == Some(&args.out) {
+        bail!("--hand-ev-out must differ from --out");
+    }
     if !subgame && args.state.is_some() {
         bail!("--state is only supported by solve-subgame");
     }
+    let size_rules = args.load_size_rules()?.or(if let Some(path) = &args.state {
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        value
+            .get("size_rules")
+            .map(|v| serde_json::from_value::<sizing::rules::RuleTable>(v.clone()))
+            .transpose()?
+    } else {
+        None
+    });
+    if args.size_rules.is_none()
+        && size_rules.is_some()
+        && (args.bet.is_some()
+            || args.bet_flop.is_some()
+            || args.bet_turn.is_some()
+            || args.bet_river.is_some())
+    {
+        bail!("snapshot contains size rules; explicit bet overrides require a replacement --size-rules table");
+    }
+    // An explicit preset chooses its own sizing; silently restoring the snapshot's
+    // rules on top of it would run a hybrid of the two.
+    if args.size_rules.is_none() && size_rules.is_some() && args.preset.is_some() {
+        bail!("snapshot contains size rules; with an explicit --preset pass --size-rules to choose the sizing");
+    }
+    if let Some(table) = &size_rules {
+        table.validate().map_err(|e| anyhow!(e))?;
+    }
+    let requests: Vec<ReachRequest> = args
+        .reach_requests
+        .as_ref()
+        .map(|p| -> Result<_> { Ok(serde_json::from_slice(&fs::read(p)?)?) })
+        .transpose()?
+        .unwrap_or_default();
     // Validate all input/config before creating progress output.
-    let direct = if args.state.is_none() {
+    let mut direct = if args.state.is_none() {
         Some((
             args.game_spec(subgame)?,
             [
@@ -465,7 +602,7 @@ fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
     } else {
         None
     };
-    let snapshot = args
+    let mut snapshot = args
         .state
         .as_ref()
         .map(|path| -> Result<solver::ReachSnapshot> {
@@ -481,6 +618,15 @@ fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
             Ok(snapshot)
         })
         .transpose()?;
+    // Use the same loaded table for the executed tree and provenance.
+    if let Some(table) = &size_rules {
+        if let Some((spec, _)) = &mut direct {
+            spec.tree.bet_size = table.clone().into_size_rule();
+        }
+        if let Some(snapshot) = &mut snapshot {
+            snapshot.tree_config.bet_size = table.clone().into_size_rule();
+        }
+    }
     let mut progress_file = args
         .progress_jsonl
         .as_ref()
@@ -502,7 +648,7 @@ fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
         }
         Ok(())
     };
-    let solution = if let Some(snapshot) = snapshot {
+    let mut solution = if let Some(snapshot) = snapshot {
         solver::solve_subgame_with_progress(
             snapshot,
             args.engine_config()?,
@@ -514,7 +660,13 @@ fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
         solve_with_progress(spec, ranges, args.stop_conditions(), progress)
     }
     .map_err(|e| anyhow!(e))?;
-    if let Some(node) = args.reach_node {
+    let selected_node = args
+        .reach_line
+        .as_deref()
+        .map(|line| resolve_reach_line(solution.tree(), line))
+        .transpose()?
+        .or(args.reach_node);
+    if let Some(node) = selected_node {
         let mut snapshot = solution.reach_snapshot(node).map_err(|e| anyhow!(e))?;
         if let Some(card) = args.reach_card {
             snapshot = snapshot.with_card(card).map_err(|e| anyhow!(e))?;
@@ -523,11 +675,41 @@ fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
             args.reach_out
                 .as_deref()
                 .ok_or_else(|| anyhow!("--reach-out is required"))?,
-            &serde_json::to_vec_pretty(&snapshot)?,
+            &snapshot_bytes(snapshot, size_rules.as_ref())?,
         )?;
     }
-    let report = solution.report();
-    write_atomic(&args.out, &serde_json::to_vec_pretty(&report)?)?;
+    for request in requests {
+        let node = resolve_reach_line(solution.tree(), &request.line)?;
+        let mut snapshot = solution.reach_snapshot(node).map_err(|e| anyhow!(e))?;
+        if let Some(card) = request.card {
+            snapshot = snapshot
+                .with_card(card.parse().map_err(|e: String| anyhow!(e))?)
+                .map_err(|e| anyhow!(e))?;
+        }
+        write_atomic(
+            &request.out,
+            &snapshot_bytes(snapshot, size_rules.as_ref())?,
+        )?;
+    }
+    if let Some(path) = &args.hand_ev_out {
+        write_atomic(
+            path,
+            &serde_json::to_vec_pretty(&solution.hand_ev_report())?,
+        )?;
+    }
+    let mut serialized_spec = solution.game_spec.clone();
+    if let Some(table) = &size_rules {
+        serialized_spec.tree.bet_size = SizeRule::Fixed(table.default_fraction);
+    }
+    let mut report = solution.report();
+    report.game_spec = &serialized_spec;
+    if let Some(table) = size_rules {
+        let mut value = serde_json::to_value(&report)?;
+        value["game_spec"]["size_rules"] = serde_json::to_value(table)?;
+        write_atomic(&args.out, &serde_json::to_vec_pretty(&value)?)?;
+    } else {
+        write_atomic(&args.out, &serde_json::to_vec_pretty(&report)?)?;
+    }
     eprintln!(
         "iterations={} exploitability={:.6}% memory={} bytes stop={} output={}",
         report.iterations,
@@ -695,6 +877,173 @@ mod tests {
                 after_check: false,
             })
         })
+    }
+    #[test]
+    fn size_rules_conflict_with_every_bet_override() {
+        for command in ["solve", "solve-subgame"] {
+            for bet in ["--bet", "--bet-flop", "--bet-turn", "--bet-river"] {
+                let result = Cli::try_parse_from([
+                    "cli",
+                    command,
+                    "--board",
+                    "QsJh2h",
+                    "--oop-range",
+                    "o",
+                    "--ip-range",
+                    "i",
+                    "--out",
+                    "s",
+                    "--size-rules",
+                    "rules.json",
+                    bet,
+                    "66",
+                ]);
+                assert_eq!(
+                    result.err().unwrap().kind(),
+                    clap::error::ErrorKind::ArgumentConflict
+                );
+            }
+        }
+    }
+    #[test]
+    fn size_rules_cli_context_and_unchanged_default_shape() {
+        let path = std::env::temp_dir().join(format!("cli-size-rules-{}.json", std::process::id()));
+        let table = sizing::rules::RuleTable {
+            version: 1,
+            candidates: vec![0.25, 0.5, 1.0],
+            default_fraction: 0.66,
+            rules: vec![
+                sizing::rules::Rule {
+                    street: Some(tree::Street::Turn),
+                    player: Some(0),
+                    after_check: Some(false),
+                    fraction: 0.25,
+                    ..Default::default()
+                },
+                sizing::rules::Rule {
+                    street: Some(tree::Street::Turn),
+                    player: Some(1),
+                    after_check: Some(true),
+                    fraction: 1.0,
+                    ..Default::default()
+                },
+                sizing::rules::Rule {
+                    street: Some(tree::Street::River),
+                    fraction: 0.5,
+                    ..Default::default()
+                },
+            ],
+        };
+        fs::write(&path, serde_json::to_vec(&table).unwrap()).unwrap();
+        let configured = args("solve", &["--size-rules", path.to_str().unwrap()]);
+        let rule = configured.tree_config(BB, None).unwrap().bet_size;
+        let board: Vec<_> = parse_board("QsJh2h3c4d")
+            .unwrap()
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        for (street, player, after_check, expected) in [
+            (tree::Street::Flop, 0, false, 0.66),
+            (tree::Street::Turn, 0, false, 0.25),
+            (tree::Street::Turn, 1, true, 1.0),
+            (tree::Street::Turn, 1, false, 0.66),
+            (tree::Street::River, 0, false, 0.5),
+        ] {
+            let len = match street {
+                tree::Street::Flop => 3,
+                tree::Street::Turn => 4,
+                tree::Street::River => 5,
+            };
+            assert_eq!(
+                rule.fraction(&tree::SizeContext {
+                    board: &board[..len],
+                    street,
+                    player,
+                    first_bet: true,
+                    after_check
+                }),
+                expected
+            );
+        }
+        let default_spec = args("solve", &[]).game_spec(false).unwrap();
+        assert!(serde_json::to_value(default_spec)
+            .unwrap()
+            .get("size_rules")
+            .is_none());
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn reach_line_paths_and_selector_constraints() {
+        let config = args("solve", &[]).tree_config(BB, None).unwrap();
+        // River keeps this test small; terminal destinations still resolve correctly.
+        let tree = tree::GameTree::build(
+            parse_board("QsJh2h3c4d")
+                .unwrap()
+                .iter()
+                .map(|c| c.0)
+                .collect(),
+            config,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_reach_line(&tree, "X,X").unwrap(),
+            resolve_reach_line(&tree, "X X").unwrap()
+        );
+        assert!(resolve_reach_line(&tree, "X,B,C").is_ok());
+        for invalid in ["", "Z", "C", "X,X,X"] {
+            assert!(resolve_reach_line(&tree, invalid).is_err());
+        }
+        let parsed = args(
+            "solve",
+            &[
+                "--reach-line",
+                "X,X",
+                "--reach-out",
+                "r.json",
+                "--reach-card",
+                "3c",
+            ],
+        );
+        assert_eq!(parsed.reach_line.as_deref(), Some("X,X"));
+        let request: ReachRequest =
+            serde_json::from_str(r#"{"line":"X,X","card":"2c","out":"reach.json"}"#).unwrap();
+        assert_eq!(
+            request.card.unwrap().parse::<Card>().unwrap().to_string(),
+            "2c"
+        );
+        let mut ambiguous = tree.clone();
+        if let tree::NodeKind::Decision {
+            actions, children, ..
+        } = &mut ambiguous.nodes[tree.root].kind
+        {
+            let child = children[0];
+            actions.push(tree::Action::Check);
+            children.push(child);
+        }
+        assert!(resolve_reach_line(&ambiguous, "X")
+            .unwrap_err()
+            .to_string()
+            .contains("2 matches"));
+
+        assert!(Cli::try_parse_from([
+            "cli",
+            "solve",
+            "--board",
+            "QsJh2h",
+            "--oop-range",
+            "o",
+            "--ip-range",
+            "i",
+            "--out",
+            "s",
+            "--reach-line",
+            "X,X",
+            "--reach-node",
+            "0",
+            "--reach-out",
+            "r"
+        ])
+        .is_err());
     }
     #[test]
     fn scratch_precision_defaults_and_explicit_values_propagate() {
@@ -984,6 +1333,72 @@ mod tests {
         .is_err());
     }
     #[test]
+    fn hand_ev_cli_is_opt_in_and_keeps_legacy_output_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "reyson-hand-ev-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let range = dir.join("range.json");
+        fs::write(&range, r#"{"2c3c":1,"2d3d":1}"#).unwrap();
+        let mut reports = Vec::new();
+        for enabled in [false, true] {
+            let output = dir.join(format!("report-{enabled}.json"));
+            let hand = dir.join("hands.json");
+            let mut argv = vec![
+                "cli",
+                "solve-subgame",
+                "--board",
+                "AsKsQsJsTs",
+                "--pot",
+                "2",
+                "--stack",
+                "0",
+                "--oop-range",
+                range.to_str().unwrap(),
+                "--ip-range",
+                range.to_str().unwrap(),
+                "--threads",
+                "1",
+                "--max-iters",
+                "1",
+                "--out",
+                output.to_str().unwrap(),
+            ];
+            if enabled {
+                argv.extend(["--hand-ev-out", hand.to_str().unwrap()]);
+            }
+            let Command::SolveSubgame(a) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!()
+            };
+            assert_eq!(a.hand_ev_out.is_some(), enabled);
+            run_solve(a, true).unwrap();
+            assert_eq!(hand.exists(), enabled);
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+            assert!(report.get("players").is_none());
+            reports.push(report);
+        }
+        // Wall clocks naturally vary across separate solves; every deterministic
+        // numerical result and existing policy serialization remains bit-identical.
+        for key in [
+            "root_ev_chips",
+            "metrics",
+            "root_strategy",
+            "after_check_strategy",
+            "game_spec",
+            "iterations",
+        ] {
+            assert!(reports[0].get(key).is_some(), "missing legacy field {key}");
+            assert!(reports[1].get(key).is_some(), "missing legacy field {key}");
+            assert_eq!(reports[0][key], reports[1][key], "{key}");
+        }
+    }
+    #[test]
     fn river_cli_reach_export_and_snapshot_replay() {
         let dir = std::env::temp_dir().join(format!(
             "reyson-cli-m3-{}-{}",
@@ -1033,6 +1448,9 @@ mod tests {
             panic!()
         };
         run_solve(args, true).unwrap();
+        let default_report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert!(default_report["game_spec"].get("size_rules").is_none());
         let snapshot: solver::ReachSnapshot =
             serde_json::from_slice(&fs::read(&reach).unwrap()).unwrap();
         assert_eq!(snapshot.board.len(), 5);
@@ -1063,6 +1481,90 @@ mod tests {
             serde_json::from_slice(&fs::read(&replay).unwrap()).unwrap();
         assert_eq!(first["game_spec"], second["game_spec"]);
         assert_eq!(first["metrics"], second["metrics"]);
+        let rule_path = dir.join("rules.json");
+        let ruled_report = dir.join("ruled-report.json");
+        let ruled_snapshot = dir.join("ruled-snapshot.json");
+        let restored_report = dir.join("restored-report.json");
+        let table = sizing::rules::RuleTable {
+            version: 1,
+            candidates: vec![0.5],
+            default_fraction: 0.5,
+            rules: vec![],
+        };
+        fs::write(&rule_path, serde_json::to_vec(&table).unwrap()).unwrap();
+        let Command::SolveSubgame(ruled) = Cli::try_parse_from([
+            "cli",
+            "solve-subgame",
+            "--state",
+            reach.to_str().unwrap(),
+            "--size-rules",
+            rule_path.to_str().unwrap(),
+            "--threads",
+            "1",
+            "--max-iters",
+            "2",
+            "--target",
+            "0",
+            "--reach-node",
+            "0",
+            "--reach-out",
+            ruled_snapshot.to_str().unwrap(),
+            "--out",
+            ruled_report.to_str().unwrap(),
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        run_solve(ruled, true).unwrap();
+        let actual: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ruled_report).unwrap()).unwrap();
+        assert_eq!(
+            actual["game_spec"]["size_rules"],
+            serde_json::to_value(&table).unwrap()
+        );
+        let Command::SolveSubgame(restored) = Cli::try_parse_from([
+            "cli",
+            "solve-subgame",
+            "--state",
+            ruled_snapshot.to_str().unwrap(),
+            "--threads",
+            "1",
+            "--max-iters",
+            "2",
+            "--target",
+            "0",
+            "--out",
+            restored_report.to_str().unwrap(),
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        run_solve(restored, true).unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&restored_report).unwrap()).unwrap();
+        assert_eq!(actual["game_spec"], restored["game_spec"]);
+        assert_eq!(actual["metrics"], restored["metrics"]);
+        // An explicit preset never runs on top of the snapshot's inherited rules.
+        let Command::SolveSubgame(mixed) = Cli::try_parse_from([
+            "cli",
+            "solve-subgame",
+            "--state",
+            ruled_snapshot.to_str().unwrap(),
+            "--preset",
+            "benchmark",
+            "--out",
+            dir.join("mixed-report.json").to_str().unwrap(),
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        assert!(run_solve(mixed, true).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

@@ -120,3 +120,42 @@ ReysonAI の設定にあった `three_bet_ip_multiplier` などの倍率は、�
 
 - 実現率の初期値の表（P4 の前に決める）。
 - 2 人の 169×169 の表を、正確な計算にするかサンプルにするか（時間で決める）。
+
+### M6 準備：ハンド別 EV のエクスポート
+
+`solve ... --hand-ev-out hands.json`（`solve-subgame` も対応）。省略時は追加の計算・出力を行わず、既存の `solution.json` の形式・数値を維持する。
+API は `Engine::root_hand_values()` と `Solution::hand_ev_report()`。
+
+- JSON は `schema_version`, `board`, `pot_chips`, 各定義, `units_per_bb`, `root_ev_chips`, `players`。
+  各プレイヤー（0=OOP, 1=IP）に `combos`（`combo`, `hand_class`, `own_reach_weight`, `reach_weight`, `ev_chips`, `ev_bb`, `equity`）と
+  `classes`（`hand_class`, `reach_weight`, 重み付き平均の `ev_chips`, `ev_bb`, `equity`）を出す。
+- EV は学習済み**平均戦略どうし**の条件付き値であり、収束保証とは別。単位 chips は既存出力と同じ整数チップ単位、BB は `units_per_bb` で割る。
+  定義は「レーキ控除後の終端受取額 − ルート以降の投資額 − 開始ポットの半分」。ゼロレーキでは両者の EV 合計が 0。
+  `solve-subgame` では新しいサブゲームのルート基準であり、元のゲームへの投資差の変換はしていない（必要なら `ReachSnapshot::source_frame_ev`）。
+- `pot_chips` は**レーキ前のルート開始ポット**。エクイティは将来のベット・フォールド・レーキによらず、相手のルート到達レンジに対し最後まで配る勝率（引分け 1/2）。
+  フロップからは各合法な両者の手札について 990 通りのターン・リバーを等確率、ターンからは 44 通りを評価する。
+- `own_reach_weight` は正規化した自分のレンジ重み。`reach_weight` はそれにブロッカー除外後の相手レンジ質量を掛けた値。
+  **こちらを正規化して平均すると `root_ev_chips` に一致**する。単純な自分のレンジ重みだけでは一般には一致しない。
+  相手との合法な組合せがないコンボは重み 0、条件付き EV・エクイティは `null`。クラスの総重み 0 も平均値は `null`。
+- M6 で通常の「ポットの獲得価値」の実現率を学ぶなら、分子は `ev_chips + pot_chips / 2` とする。
+  `ev_chips / (equity * pot_chips)` は中心化された net EV の比率であって、通常の gross 実現率ではない。
+  エクイティ 0 の比率は未定義。クラス平均同士の比率と、個々の比率の平均も同じではない。
+
+追加コストは平均戦略の評価走査 2 回（既存 scratch を再利用）と、物理的な完成ボードごとのハンド評価・ソート。
+エクイティは順位の累積重みとカード別ブロッカー差引きで計算し、全コンボ対のテーブルは作らない。
+完成ボード数を B、両者のコンボ数の合計を H とすると、時間はおおむね O(B H log H)、追加作業領域は O(H)。
+EV の走査時間は既存の木の大きさに依存し、エクイティの時間だけからは推定できない。
+
+検証：`hand_ev_weighted_average_matches_root_and_export_preserves_report_bits`、
+`symmetric_river_board_nuts_have_half_equity_and_zero_net_ev`、`unreachable_combo_has_null_values`、
+`equity_matches_independent_naive_runout_enumeration`、`hand_ev_cli_is_opt_in_and_keeps_legacy_output_fields`。
+前者は診断有効時も既存レポートのバイト列が不変であることを確認する。CLI の別実行では時計の値は比較せず、既存の EV・戦略・指標・設定が一致することを確認する。
+
+2026-10-17 の軽量計測：`cargo test --release -p cfr -j 2 synthetic_equity_timing -- --ignored --nocapture`。
+合成 64 対 64 コンボ、フロップ、エクイティ単体 10 回平均 **0.029655 秒/回**（solve は実行しない）。
+本番のフロップ 1 枚・最大 1,176 対 1,176 コンボへの外挿は、エクイティ部分でおよそ **0.5〜2 秒**。
+追加全体は **平均戦略評価 1 回の時間 T の 2 倍 + 0.5〜2 秒 + JSON 保存**。
+例えば本番の平均戦略評価が 10 秒/回なら約 **20.5〜22 秒 + 保存時間**であり、この 10 秒は仮定であって実測値ではない。
+追加メモリは評価用の既存 scratch を再利用し、O(H) の計算用ベクトルは最大レンジで概算 0.5 MiB 未満、
+レポート構造と整形 JSON・アロケータ余裕を含め **1〜3 MiB 程度**を見込む（ソルバー本体の常駐メモリは別）。
+いずれも本番 solve の測定ではなく、木・レンジ・同時実行負荷・アロケータに依存する見積もり。
