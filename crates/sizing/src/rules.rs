@@ -215,6 +215,9 @@ mod tests {
         assert_eq!(fraction_on(&t, "KcQdTh", Street::Flop), 0.33);
         assert_eq!(fraction_on(&t, "7c7d6h", Street::Flop), 0.33);
         assert_eq!(fraction_on(&t, "AcKd4h", Street::Flop), 0.33);
+        // Turn and river stay at the 66% the flop sizes were compared under.
+        assert_eq!(fraction_on(&t, "7c6d5dKs", Street::Turn), 0.66);
+        assert_eq!(fraction_on(&t, "7c6d5dKs2h", Street::River), 0.66);
         t.into_size_rule().check_suit_invariance(20261017, 64).unwrap();
     }
 
