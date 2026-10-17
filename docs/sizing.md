@@ -105,7 +105,7 @@ python3 tools/m4_turn.py \
 
 `--flops N` は `--manifest`（既定 `data/m4b/manifest.json`）の training から先頭 N 枚を使う。
 `--flops 7c6d5d,As7d2c` のように明示することもできる。既定のフロップ規則のパスは
-`configs/sizing/srp-btn-vs-bb-flop.json` だが、未提供なら停止する。
+`configs/sizing/srp-btn-vs-bb.json` だが、未提供なら停止する。
 過去の比較結果から規則を捏造したり、都合のよい固定サイズに置き換えたりしない。
 `--oop-range` / `--ip-range` で外部レンジを指定でき、製品レンジはコミットしない。
 

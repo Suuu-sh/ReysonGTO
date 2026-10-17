@@ -123,6 +123,8 @@ pub struct NodeStrategy {
 /// factor; private-card blockers are applied explicitly instead.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReachSnapshot {
+    #[serde(default)]
+    pub previous_street_bet: Option<bool>,
     pub source_node: usize,
     pub board: Vec<Card>,
     pub pot: i64,
@@ -194,6 +196,7 @@ pub fn solve_subgame_with_progress(
         return Err("subgame requires equal nonnegative remaining stacks".into());
     }
     let mut config = snapshot.tree_config;
+    config.previous_street_bet = snapshot.previous_street_bet;
     config.starting_pot = snapshot.pot;
     config.effective_stack = snapshot.stacks[0];
     solve_with_progress(
@@ -571,6 +574,7 @@ impl Solution {
             matches!(&parent.kind, NodeKind::Chance { children, .. } if children.contains(&node))
         });
         Ok(ReachSnapshot {
+            previous_street_bet: self.tree().previous_street_bet_at(node),
             source_node: node,
             board: state.board.iter().copied().map(Card).collect(),
             pot: state.pot,
@@ -882,6 +886,18 @@ mod tests {
             _ => unreachable!(),
         };
         let direct = solution.reach_snapshot(card_node).unwrap();
+        assert_eq!(direct.previous_street_bet, conditioned.previous_street_bet);
+        let mut legacy = serde_json::to_value(&conditioned).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("previous_street_bet");
+        assert_eq!(
+            serde_json::from_value::<ReachSnapshot>(legacy)
+                .unwrap()
+                .previous_street_bet,
+            None
+        );
         for p in 0..2 {
             for (a, b) in conditioned.ranges[p]
                 .combos
@@ -906,6 +922,14 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(
+            result.tree().config.previous_street_bet,
+            restored.previous_street_bet
+        );
+        assert_eq!(
+            result.tree().previous_street_bet_at(result.tree().root),
+            restored.previous_street_bet
+        );
         assert_eq!(result.tree().nodes[result.tree().root].pot, restored.pot);
         assert_eq!(
             result.tree().nodes[result.tree().root].stacks,
@@ -964,6 +988,7 @@ mod tests {
         let (mut game, ranges) = example();
         game.board.truncate(4);
         let snapshot = ReachSnapshot {
+            previous_street_bet: None,
             source_node: 0,
             board: game.board,
             pot: 2000,

@@ -3459,7 +3459,7 @@ mod tests {
             level.reach[p] = e.initial_reach[p].iter().map(|&w| w as f32).collect();
         }
         let mut detects_early_rounding = false;
-        for target in 0..2 {
+        for (target, &count) in n.iter().enumerate() {
             let reach: Vec<_> = level.reach[1 - target].iter().map(|&w| w as f64).collect();
             let expected: Vec<_> = legacy_terminal_values(&e, 0, target, &reach)
                 .iter()
@@ -3475,7 +3475,7 @@ mod tests {
                 None,
             );
             assert_eq!(
-                level.value[..n[target]]
+                level.value[..count]
                     .iter()
                     .map(|v| v.to_bits())
                     .collect::<Vec<_>>(),
@@ -3490,7 +3490,7 @@ mod tests {
                 &mut TotalsCache::<f32>::default(),
                 None,
             );
-            detects_early_rounding |= level.value[..n[target]]
+            detects_early_rounding |= level.value[..count]
                 .iter()
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>()
