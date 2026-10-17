@@ -280,6 +280,15 @@ impl ThreeWayEquityTable {
         }
         Some(result)
     }
+    pub(crate) fn ordered_hero_shares(&self) -> Vec<f64> {
+        (0..CLASS_COUNT)
+            .flat_map(|h| {
+                (0..CLASS_COUNT).flat_map(move |x| {
+                    (0..CLASS_COUNT).map(move |y| self.get(h, x, y).map_or(f64::NAN, |e| e[0]))
+                })
+            })
+            .collect()
+    }
     fn compute_hash(&self) -> Result<String, String> {
         // Hash the values' bit patterns, not their JSON text: serde_json's default
         // float parser is not guaranteed to round-trip every f64 bit-exactly, so a
