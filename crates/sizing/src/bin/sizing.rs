@@ -30,6 +30,15 @@ enum Command {
         #[arg(long, default_value_t = 20261015)]
         seed: u64,
     },
+    /// Remaining river cards grouped by category; optionally select suit-distinct representatives.
+    RiverCards {
+        #[arg(long)]
+        board: String,
+        #[arg(long)]
+        per_kind: Option<usize>,
+        #[arg(long, default_value_t = 20261015)]
+        seed: u64,
+    },
     /// Run the sequential M4 comparison runner (remaining arguments are passed through).
     #[command(disable_help_flag = true)]
     CompareFlops {
@@ -101,6 +110,42 @@ fn main() -> anyhow::Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "flop": flop, "features": sizing::features::flop_features(&cards),
+                "seed": seed, "per_kind": per_kind, "groups": groups
+                }))?
+            );
+        }
+        Command::RiverCards {
+            board,
+            per_kind,
+            seed,
+        } => {
+            anyhow::ensure!(
+                board.is_ascii() && board.len() == 8,
+                "board must contain four cards, e.g. 7c6d5dKs"
+            );
+            let cards: Vec<cards::Card> = board
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| {
+                    std::str::from_utf8(c)
+                        .unwrap()
+                        .parse()
+                        .map_err(anyhow::Error::msg)
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let groups = sizing::rivers::river_cards(
+                [cards[0], cards[1], cards[2], cards[3]],
+                per_kind,
+                seed,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let board: String = cards.iter().map(ToString::to_string).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "board": board, "features": sizing::features::flop_features(&cards[..3]),
                 "seed": seed, "per_kind": per_kind, "groups": groups
                 }))?
             );
