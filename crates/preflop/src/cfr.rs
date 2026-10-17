@@ -2,7 +2,7 @@
 //! Class equity is an abstraction; illegal private-card pairs are excluded exactly.
 pub use crate::realization::RealizationConfig;
 use crate::{
-    equity::{EquityMetadata, EquityTable, HandClasses, CLASS_COUNT},
+    equity::{EquityMetadata, EquityTable, HandClasses, ThreeWayEquityTable, CLASS_COUNT},
     tree::{Action, Node, PreflopTree, TerminalKind},
 };
 use cards::Combo;
@@ -44,24 +44,37 @@ pub struct NodeStrategy {
 }
 #[derive(Debug, Serialize, Default)]
 pub struct RangeSummary {
+    pub opening_by_position: std::collections::BTreeMap<String, OpeningFrequency>,
     pub btn_open: Option<f64>,
     pub bb_three_bet_given_btn_open: Option<f64>,
     pub bb_call_given_btn_open: Option<f64>,
+}
+#[derive(Debug, Serialize)]
+pub struct OpeningFrequency {
+    pub raise: f64,
+    pub complete: f64,
 }
 #[derive(Debug, Serialize)]
 pub struct SolveReport {
     pub iterations: u64,
     pub training_seconds: f64,
     pub report_seconds: f64,
-    pub profile_ev_bb: [f64; 2],
-    pub best_response_ev_bb: [f64; 2],
-    pub best_response_gain_bb: [f64; 2],
+    pub profile_ev_bb: Vec<f64>,
+    pub best_response_ev_bb: Vec<f64>,
+    pub best_response_gain_bb: Vec<f64>,
     /// Sum of unilateral improvement in this general-sum abstract game.
     pub nash_conv_bb: f64,
     /// Merely half of NashConv, not zero-sum exploitability.
     pub half_gap_bb: f64,
-    pub legal_ordered_deals: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_ordered_deals: Option<usize>,
     pub equity_metadata: EquityMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub three_way_metadata: Option<EquityMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub three_way_content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approximation: Option<String>,
     pub realization: RealizationConfig,
     pub summary: RangeSummary,
     pub nodes: Vec<NodeStrategy>,
@@ -76,6 +89,8 @@ pub struct PreflopSolver {
     training_seconds: f64,
     equity_metadata: EquityMetadata,
     realization: RealizationConfig,
+    equity: EquityTable,
+    three_way: Option<ThreeWayEquityTable>,
 }
 impl PreflopSolver {
     pub fn new(
@@ -83,11 +98,28 @@ impl PreflopSolver {
         equity: EquityTable,
         realization: RealizationConfig,
     ) -> Result<Self, String> {
-        if tree.config.players != 2 {
-            return Err("P3 CFR supports exactly two players; P4 is not implemented".into());
+        Self::new_with_three_way(tree, equity, realization, None)
+    }
+    pub fn new_with_three_way(
+        tree: PreflopTree,
+        equity: EquityTable,
+        realization: RealizationConfig,
+        three_way: Option<ThreeWayEquityTable>,
+    ) -> Result<Self, String> {
+        if !(2..=6).contains(&tree.config.players) {
+            return Err("CFR requires 2..6 players".into());
+        }
+        let players = tree.config.players;
+        if players > 2 && three_way.is_none() {
+            eprintln!(
+                "warning: no three-way equity table; multiway product-HU equity is approximate"
+            );
         }
         tree.config.validate().map_err(|e| e.to_string())?;
         equity.validate()?;
+        if let Some(t) = &three_way {
+            t.validate()?;
+        }
         realization.validate()?;
         let classes = HandClasses::new();
         let mut legal_counts = vec![0.0; CLASS_COUNT * CLASS_COUNT];
@@ -109,7 +141,7 @@ impl PreflopSolver {
                     actions,
                     children,
                 } => {
-                    if *actor > 1
+                    if *actor >= players
                         || actions.is_empty()
                         || actions.len() != children.len()
                         || children.iter().any(|&id| id >= tree.nodes.len())
@@ -117,14 +149,35 @@ impl PreflopSolver {
                         return Err("invalid HU decision node".into());
                     }
                     states.push(Some(NodeState {
-                        regret: vec![0.0; actions.len() * COMBO_COUNT],
-                        average: vec![0.0; actions.len() * COMBO_COUNT],
+                        regret: vec![
+                            0.0;
+                            actions.len()
+                                * if players == 2 {
+                                    COMBO_COUNT
+                                } else {
+                                    CLASS_COUNT
+                                }
+                        ],
+                        average: vec![
+                            0.0;
+                            actions.len()
+                                * if players == 2 {
+                                    COMBO_COUNT
+                                } else {
+                                    CLASS_COUNT
+                                }
+                        ],
                     }));
                     kernels.push(None);
                 }
                 Node::Terminal(t) => {
-                    if t.contributions.len() != 2 {
+                    if t.contributions.len() != players {
                         return Err("invalid HU terminal contributions".into());
+                    }
+                    if players > 2 {
+                        states.push(None);
+                        kernels.push(None);
+                        continue;
                     }
                     let pot = t.pot_bb();
                     // Fold terminals never pay rake, regardless of external flags.
@@ -181,9 +234,62 @@ impl PreflopSolver {
             kernels,
             iterations: 0,
             training_seconds: 0.0,
-            equity_metadata: equity.metadata,
+            equity_metadata: equity.metadata.clone(),
+            equity,
+            three_way,
             realization,
         })
+    }
+    fn multi_walk(
+        &mut self,
+        id: usize,
+        player: usize,
+        strategy: &[Vec<f64>],
+        reach: &[Vec<f64>],
+        best: bool,
+        update: bool,
+    ) -> Vec<f64> {
+        multi_traverse(
+            &self.tree,
+            &self.classes,
+            &self.equity,
+            self.three_way.as_ref(),
+            &self.realization,
+            strategy,
+            &mut self.states,
+            id,
+            player,
+            reach,
+            best,
+            update,
+            true,
+            &mut RangeCache::new(),
+        )
+    }
+    fn multi_evaluate(
+        &self,
+        id: usize,
+        player: usize,
+        strategy: &[Vec<f64>],
+        reach: &[Vec<f64>],
+        best: bool,
+    ) -> Vec<f64> {
+        multi_traverse(
+            &self.tree,
+            &self.classes,
+            &self.equity,
+            self.three_way.as_ref(),
+            &self.realization,
+            strategy,
+            &mut [],
+            id,
+            player,
+            reach,
+            best,
+            false,
+            true,
+            &mut RangeCache::new(),
+        )
     }
     pub fn iterations(&self) -> u64 {
         self.iterations
@@ -198,7 +304,7 @@ impl PreflopSolver {
     }
     pub fn step(&mut self) {
         let start = Instant::now();
-        for p in 0..2 {
+        for p in 0..self.tree.config.players {
             for (node, state) in self.tree.nodes.iter().zip(&mut self.states) {
                 if let (Node::Decision { actor, .. }, Some(state)) = (node, state) {
                     if *actor == p {
@@ -207,6 +313,17 @@ impl PreflopSolver {
                 }
             }
             let strategy = self.strategies(false);
+            if self.tree.config.players > 2 {
+                self.multi_walk(
+                    self.tree.root,
+                    p,
+                    &strategy,
+                    &vec![vec![1.0; COMBO_COUNT]; self.tree.config.players],
+                    false,
+                    true,
+                );
+                continue;
+            }
             traverse(
                 &self.tree,
                 &self.classes,
@@ -229,15 +346,18 @@ impl PreflopSolver {
                 None => Vec::new(),
                 Some(s) => {
                     let source = if average { &s.average } else { &s.regret };
-                    let count = source.len() / COMBO_COUNT;
+                    let stride = if self.tree.config.players == 2 {
+                        COMBO_COUNT
+                    } else {
+                        CLASS_COUNT
+                    };
+                    let count = source.len() / stride;
                     let mut out = vec![0.0; source.len()];
-                    for c in 0..COMBO_COUNT {
-                        let sum: f64 = (0..count)
-                            .map(|a| source[a * COMBO_COUNT + c].max(0.0))
-                            .sum();
+                    for c in 0..stride {
+                        let sum: f64 = (0..count).map(|a| source[a * stride + c].max(0.0)).sum();
                         for a in 0..count {
-                            out[a * COMBO_COUNT + c] = if sum > 0.0 {
-                                source[a * COMBO_COUNT + c].max(0.0) / sum
+                            out[a * stride + c] = if sum > 0.0 {
+                                source[a * stride + c].max(0.0) / sum
                             } else {
                                 1.0 / count as f64
                             };
@@ -249,35 +369,56 @@ impl PreflopSolver {
             .collect()
     }
     pub fn report(&self) -> SolveReport {
+        self.report_impl(false)
+    }
+    pub fn report_summary(&self) -> SolveReport {
+        self.report_impl(true)
+    }
+    fn report_impl(&self, summary_only: bool) -> SolveReport {
         let start = Instant::now();
         let strategy = self.strategies(true);
-        let mut profile = [0.0; 2];
-        let mut br = [0.0; 2];
-        for p in 0..2 {
+        let mut profile = vec![0.0; self.tree.config.players];
+        let mut br = vec![0.0; self.tree.config.players];
+        for p in 0..self.tree.config.players {
             for (best_response, target) in [(false, &mut profile[p]), (true, &mut br[p])] {
-                *target = evaluate(
-                    &self.tree,
-                    &self.classes,
-                    &self.kernels,
-                    &strategy,
-                    self.tree.root,
-                    p,
-                    &vec![1.0; COMBO_COUNT],
-                    best_response,
-                )
+                *target = if self.tree.config.players > 2 {
+                    self.multi_evaluate(
+                        self.tree.root,
+                        p,
+                        &strategy,
+                        &vec![vec![1.0; COMBO_COUNT]; self.tree.config.players],
+                        best_response,
+                    )
+                } else {
+                    evaluate(
+                        &self.tree,
+                        &self.classes,
+                        &self.kernels,
+                        &strategy,
+                        self.tree.root,
+                        p,
+                        &vec![1.0; COMBO_COUNT],
+                        best_response,
+                    )
+                }
                 .iter()
                 .sum::<f64>()
                     / COMBO_COUNT as f64;
             }
         }
-        let gains = [(br[0] - profile[0]).max(0.0), (br[1] - profile[1]).max(0.0)];
+        let gains: Vec<_> = br
+            .iter()
+            .zip(&profile)
+            .map(|(b, p)| (b - p).max(0.0))
+            .collect();
         let mut nodes = Vec::new();
         self.collect_nodes(
             self.tree.root,
             &strategy,
-            [vec![1.0; COMBO_COUNT], vec![1.0; COMBO_COUNT]],
+            vec![vec![1.0; COMBO_COUNT]; self.tree.config.players],
             Vec::new(),
             &mut nodes,
+            summary_only,
         );
         let mut summary = RangeSummary::default();
         if self.tree.config.positions == ["BTN", "BB"] {
@@ -313,29 +454,56 @@ impl PreflopSolver {
                 );
             }
         }
+        for n in &nodes {
+            if n.history.iter().all(|a| a == "fold") && self.tree.config.positions[n.actor] != "BB"
+            {
+                let raise = n
+                    .actions
+                    .iter()
+                    .zip(&n.conditional_action_frequencies)
+                    .filter(|(a, _)| a.starts_with("raise_to_") || *a == "all_in")
+                    .map(|(_, p)| p)
+                    .sum();
+                let complete = n
+                    .actions
+                    .iter()
+                    .zip(&n.conditional_action_frequencies)
+                    .filter(|(a, _)| *a == "call")
+                    .map(|(_, p)| p)
+                    .sum();
+                summary.opening_by_position.insert(
+                    self.tree.config.positions[n.actor].clone(),
+                    OpeningFrequency { raise, complete },
+                );
+            }
+        }
         SolveReport {
             iterations: self.iterations,
             training_seconds: self.training_seconds,
             report_seconds: start.elapsed().as_secs_f64(),
             profile_ev_bb: profile,
             best_response_ev_bb: br,
-            best_response_gain_bb: gains,
+            best_response_gain_bb: gains.clone(),
             nash_conv_bb: gains.iter().sum(),
             half_gap_bb: gains.iter().sum::<f64>() / 2.0,
-            legal_ordered_deals: LEGAL_ORDERED_DEALS,
+            legal_ordered_deals: (self.tree.config.players==2).then_some(LEGAL_ORDERED_DEALS),
             equity_metadata: self.equity_metadata.clone(),
+            three_way_metadata: self.three_way.as_ref().map(|t| t.metadata.clone()),
+            three_way_content_hash: self.three_way.as_ref().map(|t|t.content_hash.clone()),
+            approximation: (self.tree.config.players > 2).then(|| "independent class chance for >=3 active; exact pair blockers for active2; independent folded reach; three-way table when supplied, raw product-HU otherwise (not constant-sum); multiway realization is unlearned".into()),
             realization: self.realization.clone(),
             summary,
-            nodes,
+            nodes: if summary_only { Vec::new() } else { nodes },
         }
     }
     fn collect_nodes(
         &self,
         id: usize,
         strategy: &[Vec<f64>],
-        reach: [Vec<f64>; 2],
+        reach: Vec<Vec<f64>>,
         history: Vec<String>,
         out: &mut Vec<NodeStrategy>,
+        summary_only: bool,
     ) {
         if let Node::Decision {
             actor,
@@ -343,13 +511,37 @@ impl PreflopSolver {
             children,
         } = &self.tree.nodes[id]
         {
-            let mass = compatible_mass(&reach[1 - actor]);
+            let stride = if reach.len() == 2 {
+                COMBO_COUNT
+            } else {
+                CLASS_COUNT
+            };
+            let mass = if reach.len() == 2 {
+                compatible_mass(&reach[1 - actor])
+            } else {
+                let m: f64 = reach
+                    .iter()
+                    .enumerate()
+                    .filter(|(p, _)| *p != *actor)
+                    .map(|(_, r)| r.iter().sum::<f64>() / COMBO_COUNT as f64)
+                    .product();
+                vec![m * LEGAL_OPPONENT_COMBOS as f64; COMBO_COUNT]
+            };
             let node_mass: f64 = (0..COMBO_COUNT).map(|c| reach[*actor][c] * mass[c]).sum();
             let conditional = (0..actions.len())
                 .map(|a| {
                     if node_mass > 0.0 {
                         (0..COMBO_COUNT)
-                            .map(|c| reach[*actor][c] * mass[c] * strategy[id][a * COMBO_COUNT + c])
+                            .map(|c| {
+                                reach[*actor][c]
+                                    * mass[c]
+                                    * strategy[id][a * stride
+                                        + if stride == COMBO_COUNT {
+                                            c
+                                        } else {
+                                            self.classes.combo_classes[c]
+                                        }]
+                            })
                             .sum::<f64>()
                             / node_mass
                     } else {
@@ -374,7 +566,14 @@ impl PreflopSolver {
                         .map(|a| {
                             combos
                                 .iter()
-                                .map(|c| strategy[id][a * COMBO_COUNT + c.id()])
+                                .map(|c| {
+                                    strategy[id][a * stride
+                                        + if stride == COMBO_COUNT {
+                                            c.id()
+                                        } else {
+                                            self.classes.combo_classes[c.id()]
+                                        }]
+                                })
                                 .sum::<f64>()
                                 / combos.len() as f64
                         })
@@ -391,16 +590,372 @@ impl PreflopSolver {
                 classes,
             });
             for (a, &child) in children.iter().enumerate() {
+                if summary_only
+                    && (actions[a] != Action::Fold || !history.iter().all(|a| a == "fold"))
+                {
+                    continue;
+                }
                 let mut next = reach.clone();
                 for c in 0..COMBO_COUNT {
-                    next[*actor][c] *= strategy[id][a * COMBO_COUNT + c];
+                    next[*actor][c] *= strategy[id][a * stride
+                        + if stride == COMBO_COUNT {
+                            c
+                        } else {
+                            self.classes.combo_classes[c]
+                        }];
                 }
                 let mut path = history.clone();
                 path.push(action_label(&actions[a]));
-                self.collect_nodes(child, strategy, next, path, out);
+                self.collect_nodes(child, strategy, next, path, out, summary_only);
             }
         }
     }
+}
+type RangeCache = std::collections::HashMap<Vec<u64>, (Vec<f64>, Vec<f64>)>;
+fn range_expectation(
+    classes: &HandClasses,
+    equity: &EquityTable,
+    reach: &[f64],
+    blockers: bool,
+    cache: &mut RangeCache,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut key: Vec<_> = classes
+        .combos
+        .iter()
+        .map(|c| reach[c[0].id()].to_bits())
+        .collect();
+    key.push(blockers as u64);
+    if let Some(value) = cache.get(&key) {
+        return value.clone();
+    }
+    static COUNTS: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    let counts = COUNTS.get_or_init(|| {
+        (0..CLASS_COUNT)
+            .flat_map(|h| {
+                let hero = classes.combos[h][0];
+                (0..CLASS_COUNT).map(move |o| {
+                    classes.combos[o]
+                        .iter()
+                        .filter(|c| c.mask() & hero.mask() == 0)
+                        .count() as f64
+                })
+            })
+            .collect()
+    });
+    let mut expected = vec![0.0; CLASS_COUNT];
+    let mut mass = vec![0.0; CLASS_COUNT];
+    for h in 0..CLASS_COUNT {
+        for o in 0..CLASS_COUNT {
+            let weight = reach[classes.combos[o][0].id()]
+                * if blockers {
+                    counts[h * CLASS_COUNT + o] / LEGAL_OPPONENT_COMBOS as f64
+                } else {
+                    classes.combos[o].len() as f64 / COMBO_COUNT as f64
+                };
+            expected[h] += equity.get(h, o) * weight;
+            mass[h] += weight;
+        }
+    }
+    let result = (expected, mass);
+    // Bounded cache: at most about17MB, never scales with the public tree.
+    if cache.len() < 4096 {
+        cache.insert(key, result.clone());
+    }
+    result
+}
+// Multiway chance is independent class chance, not exact joint card deals.
+// Active two-seat payoffs retain the exact HU blocker kernel; folded reach
+// factors independently. Supported reaches start uniform and remain class-
+// invariant: regrets/strategies are losslessly stored once per suit class.
+#[allow(clippy::too_many_arguments)]
+fn multi_traverse(
+    tree: &PreflopTree,
+    classes: &HandClasses,
+    equity: &EquityTable,
+    three: Option<&ThreeWayEquityTable>,
+    realization: &RealizationConfig,
+    strategy: &[Vec<f64>],
+    states: &mut [Option<NodeState>],
+    id: usize,
+    player: usize,
+    reach: &[Vec<f64>],
+    best: bool,
+    update: bool,
+    prune_folds: bool,
+    cache: &mut RangeCache,
+) -> Vec<f64> {
+    let Node::Decision {
+        actor,
+        actions,
+        children,
+    } = &tree.nodes[id]
+    else {
+        return multi_terminal_cached(
+            tree,
+            classes,
+            equity,
+            three,
+            realization,
+            id,
+            player,
+            reach,
+            cache,
+        );
+    };
+    let maximize = best && *actor == player;
+    let mut values = vec![if maximize { f64::NEG_INFINITY } else { 0.0 }; COMBO_COUNT];
+    let mut action_values = Vec::new();
+    for (a, &child) in children.iter().enumerate() {
+        let mut next = reach.to_vec();
+        if update || *actor != player {
+            for (c, r) in next[*actor].iter_mut().enumerate() {
+                *r *= strategy[id][a * CLASS_COUNT + classes.combo_classes[c]];
+            }
+        }
+        let v = if prune_folds && *actor == player && actions[a] == Action::Fold {
+            // Once hero folds its contribution never changes; integrating the
+            // remaining independent chance/strategies has total probability1.
+            let mut terminal = child;
+            while let Node::Decision { children, .. } = &tree.nodes[terminal] {
+                terminal = children[0];
+            }
+            let Node::Terminal(t) = &tree.nodes[terminal] else {
+                unreachable!()
+            };
+            let mass: f64 = reach
+                .iter()
+                .enumerate()
+                .filter(|(p, _)| *p != player)
+                .map(|(_, r)| r.iter().sum::<f64>() / COMBO_COUNT as f64)
+                .product();
+            vec![-t.contributions[player] * mass; COMBO_COUNT]
+        } else {
+            multi_traverse(
+                tree,
+                classes,
+                equity,
+                three,
+                realization,
+                strategy,
+                states,
+                child,
+                player,
+                &next,
+                best,
+                update,
+                prune_folds,
+                cache,
+            )
+        };
+        for c in 0..COMBO_COUNT {
+            if maximize {
+                values[c] = values[c].max(v[c]);
+            } else {
+                values[c] += v[c]
+                    * if *actor == player {
+                        strategy[id][a * CLASS_COUNT + classes.combo_classes[c]]
+                    } else {
+                        1.0
+                    };
+            }
+        }
+        if update && *actor == player {
+            action_values.push(v);
+        }
+    }
+    if update && *actor == player {
+        let state = states[id].as_mut().unwrap();
+        for (a, v) in action_values.iter().enumerate() {
+            for h in 0..CLASS_COUNT {
+                let c = classes.combos[h][0].id();
+                state.regret[a * CLASS_COUNT + h] += v[c] - values[c];
+                state.average[a * CLASS_COUNT + h] +=
+                    reach[player][c] * strategy[id][a * CLASS_COUNT + h];
+            }
+        }
+    }
+    values
+}
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn multi_terminal(
+    tree: &PreflopTree,
+    classes: &HandClasses,
+    equity: &EquityTable,
+    three: Option<&ThreeWayEquityTable>,
+    realization: &RealizationConfig,
+    id: usize,
+    player: usize,
+    reach: &[Vec<f64>],
+) -> Vec<f64> {
+    multi_terminal_cached(
+        tree,
+        classes,
+        equity,
+        three,
+        realization,
+        id,
+        player,
+        reach,
+        &mut RangeCache::new(),
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn multi_terminal_cached(
+    tree: &PreflopTree,
+    classes: &HandClasses,
+    equity: &EquityTable,
+    three: Option<&ThreeWayEquityTable>,
+    realization: &RealizationConfig,
+    id: usize,
+    player: usize,
+    reach: &[Vec<f64>],
+    cache: &mut RangeCache,
+) -> Vec<f64> {
+    let Node::Terminal(t) = &tree.nodes[id] else {
+        unreachable!()
+    };
+    let active: Vec<_> = t
+        .active
+        .iter()
+        .enumerate()
+        .filter_map(|(p, &a)| a.then_some(p))
+        .collect();
+    let independent_mass: f64 = reach
+        .iter()
+        .enumerate()
+        .filter(|(p, _)| *p != player)
+        .map(|(_, r)| r.iter().sum::<f64>() / COMBO_COUNT as f64)
+        .product();
+    let mass = vec![independent_mass; COMBO_COUNT];
+    let pot = t.pot_bb();
+    if t.kind == TerminalKind::Fold || !t.active[player] {
+        let payoff = if t.winner == Some(player) {
+            pot - t.contributions[player]
+        } else {
+            -t.contributions[player]
+        };
+        return mass.iter().map(|m| m * payoff).collect();
+    }
+    if active.len() == 2 {
+        debug_assert!(reach.iter().all(|r| classes
+            .combos
+            .iter()
+            .all(|cs| cs.iter().all(|c| r[c.id()] == r[cs[0].id()]))));
+        let opponent = active.iter().copied().find(|&p| p != player).unwrap();
+        let available = pot - tree.config.rake.amount_bb(pot, true);
+        let (expected, legal) = range_expectation(classes, equity, &reach[opponent], true, cache);
+        let class_values: Vec<_> = (0..CLASS_COUNT)
+            .map(|h| {
+                let factor = if t.kind == TerminalKind::Flop {
+                    realization.get(
+                        t.stage,
+                        tree.config.is_ip(player, opponent),
+                        &classes.names[h],
+                    )
+                } else {
+                    1.0
+                };
+                expected[h] * available * factor - t.contributions[player] * legal[h]
+            })
+            .collect();
+        let mut value: Vec<_> = classes
+            .combo_classes
+            .iter()
+            .map(|&h| class_values[h])
+            .collect();
+        for (p, r) in reach.iter().enumerate() {
+            if p != player && p != opponent {
+                let m = r.iter().sum::<f64>() / COMBO_COUNT as f64;
+                for v in &mut value {
+                    *v *= m;
+                }
+            }
+        }
+        return value;
+    }
+    // >=3 active seats use independent class chance. Legal triple class sets
+    // come from the table; suit-specific joint blockers are not modeled.
+    let weights: Vec<Vec<f64>> = reach
+        .iter()
+        .map(|r| {
+            classes
+                .combos
+                .iter()
+                .map(|cs| cs.iter().map(|c| r[c.id()]).sum::<f64>())
+                .collect()
+        })
+        .collect();
+    let totals: Vec<f64> = weights.iter().map(|w| w.iter().sum()).collect();
+    let opponents: Vec<_> = active.iter().copied().filter(|&p| p != player).collect();
+    let mut shares = vec![0.0; CLASS_COUNT];
+    let mut legal_mass = vec![1.0; CLASS_COUNT];
+    let pair_expected: Vec<_> = opponents
+        .iter()
+        .map(|&p| range_expectation(classes, equity, &reach[p], false, cache).0)
+        .collect();
+    for h in 0..CLASS_COUNT {
+        if let Some(three) = three.filter(|_| active.len() == 3) {
+            legal_mass[h] = 0.0;
+            let a = opponents[0];
+            let b = opponents[1];
+            if totals[a] > 0.0 && totals[b] > 0.0 {
+                for x in 0..CLASS_COUNT {
+                    if weights[a][x] == 0.0 {
+                        continue;
+                    }
+                    for y in 0..CLASS_COUNT {
+                        if weights[b][y] == 0.0 {
+                            continue;
+                        }
+                        if let Some(e) = three.get(h, x, y) {
+                            legal_mass[h] += weights[a][x] / totals[a] * weights[b][y] / totals[b];
+                            shares[h] +=
+                                e[0] * weights[a][x] / totals[a] * weights[b][y] / totals[b];
+                        }
+                    }
+                }
+            }
+        } else {
+            shares[h] = 1.0;
+            for (index, &p) in opponents.iter().enumerate() {
+                let expected = &pair_expected[index];
+                let e = if totals[p] > 0.0 {
+                    expected[h] * COMBO_COUNT as f64 / totals[p]
+                } else {
+                    0.0
+                };
+                shares[h] *= e;
+            }
+        }
+    }
+    let available = pot - tree.config.rake.amount_bb(pot, true);
+    let factor = if t.kind == TerminalKind::Flop {
+        if active.len() > 2 {
+            realization.multiway
+        } else {
+            realization.get(t.stage, tree.config.is_ip(player, opponents[0]), "AA")
+        }
+    } else {
+        1.0
+    };
+    (0..COMBO_COUNT)
+        .map(|c| {
+            let h = classes.combo_classes[c];
+            let realization_factor = if t.kind == TerminalKind::Flop && active.len() == 2 {
+                realization.get(
+                    t.stage,
+                    tree.config.is_ip(player, opponents[0]),
+                    &classes.names[h],
+                )
+            } else {
+                factor
+            };
+            mass[c]
+                * (shares[h] * available * realization_factor
+                    - t.contributions[player] * legal_mass[h])
+        })
+        .collect()
 }
 // Before update t, apply the discount belonging to completed update t-1.
 // Thus normalized average contributions have weights 1^2, 2^2, ..., t^2.
@@ -626,6 +1181,358 @@ mod tests {
                 t
             })
             .clone()
+    }
+    fn config_three() -> PreflopConfig {
+        let mut c = config();
+        c.players = 3;
+        c.positions = vec!["BTN".into(), "SB".into(), "BB".into()];
+        c
+    }
+    fn golden_hash(mut report: serde_json::Value) -> u64 {
+        for key in ["training_seconds", "report_seconds"] {
+            report.as_object_mut().unwrap().remove(key);
+        }
+        report["realization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("multiway");
+        report["summary"]
+            .as_object_mut()
+            .unwrap()
+            .remove("opening_by_position");
+        serde_json::to_vec(&report)
+            .unwrap()
+            .iter()
+            .fold(0xcbf29ce484222325u64, |h, b| {
+                (h ^ *b as u64).wrapping_mul(0x100000001b3)
+            })
+    }
+    #[test]
+    fn full_legacy_hu_40bb_bit_exact_golden() {
+        // Original HEAD 14d9246 isolated build, 10 iterations, MC seed20261015/sample1.
+        // Hash covers all EV/BR values and every node/class/action frequency.
+        let c: PreflopConfig =
+            serde_json::from_str(include_str!("../../../fixtures/preflop-hu.json")).unwrap();
+        let mut solver = PreflopSolver::new(
+            PreflopTree::build_legacy(c).unwrap(),
+            EquityTable::generate(1, 20261015).unwrap(),
+            RealizationConfig::default(),
+        )
+        .unwrap();
+        solver.run(10);
+        assert_eq!(
+            golden_hash(serde_json::to_value(solver.report()).unwrap()),
+            0x6f9de4c0ca91a00d
+        );
+    }
+    #[test]
+    #[ignore = "external read-only 100BB config required"]
+    fn full_legacy_hu_100bb_bit_exact_golden() {
+        let path = std::env::var("PREFLOP_100BB_CONFIG").expect("set PREFLOP_100BB_CONFIG");
+        let c = PreflopConfig::from_path(path)
+            .unwrap()
+            .heads_up_btn_bb()
+            .unwrap();
+        let mut solver = PreflopSolver::new(
+            PreflopTree::build_legacy(c).unwrap(),
+            EquityTable::generate(1, 20261015).unwrap(),
+            RealizationConfig::default(),
+        )
+        .unwrap();
+        solver.run(10);
+        assert_eq!(
+            golden_hash(serde_json::to_value(solver.report()).unwrap()),
+            0xdca0c834b8a1a935
+        );
+    }
+    #[test]
+    #[ignore = "full6 100BB benchmark: roughly 1.4GB and substantial CPU; run alone"]
+    fn six_seat_100bb_three_iterations_smoke() {
+        let mut c: PreflopConfig = if let Ok(path) = std::env::var("PREFLOP_100BB_CONFIG") {
+            PreflopConfig::from_path(path).unwrap()
+        } else {
+            serde_json::from_str(include_str!("../../../fixtures/preflop-hu.json")).unwrap()
+        };
+        c.players = 6;
+        c.positions = ["UTG", "HJ", "CO", "BTN", "SB", "BB"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        c.stack_bb = 100.0;
+        let mut solver = PreflopSolver::new(
+            PreflopTree::build(c).unwrap(),
+            synthetic_equity(),
+            RealizationConfig::default(),
+        )
+        .unwrap();
+        solver.run(3);
+        let report = solver.report_summary();
+        assert_eq!(report.iterations, 3);
+        assert_eq!(report.profile_ev_bb.len(), 6);
+        for seat in ["UTG", "HJ", "CO", "BTN", "SB"] {
+            let s = &report.summary.opening_by_position[seat];
+            assert!((0.0..=1.0).contains(&s.raise));
+            assert!((0.0..=1.0).contains(&s.complete));
+            assert!(s.raise + s.complete <= 1.0 + 1e-12);
+        }
+        assert!(report.profile_ev_bb.iter().all(|v| v.is_finite()));
+        eprintln!("{}", serde_json::to_string(&report).unwrap());
+    }
+    #[test]
+    fn folded_hero_subtree_pruning_matches_exhaustive_three_seat_values() {
+        let mut solver = PreflopSolver::new(
+            PreflopTree::push_fold(config_three()).unwrap(),
+            synthetic_equity(),
+            RealizationConfig::default(),
+        )
+        .unwrap();
+        solver.run(3);
+        let strategy = solver.strategies(true);
+        let reach = vec![vec![1.0; COMBO_COUNT]; 3];
+        for p in 0..3 {
+            for best in [false, true] {
+                let pruned = solver.multi_evaluate(solver.tree.root, p, &strategy, &reach, best);
+                let full = multi_traverse(
+                    &solver.tree,
+                    &solver.classes,
+                    &solver.equity,
+                    None,
+                    &solver.realization,
+                    &strategy,
+                    &mut [],
+                    solver.tree.root,
+                    p,
+                    &reach,
+                    best,
+                    false,
+                    false,
+                    &mut RangeCache::new(),
+                );
+                assert!(pruned.iter().zip(full).all(|(a, b)| (a - b).abs() < 1e-12));
+            }
+        }
+    }
+    #[test]
+    fn three_seat_push_fold_converges_and_preserves_class_reaches() {
+        let mut solver = PreflopSolver::new(
+            PreflopTree::push_fold(config_three()).unwrap(),
+            synthetic_equity(),
+            RealizationConfig::default(),
+        )
+        .unwrap();
+        assert!(solver
+            .states
+            .iter()
+            .flatten()
+            .all(|s| s.regret.len() % CLASS_COUNT == 0 && s.regret.len() < COMBO_COUNT));
+        solver.run(5);
+        let early = solver.report();
+        solver.run(95);
+        let late = solver.report();
+        eprintln!(
+            "three-seat toy NashConv iteration5={} iteration100={}",
+            early.nash_conv_bb, late.nash_conv_bb
+        );
+        assert!(
+            late.nash_conv_bb < early.nash_conv_bb,
+            "{} -> {}",
+            early.nash_conv_bb,
+            late.nash_conv_bb
+        );
+        assert!(late.nash_conv_bb < 1e-3, "{}", late.nash_conv_bb);
+        assert_eq!(late.profile_ev_bb.len(), 3);
+        assert!((late.best_response_gain_bb.iter().sum::<f64>() - late.nash_conv_bb).abs() < 1e-12);
+        for n in &late.nodes {
+            for h in &n.classes {
+                assert!((h.frequencies.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+                assert!(h.frequencies.iter().all(|v| (0.0..=1.0).contains(v)));
+            }
+        }
+        let strategy = solver.strategies(true);
+        let reach = vec![vec![1.0; COMBO_COUNT]; 3];
+        let v = solver.multi_evaluate(solver.tree.root, 0, &strategy, &reach, false);
+        for combos in &solver.classes.combos {
+            let first = v[combos[0].id()];
+            assert!(combos.iter().all(|c| (v[c.id()] - first).abs() < 1e-12));
+        }
+    }
+    #[test]
+    fn cached_range_expectation_matches_physical_combo_brute_force() {
+        let classes = HandClasses::new();
+        let equity = synthetic_equity();
+        let reach: Vec<_> = classes
+            .combo_classes
+            .iter()
+            .map(|h| (*h % 7) as f64 / 7.0)
+            .collect();
+        let mut cache = RangeCache::new();
+        for blocked in [false, true] {
+            let (expected, mass) =
+                range_expectation(&classes, &equity, &reach, blocked, &mut cache);
+            for h in [0, 42, 168] {
+                let hero = classes.combos[h][0];
+                let mut e = 0.0;
+                let mut m = 0.0;
+                for (c, &r) in reach.iter().enumerate() {
+                    if !blocked || hero.mask() & Combo::from_id(c).unwrap().mask() == 0 {
+                        e += r * equity.get(h, classes.combo_classes[c]);
+                        m += r;
+                    }
+                }
+                let denominator = if blocked {
+                    LEGAL_OPPONENT_COMBOS
+                } else {
+                    COMBO_COUNT
+                } as f64;
+                assert!((expected[h] - e / denominator).abs() < 1e-12);
+                assert!((mass[h] - m / denominator).abs() < 1e-12);
+            }
+            assert_eq!(
+                (expected, mass),
+                range_expectation(&classes, &equity, &reach, blocked, &mut cache)
+            );
+        }
+        assert_eq!(cache.len(), 2);
+    }
+    #[test]
+    fn folded_seat_reach_scales_active_hu_but_not_own_counterfactual_value() {
+        let classes = HandClasses::new();
+        let c = config_three();
+        let tree = PreflopTree {
+            config: c,
+            root: 0,
+            nodes: vec![Node::Terminal(Terminal {
+                kind: TerminalKind::AllIn,
+                contributions: vec![2.0, 0.5, 2.0],
+                active: vec![true, false, true],
+                winner: None,
+                stage: 1,
+                dead_blind_bb: 0.0,
+            })],
+        };
+        let equity = synthetic_equity();
+        let realization = RealizationConfig::default();
+        let mut reach = vec![vec![1.0; COMBO_COUNT]; 3];
+        let original = multi_terminal(&tree, &classes, &equity, None, &realization, 0, 0, &reach);
+        reach[1].fill(0.25);
+        let scaled = multi_terminal(&tree, &classes, &equity, None, &realization, 0, 0, &reach);
+        assert!(original
+            .iter()
+            .zip(scaled)
+            .all(|(a, b)| (a * 0.25 - b).abs() < 1e-12));
+        let folded = multi_terminal(&tree, &classes, &equity, None, &realization, 0, 1, &reach);
+        assert!(folded.iter().all(|v| (*v + 0.5).abs() < 1e-12));
+    }
+    #[test]
+    fn three_way_all_in_payout_and_net_accounting_and_zero_reaches() {
+        let classes = HandClasses::new();
+        let table = ThreeWayEquityTable::generate(1, 99).unwrap();
+        let mut c = config_three();
+        c.rake.rate = 0.05;
+        c.rake.cap_bb = 3.0;
+        c.stack_bb = 100.0;
+        let tree = PreflopTree {
+            config: c,
+            root: 0,
+            nodes: vec![Node::Terminal(Terminal {
+                kind: TerminalKind::AllIn,
+                contributions: vec![100.0; 3],
+                active: vec![true; 3],
+                winner: None,
+                stage: 3,
+                dead_blind_bb: 0.0,
+            })],
+        };
+        let ids: Vec<_> = ["AA", "KK", "QQ"]
+            .iter()
+            .map(|name| classes.names.iter().position(|n| n == name).unwrap())
+            .collect();
+        let mut reaches = vec![vec![0.0; COMBO_COUNT]; 3];
+        for p in 0..3 {
+            for combo in &classes.combos[ids[p]] {
+                reaches[p][combo.id()] = COMBO_COUNT as f64 / classes.combos[ids[p]].len() as f64;
+            }
+        }
+        let equity = synthetic_equity();
+        let realization = RealizationConfig::default();
+        let mut net = 0.0;
+        for p in 0..3 {
+            let value = multi_terminal(
+                &tree,
+                &classes,
+                &equity,
+                Some(&table),
+                &realization,
+                0,
+                p,
+                &reaches,
+            );
+            net += value[classes.combos[ids[p]][0].id()];
+        }
+        assert!((net + 3.0).abs() < 1e-10, "net={net}");
+        assert!((net + 300.0 - 297.0).abs() < 1e-10);
+        let baseline = multi_terminal(
+            &tree,
+            &classes,
+            &equity,
+            Some(&table),
+            &realization,
+            0,
+            0,
+            &reaches,
+        );
+        reaches[0].fill(0.0);
+        assert_eq!(
+            baseline,
+            multi_terminal(
+                &tree,
+                &classes,
+                &equity,
+                Some(&table),
+                &realization,
+                0,
+                0,
+                &reaches
+            )
+        );
+        reaches[1].fill(0.0);
+        assert!(multi_terminal(
+            &tree,
+            &classes,
+            &equity,
+            Some(&table),
+            &realization,
+            0,
+            0,
+            &reaches
+        )
+        .iter()
+        .all(|&v| v == 0.0));
+    }
+    #[test]
+    fn hu_golden_legacy() {
+        let mut solver = PreflopSolver::new(
+            PreflopTree::build_legacy(config()).unwrap(),
+            synthetic_equity(),
+            RealizationConfig::default(),
+        )
+        .unwrap();
+        solver.run(10);
+        let mut value = serde_json::to_value(solver.report()).unwrap();
+        value.as_object_mut().unwrap().remove("training_seconds");
+        value.as_object_mut().unwrap().remove("report_seconds");
+        value["realization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("multiway");
+        value["summary"]
+            .as_object_mut()
+            .unwrap()
+            .remove("opening_by_position");
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            include_str!("../../../fixtures/preflop-hu-golden.json")
+        );
     }
     #[test]
     fn dcfr_discount_uses_completed_iteration_and_square_average_weights() {

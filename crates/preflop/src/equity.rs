@@ -83,8 +83,9 @@ pub struct EquityMetadata {
     pub schema_version: u32,
     pub method: String,
     pub seed: u64,
-    /// Independent samples for each unordered, distinct class pair. Diagonal
-    /// equity is exactly 0.5 by exchangeability and requires no sampling.
+    /// Samples per unordered matchup. For the heads-up method, distinct
+    /// pairs are sampled and diagonal equity is exactly 0.5; for the
+    /// three-way method, each legal unordered triple is sampled.
     pub samples_per_matchup: u64,
     /// Distribution-free upper bound on one estimate's standard error.
     pub standard_error_upper_bound: f64,
@@ -200,6 +201,218 @@ impl EquityTable {
         table.validate()?;
         Ok(table)
     }
+}
+
+const THREE_WAY_METHOD: &str = "uniform_legal_class_triples_and_boards_splitmix64_v1";
+const THREE_WAY_COUNT: usize = CLASS_COUNT * (CLASS_COUNT + 1) * (CLASS_COUNT + 2) / 6;
+
+/// Class-averaged three-player showdown shares, indexed by unordered triples
+/// with repetition in lexicographic order. None means no disjoint private deal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreeWayEquityTable {
+    pub metadata: EquityMetadata,
+    pub classes: Vec<String>,
+    pub values: Vec<Option<[f64; 3]>>,
+    /// FNV-1a-64 accidental-corruption checksum, not an authenticity proof.
+    pub content_hash: String,
+}
+impl ThreeWayEquityTable {
+    pub fn generate(samples: u64, seed: u64) -> Result<Self, String> {
+        if samples == 0 || samples > u64::MAX / 6 {
+            return Err("three-way samples must be positive and at most u64::MAX / 6".into());
+        }
+        let classes = HandClasses::new();
+        let triples: Vec<_> = (0..CLASS_COUNT)
+            .flat_map(|a| {
+                (a..CLASS_COUNT).flat_map(move |b| (b..CLASS_COUNT).map(move |c| [a, b, c]))
+            })
+            .collect();
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+        eprintln!(
+            "three-way equity: {} unordered triples, {samples} samples each",
+            triples.len()
+        );
+        let values = triples
+            .par_iter()
+            .map(|&ids| {
+                let result = sample_three_way(&classes, ids, samples, seed);
+                let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if done.is_multiple_of(100_000) || done == THREE_WAY_COUNT {
+                    eprintln!("three-way equity: {done}/{THREE_WAY_COUNT} triples complete");
+                }
+                result
+            })
+            .collect();
+        let se = 0.5 / (samples as f64).sqrt();
+        let mut table = Self {
+            metadata: EquityMetadata {
+                schema_version: SCHEMA_VERSION,
+                method: THREE_WAY_METHOD.into(),
+                seed,
+                samples_per_matchup: samples,
+                standard_error_upper_bound: se,
+                pointwise_95_half_width_upper_bound: 1.96 * se,
+                class_averaged_suits: true,
+            },
+            classes: classes.names,
+            values,
+            content_hash: String::new(),
+        };
+        table.content_hash = table.compute_hash()?;
+        Ok(table)
+    }
+    /// Shares follow the caller's player order. Invalid classes and impossible
+    /// deals return None. Identical classes have equal shares by exchangeability.
+    pub fn get(&self, a: usize, b: usize, c: usize) -> Option<[f64; 3]> {
+        if [a, b, c].iter().any(|&id| id >= CLASS_COUNT) {
+            return None;
+        }
+        let mut ordered = [(a, 0), (b, 1), (c, 2)];
+        ordered.sort_unstable();
+        let value = self
+            .values
+            .get(triple_index(ordered[0].0, ordered[1].0, ordered[2].0))?
+            .as_ref()?;
+        let mut result = [0.0; 3];
+        for i in 0..3 {
+            result[ordered[i].1] = value[i];
+        }
+        Some(result)
+    }
+    fn compute_hash(&self) -> Result<String, String> {
+        let bytes = serde_json::to_vec(&(&self.metadata, &self.classes, &self.values))
+            .map_err(|e| e.to_string())?;
+        let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
+        });
+        Ok(format!("fnv1a64:{hash:016x}"))
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        let m = &self.metadata;
+        if m.schema_version != SCHEMA_VERSION
+            || m.method != THREE_WAY_METHOD
+            || !m.class_averaged_suits
+            || m.samples_per_matchup == 0
+            || m.samples_per_matchup > u64::MAX / 6
+            || self.classes != class_names()
+            || self.values.len() != THREE_WAY_COUNT
+        {
+            return Err("invalid three-way schema, classes, size or samples".into());
+        }
+        let se = 0.5 / (m.samples_per_matchup as f64).sqrt();
+        if !m.standard_error_upper_bound.is_finite()
+            || !m.pointwise_95_half_width_upper_bound.is_finite()
+            || (m.standard_error_upper_bound - se).abs() > 1e-14
+            || (m.pointwise_95_half_width_upper_bound - 1.96 * se).abs() > 1e-14
+        {
+            return Err("invalid three-way uncertainty metadata".into());
+        }
+        let classes = HandClasses::new();
+        let mut index = 0;
+        for a in 0..CLASS_COUNT {
+            for b in a..CLASS_COUNT {
+                for c in b..CLASS_COUNT {
+                    let groups = [
+                        classes.combos[a].as_slice(),
+                        classes.combos[b].as_slice(),
+                        classes.combos[c].as_slice(),
+                    ];
+                    let value = self.values[index];
+                    index += 1;
+                    if value.is_some() != joint_deal_exists(&groups, 0, 0) {
+                        return Err("invalid three-way legal-deal marker".into());
+                    }
+                    if let Some(e) = value {
+                        if e.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                            || (e.iter().sum::<f64>() - 1.0).abs() > 1e-12
+                            || (a == b && e[0] != e[1])
+                            || (b == c && e[1] != e[2])
+                        {
+                            return Err("invalid three-way shares or exchangeability".into());
+                        }
+                    }
+                }
+            }
+        }
+        if self.content_hash != self.compute_hash()? {
+            return Err("three-way content hash mismatch".into());
+        }
+        Ok(())
+    }
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        self.validate()?;
+        let path = path.as_ref();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::write(path, serde_json::to_vec(self).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
+    }
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
+        let table: Self = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        table.validate()?;
+        Ok(table)
+    }
+}
+fn triple_index(a: usize, b: usize, c: usize) -> usize {
+    // Subtract all triples whose first class is at least a, then skip the
+    // rows with second class below b. Constant-time canonical indexing.
+    let n = CLASS_COUNT - a;
+    let first = THREE_WAY_COUNT - n * (n + 1) * (n + 2) / 6;
+    let rows = b - a;
+    first + rows * CLASS_COUNT - rows * (2 * a + rows.saturating_sub(1)) / 2 + c - b
+}
+fn sample_three_way(
+    classes: &HandClasses,
+    ids: [usize; 3],
+    samples: u64,
+    seed: u64,
+) -> Option<[f64; 3]> {
+    let groups = ids.map(|id| classes.combos[id].as_slice());
+    if !joint_deal_exists(&groups, 0, 0) {
+        return None;
+    }
+    let key = (ids[0] * CLASS_COUNT * CLASS_COUNT + ids[1] * CLASS_COUNT + ids[2]) as u64;
+    let mut rng = Rng::new(seed ^ key.wrapping_mul(0xd6e8_feb8_6659_fd93));
+    let mut points = [0u64; 3];
+    for _ in 0..samples {
+        // Independent class-combo draws followed by whole-deal rejection are
+        // uniform over legal joint assignments (sequential conditioning is not).
+        let hands = loop {
+            let hands = groups.map(|g| g[rng.below(g.len() as u64) as usize]);
+            if hands[0].mask() & hands[1].mask() == 0
+                && (hands[0].mask() | hands[1].mask()) & hands[2].mask() == 0
+            {
+                break hands;
+            }
+        };
+        let board = sample_board(hands.iter().fold(0, |m, h| m | h.mask()), &mut rng);
+        let ranks = hands.map(|h| score(h, board));
+        let best = *ranks.iter().max().unwrap();
+        let winners = ranks.iter().filter(|&&r| r == best).count() as u64;
+        for p in 0..3 {
+            if ranks[p] == best {
+                points[p] += 6 / winners;
+            }
+        }
+    }
+    let mut result = points.map(|p| p as f64 / (6.0 * samples as f64));
+    // Rao-Blackwellize seat permutations of repeated classes. This preserves
+    // unbiasedness while making query ordering unambiguous for repeated IDs.
+    if ids[0] == ids[2] {
+        result = [1.0 / 3.0; 3];
+    } else if ids[0] == ids[1] {
+        let e = (result[0] + result[1]) / 2.0;
+        result[0] = e;
+        result[1] = e;
+    } else if ids[1] == ids[2] {
+        let e = (result[1] + result[2]) / 2.0;
+        result[1] = e;
+        result[2] = e;
+    }
+    Some(result)
 }
 
 /// On-demand approximation for 2..6 players: samples all class combos
@@ -496,6 +709,99 @@ mod tests {
             1
         )
         .is_err());
+    }
+    /// Small throughput probe only; never creates or saves a production table.
+    #[test]
+    #[ignore]
+    fn three_way_generation_estimate() {
+        let classes = HandClasses::new();
+        let triples: Vec<_> = (0..CLASS_COUNT)
+            .flat_map(|a| {
+                (a..CLASS_COUNT).flat_map(move |b| (b..CLASS_COUNT).map(move |c| [a, b, c]))
+            })
+            .collect();
+        let subset: Vec<_> = (0..100).map(|i| triples[i * triples.len() / 100]).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let measure = |samples| {
+            let start = std::time::Instant::now();
+            let values: Vec<_> = pool.install(|| {
+                subset
+                    .par_iter()
+                    .map(|&ids| sample_three_way(&classes, ids, samples, 123))
+                    .collect()
+            });
+            std::hint::black_box(values);
+            start.elapsed().as_secs_f64()
+        };
+        let tiny = measure(1);
+        let larger = measure(1000);
+        let sampling_seconds = (larger - tiny).max(0.0) / 999.0;
+        let projected = sampling_seconds * 1000.0 * THREE_WAY_COUNT as f64 / subset.len() as f64;
+        eprintln!("three-way probe: 100 evenly spaced triples, threads=4, sample1={tiny:.6}s sample1000={larger:.6}s; setup-subtracted projected full sample1000={projected:.3}s (approximate, no IO/hash; suit rejection mix and scaling may vary)");
+    }
+    #[test]
+    fn three_way_known_matchup_and_indexing() {
+        let classes = HandClasses::new();
+        let ids = [class("AA"), class("KK"), class("QQ")];
+        let e = sample_three_way(&classes, ids, 20_000, 42).unwrap();
+        assert!((e[0] - 0.69).abs() < 0.025, "AA/KK/QQ={e:?}");
+        assert!((e.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!(sample_three_way(&classes, [class("AA"); 3], 1, 42).is_none());
+        let mut index = 0;
+        for a in 0..CLASS_COUNT {
+            for b in a..CLASS_COUNT {
+                for c in b..CLASS_COUNT {
+                    assert_eq!(triple_index(a, b, c), index);
+                    index += 1;
+                }
+            }
+        }
+        assert_eq!(index, THREE_WAY_COUNT);
+    }
+    #[test]
+    fn three_way_roundtrip_order_corruption_and_threads() {
+        let make = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| ThreeWayEquityTable::generate(1, 123).unwrap())
+        };
+        let table = make(2);
+        let single = make(1);
+        assert_eq!(table.values, single.values);
+        assert_eq!(table.content_hash, single.content_hash);
+        let [a, b, c] = [class("AA"), class("KK"), class("QQ")];
+        let e = table.get(a, b, c).unwrap();
+        assert_eq!(table.get(c, a, b), Some([e[2], e[0], e[1]]));
+        assert_eq!(table.get(b, c, a), Some([e[1], e[2], e[0]]));
+        assert!(table.get(a, a, a).is_none());
+        assert!(table.get(CLASS_COUNT, b, c).is_none());
+        let repeated = table.get(a, a, b).unwrap();
+        assert_eq!(repeated[0], repeated[1]);
+        let path =
+            std::env::temp_dir().join(format!("reyson-three-way-test-{}.json", std::process::id()));
+        table.save(&path).unwrap();
+        let loaded = ThreeWayEquityTable::load(&path).unwrap();
+        assert_eq!(loaded.values, table.values);
+        // Preserve valid probability sums: checksum still detects altered data.
+        let mut bad = table.clone();
+        let i = triple_index(a, b, c);
+        bad.values[i] = Some(if e == [1.0, 0.0, 0.0] {
+            [0.0, 1.0, 0.0]
+        } else {
+            [1.0, 0.0, 0.0]
+        });
+        assert!(bad.validate().is_err());
+        let mut bad = table.clone();
+        bad.metadata.seed += 1;
+        assert!(bad.validate().is_err());
+        fs::write(&path, b"{truncated").unwrap();
+        assert!(ThreeWayEquityTable::load(&path).is_err());
+        assert!(ThreeWayEquityTable::generate(0, 1).is_err());
     }
     #[test]
     fn sampled_deals_have_no_duplicate_cards() {

@@ -23,7 +23,7 @@ pub struct Terminal {
     pub contributions: Vec<f64>,
     pub active: Vec<bool>,
     pub winner: Option<usize>,
-    /// 0 = limp, 1 = open/iso, 2 = 3bet, 3 = 4bet, 4 = 5bet jam.
+    /// 0 = limp, 1 = open/iso, 2 = 3bet, 3 = 4bet, 4 = 5bet, 5 = 6bet jam.
     pub stage: u8,
     pub dead_blind_bb: f64,
 }
@@ -76,6 +76,13 @@ struct State {
 }
 impl PreflopTree {
     pub fn build(config: PreflopConfig) -> Result<Self> {
+        Self::build_mode(config, false)
+    }
+    /// Frozen P1-P3 betting abstraction for explicit historical HU regression only.
+    pub fn build_legacy(config: PreflopConfig) -> Result<Self> {
+        Self::build_mode(config, true)
+    }
+    fn build_mode(config: PreflopConfig, legacy: bool) -> Result<Self> {
         config.validate()?;
         let state = Self::initial_state(&config);
         let mut tree = Self {
@@ -83,11 +90,26 @@ impl PreflopTree {
             nodes: Vec::new(),
             root: 0,
         };
-        tree.root = tree.expand(state)?;
+        tree.root = tree.expand(state, legacy)?;
         Ok(tree)
     }
-    /// Synthetic one-shove/one-call toy, not the full fixed-sizing game.
+    /// Synthetic shove-or-fold / call-or-fold toy, supporting 2..=6 seats.
+    /// HU preserves the historical five-node game exactly.
     pub fn push_fold(config: PreflopConfig) -> Result<Self> {
+        config.validate()?;
+        if config.players == 2 {
+            return Self::push_fold_legacy_hu(config);
+        }
+        let state = Self::initial_state(&config);
+        let mut tree = Self {
+            config,
+            nodes: Vec::new(),
+            root: 0,
+        };
+        tree.root = tree.expand_push_fold(state)?;
+        Ok(tree)
+    }
+    fn push_fold_legacy_hu(config: PreflopConfig) -> Result<Self> {
         config.validate()?;
         if config.node_limit < 5 {
             bail!("push/fold requires node_limit >= 5");
@@ -126,6 +148,45 @@ impl PreflopTree {
             children: vec![fold_id, response],
         });
         Ok(tree)
+    }
+    fn expand_push_fold(&mut self, state: State) -> Result<usize> {
+        if self.nodes.len() >= self.config.node_limit {
+            bail!("preflop node limit {} exceeded", self.config.node_limit);
+        }
+        if state.active.count_ones() == 1 {
+            return Ok(self.add_terminal(&state, TerminalKind::Fold));
+        }
+        if state.pending == 0 {
+            return Ok(self.add_terminal(&state, TerminalKind::AllIn));
+        }
+        let actor = state.actor;
+        let actions = if state.target == chips(self.config.stack_bb) {
+            vec![Action::Fold, Action::Call]
+        } else {
+            vec![Action::Fold, Action::AllIn]
+        };
+        let id = self.nodes.len();
+        self.nodes.push(Node::Decision {
+            actor,
+            actions: actions.clone(),
+            children: Vec::new(),
+        });
+        let mut children = Vec::new();
+        for &action in &actions {
+            let mut next = self.apply(&state, action);
+            // Match the historical toy's terminal stage metadata.
+            if action == Action::AllIn {
+                next.stage = 4;
+            }
+            children.push(self.expand_push_fold(next)?);
+        }
+        if let Node::Decision {
+            children: stored, ..
+        } = &mut self.nodes[id]
+        {
+            *stored = children;
+        }
+        Ok(id)
     }
     fn initial_state(config: &PreflopConfig) -> State {
         let contributions: Vec<i64> = config
@@ -174,7 +235,7 @@ impl PreflopTree {
         }));
         id
     }
-    fn expand(&mut self, state: State) -> Result<usize> {
+    fn expand(&mut self, state: State, legacy: bool) -> Result<usize> {
         if self.nodes.len() >= self.config.node_limit {
             bail!("preflop node limit {} exceeded", self.config.node_limit);
         }
@@ -195,7 +256,7 @@ impl PreflopTree {
             ));
         }
         let actor = state.actor;
-        let actions = self.actions(&state);
+        let actions = self.actions(&state, legacy);
         let id = self.nodes.len();
         // Reserve the parent before recursion so node limits cover every node.
         self.nodes.push(Node::Decision {
@@ -205,7 +266,7 @@ impl PreflopTree {
         });
         let mut children = Vec::with_capacity(actions.len());
         for &action in &actions {
-            children.push(self.expand(self.apply(&state, action))?);
+            children.push(self.expand(self.apply(&state, action), legacy)?);
         }
         if let Node::Decision {
             children: stored, ..
@@ -215,7 +276,7 @@ impl PreflopTree {
         }
         Ok(id)
     }
-    fn actions(&self, state: &State) -> Vec<Action> {
+    fn actions(&self, state: &State, legacy: bool) -> Vec<Action> {
         let actor = state.actor;
         let owed = state.target - state.contributions[actor];
         let position = self.config.positions[actor].as_str();
@@ -235,7 +296,7 @@ impl PreflopTree {
             actions.push(Action::Call);
         }
         let stack = chips(self.config.stack_bb);
-        if state.target >= stack || state.stage >= 4 {
+        if state.target >= stack || (legacy && state.stage >= 4) {
             return actions;
         }
         let f = &self.config.sizing.fixed_raise_to_bb;
@@ -277,13 +338,25 @@ impl PreflopTree {
                     f.four_bet.oop
                 }]
             }
+            3 if !legacy => vec![
+                bb(state.target - chips(self.config.ante_bb))
+                    * self.config.sizing.five_bet_multiplier,
+            ],
             _ => vec![self.config.stack_bb],
         };
         for target in targets {
             // A squeeze can make a nominal fixed 4bet too small. Keep it legal.
-            let target = chips(target + self.config.ante_bb)
+            let mut target = chips(target + self.config.ante_bb)
                 .max(state.target + state.last_increment)
                 .min(stack);
+            if !legacy
+                && state.stage == 3
+                && (target - state.contributions[actor]) as f64
+                    >= self.config.sizing.five_bet_merge_remaining_fraction
+                        * (stack - state.contributions[actor]) as f64
+            {
+                target = stack;
+            }
             if target > state.target {
                 let action = if target == stack {
                     Action::AllIn
@@ -294,6 +367,9 @@ impl PreflopTree {
                     actions.push(action);
                 }
             }
+        }
+        if !legacy && state.stage >= 2 && !actions.contains(&Action::AllIn) {
+            actions.push(Action::AllIn);
         }
         actions
     }
@@ -641,5 +717,122 @@ mod ante_tests {
                 panic!("no action for all-in BB");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod p4_tests {
+    use super::*;
+    fn config() -> PreflopConfig {
+        let mut c: PreflopConfig =
+            serde_json::from_str(include_str!("../../../fixtures/preflop-hu.json")).unwrap();
+        c.stack_bb = 100.0;
+        c
+    }
+    fn actions(tree: &PreflopTree, path: &[Action]) -> Vec<Action> {
+        let mut id = tree.root;
+        for a in path {
+            if let Node::Decision {
+                actions, children, ..
+            } = &tree.nodes[id]
+            {
+                id = children[actions.iter().position(|x| x == a).expect("path action")];
+            } else {
+                panic!("early terminal");
+            }
+        }
+        if let Node::Decision { actions, .. } = &tree.nodes[id] {
+            actions.clone()
+        } else {
+            panic!("terminal")
+        }
+    }
+    #[test]
+    fn four_bet_fixed_and_jam_five_bet_multiplier_then_six_bet_jam() {
+        let t = PreflopTree::build(config()).unwrap();
+        let p = [Action::RaiseTo(2.0), Action::RaiseTo(9.0)];
+        assert_eq!(
+            actions(&t, &p),
+            vec![
+                Action::Fold,
+                Action::Call,
+                Action::RaiseTo(21.0),
+                Action::AllIn
+            ]
+        );
+        let mut p = p.to_vec();
+        p.push(Action::RaiseTo(21.0));
+        assert_eq!(
+            actions(&t, &p),
+            vec![
+                Action::Fold,
+                Action::Call,
+                Action::RaiseTo(46.2),
+                Action::AllIn
+            ]
+        );
+        p.push(Action::RaiseTo(46.2));
+        assert_eq!(
+            actions(&t, &p),
+            vec![Action::Fold, Action::Call, Action::AllIn]
+        );
+        assert_eq!(PreflopTree::build_legacy(config()).unwrap().nodes.len(), 14);
+    }
+    #[test]
+    fn five_bet_merge_uses_additional_chips_and_remaining_stack() {
+        let mut c = config();
+        c.sizing.five_bet_multiplier = 3.0;
+        let p = [
+            Action::RaiseTo(2.0),
+            Action::RaiseTo(9.0),
+            Action::RaiseTo(21.0),
+        ];
+        // Additional54 / remaining91 is below .67, despite target63 exceeding .67*91.
+        let t = PreflopTree::build(c.clone()).unwrap();
+        assert!(actions(&t, &p).contains(&Action::RaiseTo(63.0)));
+        c.sizing.five_bet_merge_remaining_fraction = 54.0 / 91.0;
+        assert_eq!(
+            actions(&PreflopTree::build(c).unwrap(), &p),
+            vec![Action::Fold, Action::Call, Action::AllIn]
+        );
+    }
+    #[test]
+    fn four_bet_stack_cap_deduplicates_jam_and_node_limit_applies() {
+        let mut c = config();
+        c.stack_bb = 20.0;
+        let t = PreflopTree::build(c).unwrap();
+        assert_eq!(
+            actions(&t, &[Action::RaiseTo(2.0), Action::RaiseTo(9.0)]),
+            vec![Action::Fold, Action::Call, Action::AllIn]
+        );
+        let mut c = config();
+        c.node_limit = 14;
+        assert!(PreflopTree::build(c).is_err());
+    }
+    #[test]
+    fn shallow_multiway_push_fold_never_reacts_with_allin_seat() {
+        let mut c = config();
+        c.players = 3;
+        c.positions = vec!["BTN".into(), "SB".into(), "BB".into()];
+        c.stack_bb = 1.0;
+        let t = PreflopTree::push_fold(c).unwrap();
+        assert!(t
+            .nodes
+            .iter()
+            .all(|n| !matches!(n, Node::Decision { actor: 2, .. })));
+        assert!(t
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Node::Terminal(x) if x.kind == TerminalKind::AllIn)));
+    }
+    #[test]
+    fn three_player_push_fold_has_joint_allin_and_limit() {
+        let mut c = config();
+        c.players = 3;
+        c.positions = vec!["BTN".into(), "SB".into(), "BB".into()];
+        let t = PreflopTree::push_fold(c.clone()).unwrap();
+        assert!(t.nodes.iter().any(|n| matches!(n, Node::Terminal(x) if x.kind == TerminalKind::AllIn && x.active.iter().all(|a| *a))));
+        c.node_limit = t.nodes.len() - 1;
+        assert!(PreflopTree::push_fold(c).is_err());
     }
 }

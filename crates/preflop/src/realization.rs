@@ -17,12 +17,17 @@ pub struct PositionRealization {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RealizationConfig {
+    #[serde(default = "default_multiway")]
+    pub multiway: f64,
     pub limp: PositionRealization,
     pub srp: PositionRealization,
     pub three_bet: PositionRealization,
     pub four_bet: PositionRealization,
 }
 
+fn default_multiway() -> f64 {
+    0.8
+}
 impl Default for RealizationConfig {
     fn default() -> Self {
         fn row(ip: f64, oop: f64) -> PositionRealization {
@@ -41,6 +46,7 @@ impl Default for RealizationConfig {
             }
         }
         Self {
+            multiway: default_multiway(),
             limp: row(0.98, 0.83),
             srp: row(1.0, 0.85),
             three_bet: row(1.0, 0.88),
@@ -56,6 +62,9 @@ impl RealizationConfig {
         Ok(value)
     }
     pub fn validate(&self) -> Result<(), String> {
+        if !self.multiway.is_finite() || !(0.0..=1.5).contains(&self.multiway) {
+            return Err("invalid multiway realization".into());
+        }
         for row in [&self.limp, &self.srp, &self.three_bet, &self.four_bet] {
             for h in [&row.ip, &row.oop] {
                 for v in [

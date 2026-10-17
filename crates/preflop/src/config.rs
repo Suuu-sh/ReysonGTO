@@ -48,6 +48,13 @@ impl RakeConfig {
         }
     }
 }
+fn default_five_bet_multiplier() -> f64 {
+    2.2
+}
+fn default_five_bet_merge_remaining_fraction() -> f64 {
+    0.67
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SizingConfig {
     pub open_sizes_bb: Vec<f64>,
@@ -62,7 +69,13 @@ pub struct SizingConfig {
     #[serde(default)]
     pub four_bet_multiplier: Option<f64>,
     pub fixed_raise_to_bb: FixedRaiseConfig,
+    /// Legacy metadata; the current tree always offers a 5bet jam.
     pub five_bet_all_in: bool,
+    #[serde(default = "default_five_bet_multiplier")]
+    pub five_bet_multiplier: f64,
+    /// Merge the fixed 5bet when its additional chips reach this fraction of remaining chips.
+    #[serde(default = "default_five_bet_merge_remaining_fraction")]
+    pub five_bet_merge_remaining_fraction: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LimpConfig {
@@ -194,6 +207,14 @@ impl PreflopConfig {
             positive_chips(size, "fixed raise target")?;
         }
         nonnegative_chips(f.squeeze.per_additional_caller, "squeeze increment")?;
+        if !self.sizing.five_bet_multiplier.is_finite() || self.sizing.five_bet_multiplier <= 1.0 {
+            bail!("five_bet_multiplier must be finite and greater than one");
+        }
+        if !self.sizing.five_bet_merge_remaining_fraction.is_finite()
+            || !(0.0..=1.0).contains(&self.sizing.five_bet_merge_remaining_fraction)
+        {
+            bail!("five_bet_merge_remaining_fraction must be in [0,1]");
+        }
         if !self.sizing.five_bet_all_in {
             bail!("P1 requires five_bet_all_in=true");
         }
@@ -288,6 +309,21 @@ mod tests {
         assert!(hu.is_ip(0, 1));
         assert!(c.is_ip(0, 5));
         assert!(!c.is_ip(4, 5));
+    }
+    #[test]
+    fn five_bet_defaults_and_parameter_validation() {
+        let mut c = config();
+        assert_eq!(c.sizing.five_bet_multiplier, 2.2);
+        assert_eq!(c.sizing.five_bet_merge_remaining_fraction, 0.67);
+        c.sizing.five_bet_multiplier = 1.0;
+        assert!(c.validate().is_err());
+        c.sizing.five_bet_multiplier = f64::INFINITY;
+        assert!(c.validate().is_err());
+        c.sizing.five_bet_multiplier = 2.0;
+        for bad in [-0.01, 1.01, f64::NAN] {
+            c.sizing.five_bet_merge_remaining_fraction = bad;
+            assert!(c.validate().is_err());
+        }
     }
     #[test]
     fn rake_no_flop_no_drop_and_cap() {
