@@ -6,6 +6,7 @@
 <title>ReysonGTO 進捗</title>
 <style>
 :root {
+  color-scheme: light dark;
   --bg: #f6f5f1;
   --panel: #ffffff;
   --ink: #1d1d1b;
@@ -200,6 +201,22 @@ li .live { color: var(--accent); font-weight: 600; margin-left: 6px; font-varian
 .mx span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
 .mx.none { background: transparent; color: var(--faint); opacity: .45; }
 .note { color: var(--muted); font-size: 12px; margin-top: 14px; }
+
+/* Jobs */
+.jobs { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; margin-top: 16px; }
+@media (max-width: 860px) { .jobs { grid-template-columns: 1fr; } }
+.jobs > * { min-width: 0; }
+.st-pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 99px; white-space: nowrap; }
+.st-pill.done { background: var(--accent); color: var(--panel); }
+.st-pill.running { background: var(--accent-soft); color: var(--accent); }
+.st-pill.pending, .st-pill.waiting { background: var(--track); color: var(--faint); }
+.st-pill.failed { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+.steps { list-style: none; margin: 0; padding: 0; }
+.steps li { display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.steps li:last-child { border-bottom: 0; }
+pre.logt { margin: 10px 0 0; padding: 10px; background: var(--bg); border-radius: 8px; font: 11px/1.5 var(--mono); color: var(--muted);
+  white-space: pre-wrap; word-break: break-all; max-height: 140px; overflow: auto; }
+.speed { font-weight: 650; }
 </style>
 </head>
 <body>
@@ -241,6 +258,19 @@ li .live { color: var(--accent); font-weight: 600; margin-left: 6px; font-varian
     </div>
   </div>
 
+
+  <section class="jobs" id="jobsec" hidden>
+    <div class="panel">
+      <h2>f32 の比較（3 ボード × 3 つの精度、目標 0.5%）</h2>
+      <div class="scroll"><table id="f32tab"></table></div>
+      <p class="feat" style="margin:10px 0 0">速さは同じボードの f64 との比較（かかった時間の比）。exploitability は f32 でも f64 で測った値。</p>
+    </div>
+    <div class="panel">
+      <h2>プリフロップ P4 の試し解き</h2>
+      <ul class="steps" id="p4steps"></ul>
+      <pre class="logt" id="p4log"></pre>
+    </div>
+  </section>
   <section class="panel">
     <h2>ボードごと（完了したボードを押すと BTN のフロップ戦略）</h2>
     <div class="legend">
@@ -318,6 +348,7 @@ function spark(trail, target) {
 
 function render(s) {
   boards = Object.fromEntries(s.boards.map((b) => [b.flop, b]));
+  renderJobs(s.jobs);
   const r = s.roadmap || { milestones: [] };
   $("goal").textContent = r.goal || "";
   $("stamp").textContent = `更新 ${new Date(s.now * 1000).toLocaleTimeString("ja-JP")}・15 秒ごと`;
@@ -484,6 +515,34 @@ document.addEventListener("click", (e) => {
   const t = e.target.closest("[data-flop]");
   if (t && !e.target.closest("#sheet")) openBoard(t.dataset.flop);
 });
+
+const MODE = { f64: "f64（今まで）", f32: "f32", wide: "f32＋wide" };
+const STATE = { done: "完了", running: "実行中", pending: "待ち", waiting: "待ち", failed: "失敗" };
+function renderJobs(j) {
+  $("jobsec").hidden = !j;
+  if (!j) return;
+  const runs = j.f32cmp.runs;
+  const base = Object.fromEntries(runs.filter((r) => r.mode === "f64" && r.state === "done").map((r) => [r.board, r]));
+  $("f32tab").innerHTML = `<tr><th>ボード</th><th>精度</th><th>状態</th><th class="num">時間</th><th class="num">速さ</th><th class="num">メモリ</th><th class="num">反復</th><th class="num">exploit.</th><th class="num">BTN EV 差</th></tr>` +
+    runs.map((r) => {
+      const b = base[r.board];
+      const speed = r.state === "done" && b && r.wall ? b.wall / r.wall : null;
+      const dev = r.state === "done" && b && r.btn_ev_bb != null && r.mode !== "f64" ? r.btn_ev_bb - b.btn_ev_bb : null;
+      const time = r.state === "done" ? dur(r.wall) : r.state === "running" ? `${dur(r.elapsed)}…` : "–";
+      return `<tr><td style="font-family:var(--mono)">${r.board}</td><td>${MODE[r.mode]}</td>
+        <td><span class="st-pill ${r.state}">${STATE[r.state]}</span></td>
+        <td class="num">${time}</td>
+        <td class="num speed" style="color:${speed > 1.02 ? "var(--accent)" : speed && speed < 0.98 ? "var(--warn)" : "inherit"}">${speed ? (r.mode === "f64" ? "基準" : `${speed.toFixed(2)}×`) : "–"}</td>
+        <td class="num">${r.rss ? (r.rss / 2 ** 30).toFixed(1) + " GB" : "–"}</td>
+        <td class="num">${r.iterations ?? r.iteration ?? "–"}</td>
+        <td class="num">${r.exploit_pct != null ? r.exploit_pct.toFixed(2) + "%" : "–"}</td>
+        <td class="num">${dev != null ? (dev >= 0 ? "+" : "") + dev.toFixed(4) + " BB" : "–"}</td></tr>`;
+    }).join("");
+  const p4 = j.p4;
+  $("p4steps").innerHTML = p4.steps.map((s) => `<li><span>${s.name}</span><span class="st-pill ${s.state}">${STATE[s.state]}</span></li>`).join("");
+  const lines = [...p4.log, ...p4.equity_tail, ...p4.solve_tail];
+  $("p4log").textContent = lines.length ? lines.join("\n") : "まだ出力はありません";
+}
 async function tick() {
   try {
     const res = await fetch("/api/status", { cache: "no-store" });
