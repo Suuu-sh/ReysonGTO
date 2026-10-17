@@ -44,11 +44,11 @@
         },
         {
           "text": "120 ボードの結果から、フロップの規則の表を作る（特徴ごとに多数決）",
-          "status": "todo"
+          "status": "done"
         },
         {
           "text": "確認用 40 ボードを同じ方法で解く（m4b の続き）",
-          "status": "active",
+          "status": "done",
           "live": "validation"
         },
         {
@@ -92,15 +92,19 @@
           "status": "done"
         },
         {
-          "text": "PR #27：本番の木で f64 / f32 / f32+wide-totals の時間・メモリ・EV・exploitability を比べる（M4 の後）",
-          "status": "todo"
+          "text": "PR #27：本番の木で f64 / f32 / f32+wide を比較（f32 は 1 反復 4〜11% 速いだけ、メモリは増える）",
+          "status": "done"
         },
         {
-          "text": "比較の結果を見て、f32 を本番で使うか決める",
-          "status": "todo"
+          "text": "f32 は本番で使わない（オプトインの機能として残す）と決定",
+          "status": "done"
         },
         {
           "text": "i16 保存を標準にするか、精度への影響を測って決める",
+          "status": "todo"
+        },
+        {
+          "text": "収束の確認（metrics）の時間を減らす（1 回の解きの約 2 割）",
           "status": "todo"
         }
       ]
