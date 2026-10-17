@@ -29,17 +29,52 @@
       "detail": "候補サイズごとに解いて EV で選び、特徴から決める表にする。損失の目標は平均でポットの 0.1% 未満、最大 0.5% 未満",
       "status": "active",
       "tasks": [
-        { "text": "フロップ 20 ボードの試行（m4a）", "status": "done" },
-        { "text": "フロップ 120 ボード：4 サイズを 5% → 上位 2 つを 0.5%（m4b, Mac）", "status": "done", "live": "training" },
-        { "text": "EC2 で 280 ボードに広げる仕組み（シャード・一発セットアップ）", "status": "done" },
-        { "text": "120 ボードの結果から、フロップの規則の表を作る（特徴ごとに多数決）", "status": "todo" },
-        { "text": "確認用 40 ボードを同じ方法で解く（m4b の続き）", "status": "active", "live": "validation" },
-        { "text": "規則のサイズと最適なサイズの損失を確認用ボードで測る", "status": "todo" },
-        { "text": "ベットする側（IP / OOP）と、チェックのあとかどうかで規則を分ける", "status": "todo" },
-        { "text": "フロップの均衡からターン開始時の到達レンジを取り出す API", "status": "todo" },
-        { "text": "ターンのサイズ比較（流れ 2 × カードの種類 6 × ベットする側 2、約 4,800 状況、EC2）", "status": "todo" },
-        { "text": "リバーのサイズ比較", "status": "todo" },
-        { "text": "ターン・リバーの規則の表と確認", "status": "todo" }
+        {
+          "text": "フロップ 20 ボードの試行（m4a）",
+          "status": "done"
+        },
+        {
+          "text": "フロップ 120 ボード：4 サイズを 5% → 上位 2 つを 0.5%（m4b, Mac）",
+          "status": "done",
+          "live": "training"
+        },
+        {
+          "text": "EC2 で 280 ボードに広げる仕組み（シャード・一発セットアップ）",
+          "status": "done"
+        },
+        {
+          "text": "120 ボードの結果から、フロップの規則の表を作る（特徴ごとに多数決）",
+          "status": "active"
+        },
+        {
+          "text": "確認用 40 ボードを同じ方法で解く（m4b の続き）",
+          "status": "done",
+          "live": "validation"
+        },
+        {
+          "text": "規則のサイズと最適なサイズの損失を確認用ボードで測る",
+          "status": "todo"
+        },
+        {
+          "text": "ベットする側（IP / OOP）と、チェックのあとかどうかで規則を分ける",
+          "status": "todo"
+        },
+        {
+          "text": "フロップの均衡からターン開始時の到達レンジを取り出す API",
+          "status": "todo"
+        },
+        {
+          "text": "ターンのサイズ比較（流れ 2 × カードの種類 6 × ベットする側 2、約 4,800 状況、EC2）",
+          "status": "todo"
+        },
+        {
+          "text": "リバーのサイズ比較",
+          "status": "todo"
+        },
+        {
+          "text": "ターン・リバーの規則の表と確認",
+          "status": "todo"
+        }
       ]
     },
     {
@@ -48,11 +83,30 @@
       "detail": "本番の木での時間・メモリを下げる",
       "status": "active",
       "tasks": [
-        { "text": "第 1 段階：解を変えない高速化（PR #26）", "status": "done" },
-        { "text": "第 2 段階：計算途中の値を f32 に（PR #27、オプトインでマージ済み）", "status": "done" },
-        { "text": "PR #27：本番の木で f64 / f32 / f32+wide-totals の時間・メモリ・EV・exploitability を比べる（M4 の後）", "status": "todo" },
-        { "text": "比較の結果を見て、f32 を本番で使うか決める", "status": "todo" },
-        { "text": "i16 保存を標準にするか、精度への影響を測って決める", "status": "todo" }
+        {
+          "text": "第 1 段階：解を変えない高速化（PR #26）",
+          "status": "done"
+        },
+        {
+          "text": "第 2 段階：計算途中の値を f32 に（PR #27、オプトインでマージ済み）",
+          "status": "done"
+        },
+        {
+          "text": "PR #27：本番の木で f64 / f32 / f32+wide を比較（f32 は 1 反復 4〜11% 速いだけ、メモリは増える）",
+          "status": "done"
+        },
+        {
+          "text": "f32 は本番で使わない（オプトインの機能として残す）と決定",
+          "status": "done"
+        },
+        {
+          "text": "i16 保存を標準にするか、精度への影響を測って決める",
+          "status": "todo"
+        },
+        {
+          "text": "収束の確認（metrics）の時間を減らす（1 回の解きの約 2 割）",
+          "status": "todo"
+        }
       ]
     },
     {
@@ -61,9 +115,18 @@
       "detail": "エクイティ × 実現率。レンジを ReysonAI の形式で出す",
       "status": "active",
       "tasks": [
-        { "text": "P1–P3：プリフロップ木・エクイティ・BTN vs BB の HU DCFR", "status": "done" },
-        { "text": "P4：6 人全体を解く", "status": "todo" },
-        { "text": "レンジを ReysonAI の形式で出力", "status": "todo" }
+        {
+          "text": "P1–P3：プリフロップ木・エクイティ・BTN vs BB の HU DCFR",
+          "status": "done"
+        },
+        {
+          "text": "P4：6 人全体を解く",
+          "status": "todo"
+        },
+        {
+          "text": "レンジを ReysonAI の形式で出力",
+          "status": "todo"
+        }
       ]
     },
     {
@@ -79,8 +142,14 @@
       "detail": "確定したレンジで全 1,755 フロップを 0.3% 以下まで。再開でき、EC2 でも動く",
       "status": "todo",
       "tasks": [
-        { "text": "本番の精度を 0.3% にするか 0.2% にするか決める", "status": "todo" },
-        { "text": "1,755 フロップの batch 実行と再開", "status": "todo" }
+        {
+          "text": "本番の精度を 0.3% にするか 0.2% にするか決める",
+          "status": "todo"
+        },
+        {
+          "text": "1,755 フロップの batch 実行と再開",
+          "status": "todo"
+        }
       ]
     },
     {
@@ -89,8 +158,14 @@
       "detail": "結果の受け渡しと画面での表示",
       "status": "todo",
       "tasks": [
-        { "text": "API の呼び方を決める（ブラウザから直接か、Worker 経由か）", "status": "todo" },
-        { "text": "ターン・リバーをその場で解く場所を決める（WebAssembly かサーバーか）", "status": "todo" }
+        {
+          "text": "API の呼び方を決める（ブラウザから直接か、Worker 経由か）",
+          "status": "todo"
+        },
+        {
+          "text": "ターン・リバーをその場で解く場所を決める（WebAssembly かサーバーか）",
+          "status": "todo"
+        }
       ]
     },
     {
@@ -99,9 +174,18 @@
       "detail": "BTN vs BB 以外の HU SRP と 3BET ポット（4BET 以降は対象外）",
       "status": "todo",
       "tasks": [
-        { "text": "ほかの HU SRP の組み合わせ（ポジションごと）のサイズ規則と batch", "status": "todo" },
-        { "text": "3BET ポットのサイズ規則（候補 25 / 33 / 66 / 100 / 125%）", "status": "todo" },
-        { "text": "3BET ポットの batch", "status": "todo" }
+        {
+          "text": "ほかの HU SRP の組み合わせ（ポジションごと）のサイズ規則と batch",
+          "status": "todo"
+        },
+        {
+          "text": "3BET ポットのサイズ規則（候補 25 / 33 / 66 / 100 / 125%）",
+          "status": "todo"
+        },
+        {
+          "text": "3BET ポットの batch",
+          "status": "todo"
+        }
       ]
     }
   ]
