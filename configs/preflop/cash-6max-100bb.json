@@ -1,0 +1,30 @@
+{
+  "game": "Cash",
+  "players": 6,
+  "stack_bb": 100.0,
+  "ante_bb": 0.0,
+  "rake": {
+    "rate": 0.05,
+    "cap_bb": 3.0,
+    "no_flop_no_drop": true,
+    "label": "5%・上限3BB"
+  },
+  "positions": ["UTG", "HJ", "CO", "BTN", "SB", "BB"],
+  "sizing": {
+    "open_sizes_bb": [2.5],
+    "open_sizes_by_position": { "SB": 3.5 },
+    "limp": { "sb_complete_to_bb": 1.0 },
+    "fixed_raise_to_bb": {
+      "three_bet": { "ip": 8.0, "oop": 12.0 },
+      "three_bet_vs_sb_open": 10.5,
+      "iso_vs_limp": 3.5,
+      "limp_reraise": 10.5,
+      "squeeze": { "ip": 12.0, "oop": 13.0, "per_additional_caller": 2.5 },
+      "four_bet": { "ip": 26.0, "oop": 20.0 },
+      "four_bet_vs_bb_three_bet_from_sb": 24.0
+    },
+    "five_bet_all_in": true,
+    "five_bet_multiplier": 2.2,
+    "five_bet_merge_remaining_fraction": 0.67
+  }
+}
