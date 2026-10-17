@@ -72,6 +72,9 @@ enum Command {
         /// Omit per-node class arrays to keep large-tree smoke reports bounded.
         #[arg(long)]
         summary_only: bool,
+        /// Seats evaluated concurrently in a multiway report (each holds ~165 MB of caches).
+        #[arg(long, default_value_t = preflop::cfr::DEFAULT_REPORT_PARALLELISM)]
+        report_threads: usize,
         /// Use the frozen M5 betting tree for historical two-player regression.
         #[arg(long)]
         legacy_hu: bool,
@@ -235,6 +238,7 @@ fn main() -> Result<()> {
             heads_up,
             equity_3way,
             summary_only,
+            report_threads,
             legacy_hu,
             config,
             equity,
@@ -267,6 +271,7 @@ fn main() -> Result<()> {
                 .map_err(anyhow::Error::msg)?;
             let mut solver = PreflopSolver::new_with_three_way(tree, table, realization, three_way)
                 .map_err(anyhow::Error::msg)?;
+            solver.set_report_parallelism(report_threads);
             let mut checkpoints = Vec::new();
             let initial = serde_json::to_value(if summary_only {
                 solver.report_summary()

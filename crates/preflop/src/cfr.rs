@@ -93,7 +93,13 @@ pub struct PreflopSolver {
     equity: EquityTable,
     three_way: Option<ThreeWayEquityTable>,
     ordered_three: Option<std::sync::Arc<Vec<f64>>>,
+    /// Seats evaluated at once in a multiway report. Each owns caches of roughly
+    /// 165 MB with the production 3-way table, so this bounds report memory
+    /// independently of the Rayon pool size.
+    report_parallelism: usize,
 }
+/// Default concurrent seat evaluations in a multiway report.
+pub const DEFAULT_REPORT_PARALLELISM: usize = 2;
 impl PreflopSolver {
     pub fn new(
         tree: PreflopTree,
@@ -247,7 +253,11 @@ impl PreflopSolver {
                 .map(|t| std::sync::Arc::new(t.ordered_hero_shares())),
             three_way,
             realization,
+            report_parallelism: DEFAULT_REPORT_PARALLELISM,
         })
+    }
+    pub fn set_report_parallelism(&mut self, seats: usize) {
+        self.report_parallelism = seats.max(1);
     }
     fn multi_walk(
         &mut self,
@@ -399,18 +409,24 @@ impl PreflopSolver {
             // Each counterfactual traversal is independent and owns bounded
             // caches. Indexed collection preserves seat order; HU and the
             // alternating training updates retain their original serial path.
-            let values: Vec<_> = (0..self.tree.config.players)
-                .into_par_iter()
-                .map(|p| {
-                    let reach = vec![vec![1.0; COMBO_COUNT]; self.tree.config.players];
-                    [false, true].map(|best| {
-                        self.multi_evaluate(self.tree.root, p, &strategy, &reach, best)
-                            .iter()
-                            .sum::<f64>()
-                            / COMBO_COUNT as f64
-                    })
-                })
-                .collect();
+            let seats: Vec<usize> = (0..self.tree.config.players).collect();
+            let mut values = Vec::with_capacity(seats.len());
+            for chunk in seats.chunks(self.report_parallelism) {
+                values.extend(
+                    chunk
+                        .par_iter()
+                        .map(|&p| {
+                            let reach = vec![vec![1.0; COMBO_COUNT]; self.tree.config.players];
+                            [false, true].map(|best| {
+                                self.multi_evaluate(self.tree.root, p, &strategy, &reach, best)
+                                    .iter()
+                                    .sum::<f64>()
+                                    / COMBO_COUNT as f64
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
             for (p, value) in values.into_iter().enumerate() {
                 profile[p] = value[0];
                 br[p] = value[1];
@@ -1779,6 +1795,14 @@ mod tests {
             .all(|s| s.regret.len() % CLASS_COUNT == 0 && s.regret.len() < COMBO_COUNT));
         solver.run(5);
         let early = solver.report();
+        // Bounding concurrent seat evaluations must not change any report value.
+        for seats in [1, 3] {
+            solver.set_report_parallelism(seats);
+            let bounded = solver.report();
+            assert_eq!(bounded.profile_ev_bb, early.profile_ev_bb);
+            assert_eq!(bounded.best_response_ev_bb, early.best_response_ev_bb);
+        }
+        solver.set_report_parallelism(DEFAULT_REPORT_PARALLELISM);
         solver.run(95);
         let late = solver.report();
         eprintln!(
