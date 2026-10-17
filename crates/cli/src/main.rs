@@ -562,6 +562,11 @@ fn run_solve(args: SolveArgs, subgame: bool) -> Result<()> {
     {
         bail!("snapshot contains size rules; explicit bet overrides require a replacement --size-rules table");
     }
+    // An explicit preset chooses its own sizing; silently restoring the snapshot's
+    // rules on top of it would run a hybrid of the two.
+    if args.size_rules.is_none() && size_rules.is_some() && args.preset.is_some() {
+        bail!("snapshot contains size rules; with an explicit --preset pass --size-rules to choose the sizing");
+    }
     if let Some(table) = &size_rules {
         table.validate().map_err(|e| anyhow!(e))?;
     }
@@ -1465,6 +1470,23 @@ mod tests {
             serde_json::from_slice(&fs::read(&restored_report).unwrap()).unwrap();
         assert_eq!(actual["game_spec"], restored["game_spec"]);
         assert_eq!(actual["metrics"], restored["metrics"]);
+        // An explicit preset never runs on top of the snapshot's inherited rules.
+        let Command::SolveSubgame(mixed) = Cli::try_parse_from([
+            "cli",
+            "solve-subgame",
+            "--state",
+            ruled_snapshot.to_str().unwrap(),
+            "--preset",
+            "benchmark",
+            "--out",
+            dir.join("mixed-report.json").to_str().unwrap(),
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        assert!(run_solve(mixed, true).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

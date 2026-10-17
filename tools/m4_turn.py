@@ -96,6 +96,11 @@ def run_attempt(directory, identity, deadline, build, validate):
     return record
 
 
+def chips(bb):
+    """BB to chips exactly as the CLI's chips_at: f64 multiply, round half away from zero."""
+    return math.floor(bb * 1000 + 0.5)
+
+
 def validate_solution(directory, board, args, pot):
     report = json.loads((directory/'solution.json').read_text())
     spec = report['game_spec']
@@ -135,7 +140,8 @@ def engine_args(args, target, directory):
     return ['--threads', str(args.threads), '--memory-mb', str(args.memory_mb),
             '--storage', 'f32', '--algorithm', 'dcfr', '--dcfr-alpha', '1.5',
             '--dcfr-beta', '0', '--dcfr-gamma', '2', '--target', str(target),
-            '--max-iters', str(args.max_iters), '--progress-jsonl', str(directory/'progress.jsonl'),
+            '--max-iters', str(args.max_iters), '--max-seconds', str(args.max_solve_seconds),
+            '--progress-jsonl', str(directory/'progress.jsonl'),
             '--out', str(directory/'solution.json')]
 
 
@@ -153,7 +159,7 @@ def solve_flop(args, selected, cards, identity, deadline):
                    '--reach-requests', str(d/'reach-requests.json')] + engine_args(args, args.flop_target, d)
         return command, [d/'solution.json', d/'rules.json', d/'reach-requests.json']+[Path(r['out']) for r in requests]
     def validate(d):
-        validate_solution(d, board, args, args.pot * 1000)
+        validate_solution(d, board, args, chips(args.pot))
         metrics = read_metrics(d/'solution.json', args.flop_target, 1)
         if not metrics['target_met']:
             raise ValueError('flop target not met; refusing inaccurate reach source')
@@ -244,13 +250,13 @@ def main(argv=None):
     parser.add_argument('--lines', default='XX,BC')
     for name, default in [('threads', 4), ('memory-mb', 16384), ('max-iters', 10000), ('per-kind', 1), ('seed', 20261015)]:
         parser.add_argument('--'+name, type=int, default=default)
-    for name, default in [('coarse-target', 5.), ('fine-target', .5), ('flop-target', 1.), ('max-hours', 8.), ('pot', 5.5), ('stack', 97.5)]:
+    for name, default in [('coarse-target', 5.), ('fine-target', .5), ('flop-target', 1.), ('max-hours', 8.), ('max-solve-seconds', 7200.), ('pot', 5.5), ('stack', 97.5)]:
         parser.add_argument('--'+name, type=float, default=default)
     args = parser.parse_args(argv)
     args.lines = args.lines.split(',')
     if not args.lines or len(set(args.lines)) != len(args.lines) or any(x not in LINES for x in args.lines):
         parser.error('--lines must be XX, BC, or XX,BC')
-    if min(args.threads, args.memory_mb, args.max_iters, args.per_kind) <= 0 or any(not math.isfinite(x) or x <= 0 for x in [args.coarse_target, args.fine_target, args.flop_target, args.max_hours, args.pot, args.stack]) or args.fine_target > args.coarse_target:
+    if min(args.threads, args.memory_mb, args.max_iters, args.per_kind) <= 0 or any(not math.isfinite(x) or x <= 0 for x in [args.coarse_target, args.fine_target, args.flop_target, args.max_hours, args.max_solve_seconds, args.pot, args.stack]) or args.fine_target > args.coarse_target:
         parser.error('positive finite resources and fine-target <= coarse-target required')
     for key, value in vars(args).items():
         if isinstance(value, Path):
@@ -264,7 +270,7 @@ def main(argv=None):
         if args.flops.isdigit():
             paths.append(args.manifest)
         paths += sorted(ROOT.glob('crates/**/*.rs')) + sorted(ROOT.glob('crates/**/Cargo.toml')) + [ROOT/'Cargo.lock', ROOT/'Cargo.toml']
-        config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k not in ('out', 'report', 'max_hours')}
+        config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k not in ('out', 'report', 'max_hours', 'max_solve_seconds')}
         provenance = dict(hashes={str(p): m3.digest(p) for p in paths}, config=config, selection=selection)
     except (OSError, ValueError, KeyError) as e:
         parser.error(str(e))

@@ -115,6 +115,11 @@ class RunnerTests(unittest.TestCase):
             assert summary['winner_counts'] == {'Blank/p0': {'33': 1}, 'Blank/p1': {'125': 1}}
             assert 'Completed situations: 2 / 2' in args.report.read_text()
 
+    def test_chips_match_cli_rounding(self):
+        self.assertEqual(turn.chips(5.5), 5500)
+        self.assertEqual(turn.chips(5.5004), 5500)
+        self.assertEqual(turn.chips(2.5005), 2501)
+
     def test_metrics(self):
         with tempfile.TemporaryDirectory() as d:
             test_select_flops_and_metrics(Path(d))
