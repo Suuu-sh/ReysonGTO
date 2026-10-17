@@ -210,6 +210,7 @@ li .live { color: var(--accent); font-weight: 600; margin-left: 6px; font-varian
 .st-pill.done { background: var(--accent); color: var(--panel); }
 .st-pill.running { background: var(--accent-soft); color: var(--accent); }
 .st-pill.pending, .st-pill.waiting { background: var(--track); color: var(--faint); }
+.st-pill.stopped { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
 .st-pill.failed { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
 .steps { list-style: none; margin: 0; padding: 0; }
 .steps li { display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
@@ -269,6 +270,19 @@ pre.logt { margin: 10px 0 0; padding: 10px; background: var(--bg); border-radius
       <h2>プリフロップ P4 の試し解き</h2>
       <ul class="steps" id="p4steps"></ul>
       <pre class="logt" id="p4log"></pre>
+    </div>
+  </section>
+
+  <section class="jobs" id="jobsec2" hidden>
+    <div class="panel">
+      <h2>ターンのサイズ比較（試し実行）</h2>
+      <div id="turnhead"></div>
+      <div class="scroll" style="margin-top:12px"><table id="turntab"></table></div>
+      <p class="feat" style="margin:10px 0 0">流れ：XX＝フロップでチェック・チェック、BC＝ベット・コール。ベットする側：OOP の先打ち／IP のチェック後のベット。差が誤差（両方の解の精度）以下なら薄く表示。</p>
+    </div>
+    <div class="panel">
+      <h2>Codex の作業</h2>
+      <ul class="steps" id="codexlist"></ul>
     </div>
   </section>
   <section class="panel">
@@ -519,7 +533,9 @@ document.addEventListener("click", (e) => {
 });
 
 const MODE = { f64: "f64（今まで）", f32: "f32", wide: "f32＋wide" };
-const STATE = { done: "完了", running: "実行中", pending: "待ち", waiting: "待ち", failed: "失敗" };
+const STATE = { done: "完了", running: "実行中", pending: "待ち", waiting: "待ち", failed: "失敗", stopped: "停止中" };
+const KIND = { BoardPair: "ボードがペア", FlushComplete: "フラッシュ完成", StraightComplete: "ストレート完成", Overcard: "オーバーカード", FlushDraw: "フラッシュドロー", Blank: "ブランク" };
+const BETTOR = { 0: "OOP 先打ち", 1: "IP チェック後" };
 function renderJobs(j) {
   $("jobsec").hidden = !j;
   if (!j) return;
@@ -540,6 +556,20 @@ function renderJobs(j) {
         <td class="num">${r.exploit_pct != null ? r.exploit_pct.toFixed(2) + "%" : "–"}</td>
         <td class="num">${dev != null ? (dev >= 0 ? "+" : "") + dev.toFixed(4) + " BB" : "–"}</td></tr>`;
     }).join("");
+  const t = j.turn;
+  $("jobsec2").hidden = !t;
+  if (t) {
+    const done = t.spots.filter((x) => x.complete).length;
+    const run = t.running;
+    $("turnhead").innerHTML = `<div class="counts">${t.flops.map((f) => `${f.flop}（${Object.entries(f.kinds).filter(([, c]) => c.length).map(([k, c]) => `${KIND[k] || k} ${c.join(" ")}`).join("・")}）`).join("<br>") || "準備中"}</div>
+      <div style="margin-top:8px"><b>${done}</b> / ${t.expected || "?"} 状況 ${t.finished ? `<span class="st-pill done">完了</span>` : `<span class="st-pill running">実行中</span>`}</div>
+      ${run ? `<div class="meta" style="margin-top:6px">いま：${esc(run.path)}・${run.iteration ?? 0} 回・exploitability ${run.exploit_pct != null ? run.exploit_pct.toFixed(2) + "%" : "–"}・${dur(run.elapsed)}</div>` : ""}`;
+    $("turntab").innerHTML = `<tr><th>流れ</th><th>ターン</th><th>ベットする側</th><th>勝ったサイズ</th><th class="num">EV 差 (BB)</th><th class="num">時間</th></tr>` +
+      t.spots.map((x) => `<tr style="${x.indistinguishable_by_proxy ? "opacity:.55" : ""}"><td>${x.line}</td><td style="font-family:var(--mono)">${x.card} <span class="feat">${KIND[x.kind] || x.kind}</span></td>
+        <td>${BETTOR[x.bettor] ?? x.bettor}</td><td>${x.complete ? `<span class="tag t${x.observed_winner}">${x.observed_winner}%</span>` : `<span class="st-pill failed">未完了</span>`}</td>
+        <td class="num">${x.gap_bb != null ? x.gap_bb.toFixed(4) : "–"}</td><td class="num">${dur(x.seconds)}</td></tr>`).join("");
+  }
+  $("codexlist").innerHTML = (j.codex || []).length ? j.codex.map((c) => `<li><span>${esc(c.dir)}</span><span class="counts">${esc(c.elapsed)}</span></li>`).join("") : `<li><span class="feat">動いている Codex の作業はありません</span></li>`;
   const p4 = j.p4;
   $("p4steps").innerHTML = p4.steps.map((s) => `<li><span>${s.name}</span><span class="st-pill ${s.state}">${STATE[s.state]}</span></li>`).join("");
   const lines = [...p4.log, ...p4.equity_tail, ...p4.solve_tail];
