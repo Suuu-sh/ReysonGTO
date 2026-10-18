@@ -284,6 +284,7 @@ def summarize(args, manifest, spots, failures):
 
 
 def main(argv=None):
+    global SIZES
     parser = argparse.ArgumentParser(description=__doc__)
     for name, default in [('binary', ROOT/'target/release/cli'), ('sizing-binary', ROOT/'target/release/sizing'),
                           ('out', ROOT/'data/m4-turn'), ('report', ROOT/'docs/benchmarks/m4-turn.md'),
@@ -294,12 +295,17 @@ def main(argv=None):
     parser.add_argument('--other-side-rules', type=Path, help='full rules for all non-compared decisions')
     parser.add_argument('--flops', default='20', help='first N training flops, or comma separated boards')
     parser.add_argument('--lines', default='XX,BC')
+    parser.add_argument('--sizes', default=','.join(map(str, SIZES)), help='candidate bet sizes in percent of the pot')
     for name, default in [('threads', 4), ('memory-mb', 16384), ('max-iters', 10000), ('per-kind', 1), ('seed', 20261015)]:
         parser.add_argument('--'+name, type=int, default=default)
     for name, default in [('coarse-target', 5.), ('fine-target', .5), ('flop-target', 1.), ('max-hours', 8.), ('max-solve-seconds', 7200.), ('pot', 5.5), ('stack', 97.5)]:
         parser.add_argument('--'+name, type=float, default=default)
     args = parser.parse_args(argv)
     args.lines = args.lines.split(',')
+    # Candidates are part of the run's identity through vars(args).
+    SIZES = tuple(int(x) for x in args.sizes.split(','))
+    if len(SIZES) < 2 or len(set(SIZES)) != len(SIZES) or min(SIZES) <= 0:
+        parser.error('--sizes needs at least two distinct positive sizes')
     if not args.lines or len(set(args.lines)) != len(args.lines) or any(x not in LINES for x in args.lines):
         parser.error('--lines must be XX, BC, or XX,BC')
     if min(args.threads, args.memory_mb, args.max_iters, args.per_kind) <= 0 or any(not math.isfinite(x) or x <= 0 for x in [args.coarse_target, args.fine_target, args.flop_target, args.max_hours, args.max_solve_seconds, args.pot, args.stack]) or args.fine_target > args.coarse_target:
