@@ -1,6 +1,7 @@
 //! Readable decision table from board features to one bet size (design 12.3–12.4).
 use crate::features::{
-    flop_features, runout_card, Connectivity, Height, Pairing, RunoutCard, SuitPattern,
+    board_pairing, flop_features, runout_card, BoardPairing, Connectivity, Height, Pairing,
+    RunoutCard, SuitPattern,
 };
 use cards::Card;
 use serde::{Deserialize, Serialize};
@@ -16,9 +17,11 @@ pub struct Rule {
     pub player: Option<usize>,
     /// The first bet of the street (not a raise). Rules only size first bets; raises use the multiplier.
     pub after_check: Option<bool>,
-    pub previous_street_bet: Option<bool>,
+    pub previous_street_line: Option<tree::PreviousStreetLine>,
     pub height: Option<Height>,
     pub pairing: Option<Pairing>,
+    /// Rank multiplicities of the entire current board; omitted means wildcard.
+    pub board_pairing: Option<BoardPairing>,
     pub suits: Option<SuitPattern>,
     pub connectivity: Option<Connectivity>,
     /// Turn/river only: what the new card changed.
@@ -46,9 +49,10 @@ pub struct Situation {
     pub street: Street,
     pub player: usize,
     pub after_check: bool,
-    pub previous_street_bet: Option<bool>,
+    pub previous_street_line: Option<tree::PreviousStreetLine>,
     pub height: Height,
     pub pairing: Pairing,
+    pub board_pairing: Option<BoardPairing>,
     pub suits: SuitPattern,
     pub connectivity: Connectivity,
     pub runout: Option<RunoutCard>,
@@ -67,9 +71,10 @@ impl Situation {
             street: c.street,
             player: c.player,
             after_check: c.after_check,
-            previous_street_bet: c.previous_street_bet,
+            previous_street_line: c.previous_street_line,
             height: flop.height,
             pairing: flop.pairing,
+            board_pairing: Some(board_pairing(&board)),
             suits: flop.suits,
             connectivity: flop.connectivity,
             runout,
@@ -94,14 +99,20 @@ impl Rule {
         check!(street, s.street);
         check!(player, s.player);
         check!(after_check, s.after_check);
-        if let Some(value) = self.previous_street_bet {
-            if s.previous_street_bet != Some(value) {
+        if let Some(value) = self.previous_street_line {
+            if s.previous_street_line != Some(value) {
                 return None;
             }
             n += 1;
         }
         check!(height, s.height);
         check!(pairing, s.pairing);
+        if let Some(value) = self.board_pairing {
+            if s.board_pairing != Some(value) {
+                return None;
+            }
+            n += 1;
+        }
         check!(suits, s.suits);
         check!(connectivity, s.connectivity);
         if let Some(r) = self.runout {
@@ -200,8 +211,141 @@ mod tests {
             player: 1,
             first_bet: true,
             after_check: true,
-            previous_street_bet: None,
+            previous_street_line: None,
         }))
+    }
+
+    #[test]
+    fn situation_uses_entire_current_board_on_each_street() {
+        let ids: Vec<_> = ["As", "Ad", "2c", "2h", "Ac"]
+            .iter()
+            .map(|c| c.parse::<Card>().unwrap().0)
+            .collect();
+        for (len, street, expected) in [
+            (3, Street::Flop, BoardPairing::OnePair),
+            (4, Street::Turn, BoardPairing::TwoPair),
+            (5, Street::River, BoardPairing::FullHouse),
+        ] {
+            let situation = Situation::from_context(&SizeContext {
+                board: &ids[..len],
+                street,
+                player: 0,
+                first_bet: true,
+                after_check: false,
+                previous_street_line: None,
+            });
+            assert_eq!(situation.pairing, Pairing::Paired);
+            assert_eq!(situation.board_pairing, Some(expected));
+        }
+    }
+
+    #[test]
+    fn river_rules_cover_pairings_players_and_turn_histories() {
+        let table: RuleTable =
+            serde_json::from_str(include_str!("../../../configs/sizing/srp-btn-vs-bb.json"))
+                .unwrap();
+        for (board, pairing, expected) in [
+            (
+                "As7d2c9hTs",
+                BoardPairing::Unpaired,
+                [0.33, 0.33, 1.0, 0.66],
+            ),
+            ("As7d2c7hTs", BoardPairing::OnePair, [0.33, 0.33, 1.0, 0.66]),
+            ("AsAd2c2hTs", BoardPairing::TwoPair, [0.66, 0.33, 1.0, 0.66]),
+            ("AsAdAc2hTs", BoardPairing::Trips, [0.33, 0.33, 1.25, 0.66]),
+            (
+                "AsAdAc2h2s",
+                BoardPairing::FullHouse,
+                [0.66, 1.25, 1.25, 1.0],
+            ),
+            ("AsAdAcAhTs", BoardPairing::Quads, [0.33, 0.33, 0.33, 0.66]),
+        ] {
+            let ids: Vec<_> = board
+                .as_bytes()
+                .chunks(2)
+                .map(|c| std::str::from_utf8(c).unwrap().parse::<Card>().unwrap().0)
+                .collect();
+            for (i, (player, history)) in [(0, true), (0, false), (1, true), (1, false)]
+                .into_iter()
+                .enumerate()
+            {
+                let situation = Situation::from_context(&SizeContext {
+                    board: &ids,
+                    street: Street::River,
+                    player,
+                    first_bet: true,
+                    after_check: player == 1,
+                    previous_street_line: Some(if history {
+                        tree::PreviousStreetLine::IpBetCalled
+                    } else {
+                        tree::PreviousStreetLine::CheckedThrough
+                    }),
+                });
+                assert_eq!(situation.board_pairing, Some(pairing));
+                assert_eq!(
+                    table.fraction(&situation),
+                    expected[i],
+                    "{board} p{player} history={history}"
+                );
+                // Both unknown history and the opposite check context are unmatched.
+                for history in [
+                    None,
+                    Some(tree::PreviousStreetLine::LeadCalled),
+                    Some(tree::PreviousStreetLine::Raised),
+                ] {
+                    assert_eq!(
+                        table.fraction(&Situation {
+                            previous_street_line: history,
+                            ..situation
+                        }),
+                        0.66
+                    );
+                }
+                assert_eq!(
+                    table.fraction(&Situation {
+                        after_check: player != 1,
+                        ..situation
+                    }),
+                    0.66
+                );
+            }
+        }
+        for row in table
+            .rules
+            .iter()
+            .filter(|r| r.street == Some(Street::River))
+        {
+            assert_eq!(
+                row.sources,
+                ["data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"]
+            );
+        }
+        table
+            .into_size_rule()
+            .check_suit_invariance(20261019, 128)
+            .unwrap();
+    }
+
+    #[test]
+    fn board_pairing_is_optional_and_more_specific_than_wildcard() {
+        let mut table: RuleTable = serde_json::from_str(
+            r#"{
+            "version":1,"candidates":[0.33,0.66],"default_fraction":0.66,
+            "rules":[{"street":"River","fraction":0.33}]}"#,
+        )
+        .unwrap();
+        assert_eq!(table.rules[0].board_pairing, None);
+        assert_eq!(fraction_on(&table, "AsAdAc2h2s", Street::River), 0.33);
+        table.rules.push(Rule {
+            street: Some(Street::River),
+            board_pairing: Some(BoardPairing::FullHouse),
+            fraction: 1.25,
+            ..Default::default()
+        });
+        assert_eq!(fraction_on(&table, "AsAdAc2h2s", Street::River), 1.25);
+        assert_eq!(fraction_on(&table, "AsAdAc2hTs", Street::River), 0.33);
+        table.rules.clear();
+        assert_eq!(fraction_on(&table, "AsAdAc2h2s", Street::River), 0.66);
     }
 
     #[test]
@@ -225,7 +369,7 @@ mod tests {
         assert_eq!(fraction_on(&t, "KcQdTh", Street::Flop), 0.33);
         assert_eq!(fraction_on(&t, "7c7d6h", Street::Flop), 0.33);
         assert_eq!(fraction_on(&t, "AcKd4h", Street::Flop), 0.33);
-        // Unknown turn history and all river contexts retain the 66% fallback.
+        // Unknown turn and river histories retain the 66% fallback.
         assert_eq!(fraction_on(&t, "7c6d5dKs", Street::Turn), 0.66);
         assert_eq!(fraction_on(&t, "7c6d5dKs2h", Street::River), 0.66);
         t.into_size_rule()
@@ -270,7 +414,11 @@ mod tests {
                     player,
                     first_bet: true,
                     after_check: player == 1,
-                    previous_street_bet: Some(history),
+                    previous_street_line: Some(if history {
+                        tree::PreviousStreetLine::IpBetCalled
+                    } else {
+                        tree::PreviousStreetLine::CheckedThrough
+                    }),
                 };
                 let situation = Situation::from_context(&context);
                 assert_eq!(situation.runout, Some(kind), "{board}");
@@ -279,20 +427,19 @@ mod tests {
                     expected[i],
                     "{board} p{player} history={history}"
                 );
-                assert_eq!(
-                    table.fraction(&Situation {
-                        previous_street_bet: None,
-                        ..situation
-                    }),
-                    0.66
-                );
-                assert_eq!(
-                    table.fraction(&Situation {
-                        street: Street::River,
-                        ..situation
-                    }),
-                    0.66
-                );
+                for history in [
+                    None,
+                    Some(tree::PreviousStreetLine::LeadCalled),
+                    Some(tree::PreviousStreetLine::Raised),
+                ] {
+                    assert_eq!(
+                        table.fraction(&Situation {
+                            previous_street_line: history,
+                            ..situation
+                        }),
+                        0.66
+                    );
+                }
             }
         }
         for row in table

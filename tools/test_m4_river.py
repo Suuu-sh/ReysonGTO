@@ -13,11 +13,15 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import m4_river as river
 import m4_turn as turn
+from test_m4_turn import check_other_side_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class RunnerTests(unittest.TestCase):
+    def test_other_side_policy(self):
+        check_other_side_policy(self, river, 'River')
+
     def test_candidate_bettor_and_street(self):
         for bettor in (0, 1):
             table = river.candidate_rules(125, bettor)
@@ -38,7 +42,7 @@ class RunnerTests(unittest.TestCase):
         for street, player, after, expected in [('Flop',1,True,1.25), ('Turn',1,True,1.), ('Turn',0,False,.5)]:
             matches = [(sum(v is not None for k,v in row.items() if k not in ('fraction','sources')), i, row['fraction'])
                        for i,row in enumerate(result['rules'])
-                       if all(v is None or {'street':street,'player':player,'after_check':after,'previous_street_bet':False,'runout':'Blank'}.get(k)==v
+                       if all(v is None or {'street':street,'player':player,'after_check':after,'previous_street_line':'checked_through','runout':'Blank'}.get(k)==v
                               for k,v in row.items() if k not in ('fraction','sources'))]
             self.assertEqual(sorted(matches, key=lambda x:(-x[0],x[1]))[0][2], expected)
 
@@ -52,13 +56,13 @@ class RunnerTests(unittest.TestCase):
         wildcard=dict(player=1,fraction=.33)
         for rows in [[explicit,wildcard],[wildcard,explicit]]:
             table=dict(version=1,candidates=[.33,.66,1.,1.25],default_fraction=.66,rules=rows)
-            context=dict(street='Turn',player=1,after_check=True,previous_street_bet=False,runout='Blank')
+            context=dict(street='Turn',player=1,after_check=True,previous_street_line='checked_through',runout='Blank')
             self.assertEqual(choose(river.source_rules(table),context),choose(table,context))
         table=dict(version=1,candidates=[.33,.66,1.,1.25],default_fraction=.66,
-                   rules=[dict(street='Turn',previous_street_bet=True,fraction=1.),
-                          dict(street='Turn',previous_street_bet=False,fraction=.33)])
-        for previous,expected in [(True,1.),(False,.33)]:
-            self.assertEqual(choose(river.source_rules(table),dict(street='Turn',player=1,after_check=True,previous_street_bet=previous,runout='Blank')),expected)
+                   rules=[dict(street='Turn',previous_street_line='ip_bet_called',fraction=1.),
+                          dict(street='Turn',previous_street_line='checked_through',fraction=.33)])
+        for previous,expected in [('ip_bet_called',1.),('checked_through',.33)]:
+            self.assertEqual(choose(river.source_rules(table),dict(street='Turn',player=1,after_check=True,previous_street_line=previous,runout='Blank')),expected)
 
     def test_bettor_ev_losses_and_unconverged(self):
         with tempfile.TemporaryDirectory() as d:

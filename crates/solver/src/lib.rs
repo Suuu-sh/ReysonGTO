@@ -123,8 +123,12 @@ pub struct NodeStrategy {
 /// factor; private-card blockers are applied explicitly instead.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReachSnapshot {
-    #[serde(default)]
-    pub previous_street_bet: Option<bool>,
+    #[serde(
+        default,
+        alias = "previous_street_bet",
+        deserialize_with = "tree::deserialize_previous_street_line"
+    )]
+    pub previous_street_line: Option<tree::PreviousStreetLine>,
     pub source_node: usize,
     pub board: Vec<Card>,
     pub pot: i64,
@@ -196,7 +200,7 @@ pub fn solve_subgame_with_progress(
         return Err("subgame requires equal nonnegative remaining stacks".into());
     }
     let mut config = snapshot.tree_config;
-    config.previous_street_bet = snapshot.previous_street_bet;
+    config.previous_street_line = snapshot.previous_street_line;
     config.starting_pot = snapshot.pot;
     config.effective_stack = snapshot.stacks[0];
     solve_with_progress(
@@ -574,7 +578,7 @@ impl Solution {
             matches!(&parent.kind, NodeKind::Chance { children, .. } if children.contains(&node))
         });
         Ok(ReachSnapshot {
-            previous_street_bet: self.tree().previous_street_bet_at(node),
+            previous_street_line: self.tree().previous_street_line_at(node),
             source_node: node,
             board: state.board.iter().copied().map(Card).collect(),
             pot: state.pot,
@@ -886,16 +890,44 @@ mod tests {
             _ => unreachable!(),
         };
         let direct = solution.reach_snapshot(card_node).unwrap();
-        assert_eq!(direct.previous_street_bet, conditioned.previous_street_bet);
+        assert_eq!(
+            direct.previous_street_line,
+            conditioned.previous_street_line
+        );
         let mut legacy = serde_json::to_value(&conditioned).unwrap();
         legacy
             .as_object_mut()
             .unwrap()
-            .remove("previous_street_bet");
+            .remove("previous_street_line");
+        for (old, expected) in [
+            (true, None),
+            (false, Some(tree::PreviousStreetLine::CheckedThrough)),
+        ] {
+            let mut old_snapshot = legacy.clone();
+            old_snapshot["previous_street_bet"] = serde_json::json!(old);
+            assert_eq!(
+                serde_json::from_value::<ReachSnapshot>(old_snapshot)
+                    .unwrap()
+                    .previous_street_line,
+                expected
+            );
+            let mut old_config = serde_json::to_value(&conditioned.tree_config).unwrap();
+            old_config
+                .as_object_mut()
+                .unwrap()
+                .remove("previous_street_line");
+            old_config["previous_street_bet"] = serde_json::json!(old);
+            assert_eq!(
+                serde_json::from_value::<TreeConfig>(old_config)
+                    .unwrap()
+                    .previous_street_line,
+                expected
+            );
+        }
         assert_eq!(
             serde_json::from_value::<ReachSnapshot>(legacy)
                 .unwrap()
-                .previous_street_bet,
+                .previous_street_line,
             None
         );
         for p in 0..2 {
@@ -923,12 +955,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            result.tree().config.previous_street_bet,
-            restored.previous_street_bet
+            result.tree().config.previous_street_line,
+            restored.previous_street_line
         );
         assert_eq!(
-            result.tree().previous_street_bet_at(result.tree().root),
-            restored.previous_street_bet
+            result.tree().previous_street_line_at(result.tree().root),
+            restored.previous_street_line
         );
         assert_eq!(result.tree().nodes[result.tree().root].pot, restored.pot);
         assert_eq!(
@@ -988,7 +1020,7 @@ mod tests {
         let (mut game, ranges) = example();
         game.board.truncate(4);
         let snapshot = ReachSnapshot {
-            previous_street_bet: None,
+            previous_street_line: None,
             source_node: 0,
             board: game.board,
             pot: 2000,

@@ -33,10 +33,10 @@ def source_rules(table, features=None):
     for street in ('Flop', 'Turn'):
         for player in (0, 1):
             for after_check in (False, True):
-                for previous in ((None,) if street == 'Flop' else (False, True)):
+                for previous in ((None,) if street == 'Flop' else ('checked_through', 'ip_bet_called', 'lead_called', 'raised')):
                     for runout in ((None,) if street == 'Flop' else TURN_KINDS):
                         context = dict(features or {}, street=street, player=player,
-                                       after_check=after_check, previous_street_bet=previous, runout=runout)
+                                       after_check=after_check, previous_street_line=previous, runout=runout)
                         best, fraction = -1, table['default_fraction']
                         for row in table['rules']:
                             constraints = {k: v for k, v in row.items()
@@ -44,7 +44,7 @@ def source_rules(table, features=None):
                             if all(context.get(k) == v for k, v in constraints.items()) and len(constraints) > best:
                                 best, fraction = len(constraints), row['fraction']
                         rules.append(dict(street=street, player=player, after_check=after_check,
-                                          previous_street_bet=previous, runout=runout, fraction=fraction,
+                                          previous_street_line=previous, runout=runout, fraction=fraction,
                                           sources=['materialized supplied flop/turn rules']))
     return dict(version=table['version'], candidates=table['candidates'], default_fraction=.66, rules=rules)
 
@@ -94,7 +94,8 @@ def solve_source(args, board, cards, identity, deadline, state=None, source_id=N
     def build(d):
         requests = [dict(line=LINES[line], card=card, out=str(d/f'{line}-{card}.json'))
                     for line in args.lines for group in cards['groups'] for card in group['cards']]
-        save(d/'rules.json', source_rules(json.loads(args.flop_rule.read_text()), cards['features']))
+        table = turn.supplied_table(args)
+        save(d/'rules.json', table if table is not None else source_rules(json.loads(args.flop_rule.read_text()), cards['features']))
         save(d/'reach-requests.json', requests)
         if state is None:
             command = [str(args.binary), 'solve', '--preset', 'production', '--board', board,
@@ -122,16 +123,17 @@ m3_digest = turn.m3.digest
 
 
 def candidate(args, spot, state, size, identity, deadline):
-    local_identity = fingerprint([identity, m3_digest(state), spot, size])
+    policy = turn.sizing_policy(args)
+    local_identity = fingerprint([identity, m3_digest(state), spot, size, policy])
     def build(d):
-        save(d/'rules.json', candidate_rules(size, spot['bettor']))
+        save(d/'rules.json', turn.comparison_rules(args, size, spot, 'River'))
         command = [str(args.binary), 'solve-subgame', '--state', str(state), '--size-rules', str(d/'rules.json')]
         return command + turn.engine_args(args, args.river_target, d), [d/'solution.json', d/'rules.json']
     def validate(d):
         turn.validate_solution(d, spot['flop']+spot['turn_card']+spot['river_card'], args, json.loads(state.read_text())['pot'])
         return turn.read_metrics(d/'solution.json', args.river_target, spot['bettor'])
     result = turn.run_attempt(args.out/'spots'/spot['id']/str(size), local_identity, deadline, build, validate)
-    return dict(result, size=size, target_pct=args.river_target)
+    return dict(result, size=size, target_pct=args.river_target, non_compared_sizing_policy=policy)
 
 
 def compare(args, spot, state, identity, deadline):
@@ -161,11 +163,12 @@ def summarize(args, manifest, spots, failures, sources):
         records = [r['record'] for r in sources if r['phase'] == phase] if phase != 'river' else [r for s in spots for r in s['candidates']]
         walls = [r['resource']['wall_seconds'] for r in records if r.get('status') == 'complete' and 'resource' in r]
         timings[phase] = dict(completed=len(walls), total_wall_seconds=sum(walls), mean_wall_seconds=sum(walls)/len(walls) if walls else None)
-    summary = dict(identity=manifest['identity'], spots=spots, sources=sources, failures=failures,
+    summary = dict(non_compared_sizing_policy=turn.sizing_policy(args), identity=manifest['identity'], spots=spots, sources=sources, failures=failures,
                    completed=sum(s['complete'] for s in spots), total=len(spots), winner_counts=counts,
                    timing=timings, upper_bound=estimate_counts(len(manifest['provenance']['selection']), args.max_turns), no_optimality_claim=True)
     save(args.out/'summary.json', summary)
     lines = ['# M4 river sizing comparison', '',
+             'Non-compared sizing policy: '+json.dumps(summary['non_compared_sizing_policy'], sort_keys=True), '',
              'Bettor root EV: OOP=0 lead; IP=1 after check. Not conditional action EV.',
              'All four candidates use the river target; no coarse elimination.',
              'Loss = (best observed bettor EV - candidate EV) / river starting pot × 100.',
@@ -190,6 +193,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name, default in [('binary', ROOT/'target/release/cli'), ('sizing-binary', ROOT/'target/release/sizing'), ('out', ROOT/'data/m4-river'), ('report', ROOT/'docs/benchmarks/m4-river.md'), ('flop-rule', ROOT/'configs/sizing/srp-btn-vs-bb.json'), ('manifest', ROOT/'data/m4b/manifest.json'), ('oop-range', ROOT/'data/ranges/bb_call.json'), ('ip-range', ROOT/'data/ranges/btn_open.json')]:
         parser.add_argument('--'+name, type=Path, default=default)
+    parser.add_argument('--other-side-rules', type=Path, help='full rules for all non-compared decisions')
     parser.add_argument('--flops', default='20')
     parser.add_argument('--lines', default='XX,BC')
     parser.add_argument('--turn-kinds', default=','.join(TURN_KINDS))
@@ -211,12 +215,12 @@ def main(argv=None):
             setattr(args, key, value.resolve())
     try:
         selection = turn.select_flops(args.flops, args.manifest)
-        paths = [args.binary, args.sizing_binary, args.flop_rule, args.oop_range, args.ip_range, Path(__file__).resolve(), ROOT/'tools/m4_turn.py', ROOT/'tools/m3_bench.py', ROOT/'tools/m4_trial.py']
+        paths = [args.binary, args.sizing_binary, args.other_side_rules or args.flop_rule, args.oop_range, args.ip_range, Path(__file__).resolve(), ROOT/'tools/m4_turn.py', ROOT/'tools/m3_bench.py', ROOT/'tools/m4_trial.py']
         if args.flops.isdigit():
             paths.append(args.manifest)
         paths += sorted(ROOT.glob('crates/**/*.rs')) + sorted(ROOT.glob('crates/**/Cargo.toml')) + [ROOT/'Cargo.lock', ROOT/'Cargo.toml']
         config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k not in ('out', 'report', 'max_hours')}
-        provenance = dict(hashes={str(p): m3_digest(p) for p in paths}, config=config, selection=selection)
+        provenance = dict(non_compared_sizing_policy=turn.sizing_policy(args), hashes={str(p): m3_digest(p) for p in paths}, config=config, selection=selection)
     except (OSError, ValueError, KeyError) as error:
         parser.error(str(error))
     identity = fingerprint(provenance)
