@@ -19,6 +19,44 @@ pub enum Pairing {
     Trips,
 }
 
+/// Rank multiplicities of the entire current board, independent of suit labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum BoardPairing {
+    Unpaired,
+    OnePair,
+    TwoPair,
+    Trips,
+    FullHouse,
+    Quads,
+}
+
+pub fn board_pairing(board: &[Card]) -> BoardPairing {
+    assert!(
+        (3..=5).contains(&board.len()),
+        "a current board has 3 to 5 cards"
+    );
+    let mut counts = [0u8; 13];
+    for card in board {
+        counts[card.rank() as usize] += 1;
+    }
+    let pairs = counts.iter().filter(|&&count| count == 2).count();
+    if counts.contains(&4) {
+        BoardPairing::Quads
+    } else if counts.contains(&3) {
+        if pairs > 0 {
+            BoardPairing::FullHouse
+        } else {
+            BoardPairing::Trips
+        }
+    } else {
+        match pairs {
+            0 => BoardPairing::Unpaired,
+            1 => BoardPairing::OnePair,
+            _ => BoardPairing::TwoPair,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SuitPattern {
     Rainbow,
@@ -161,6 +199,36 @@ mod tests {
             .chunks(2)
             .map(|c| std::str::from_utf8(c).unwrap().parse().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn whole_board_pairing_all_shapes_and_streets() {
+        for (board, expected) in [
+            ("As7d2c", BoardPairing::Unpaired),
+            ("AsAd2c", BoardPairing::OnePair),
+            ("AsAdAc", BoardPairing::Trips),
+            ("As7d2c9h", BoardPairing::Unpaired),
+            ("As7d2c7h", BoardPairing::OnePair),
+            ("AsAd2c2h", BoardPairing::TwoPair),
+            ("AsAdAc2h", BoardPairing::Trips),
+            ("AsAdAcAh", BoardPairing::Quads),
+            ("As7d2c9hTs", BoardPairing::Unpaired),
+            ("As7d2c7hTs", BoardPairing::OnePair),
+            ("AsAd2c2hTs", BoardPairing::TwoPair),
+            ("AsAdAc2hTs", BoardPairing::Trips),
+            ("AsAdAc2h2s", BoardPairing::FullHouse),
+            ("AsAdAcAhTs", BoardPairing::Quads),
+        ] {
+            let original = cards(board);
+            assert_eq!(board_pairing(&original), expected, "{board}");
+            for shift in 0..4 {
+                let relabeled: Vec<_> = original
+                    .iter()
+                    .map(|c| Card(c.rank() * 4 + (c.suit() + shift) % 4))
+                    .collect();
+                assert_eq!(board_pairing(&relabeled), expected);
+            }
+        }
     }
 
     #[test]
