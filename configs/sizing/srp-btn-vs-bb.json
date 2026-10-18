@@ -48,7 +48,7 @@
       "street": "Turn",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 1.25,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -59,7 +59,7 @@
       "street": "Turn",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 1.25,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -70,7 +70,7 @@
       "street": "Turn",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 1.0,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -81,7 +81,7 @@
       "street": "Turn",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 0.33,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -91,7 +91,7 @@
       "street": "Turn",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": false,
+      "previous_street_line": "checked_through",
       "fraction": 0.66,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -102,7 +102,7 @@
       "street": "Turn",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": false,
+      "previous_street_line": "checked_through",
       "fraction": 0.33,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -112,7 +112,7 @@
       "street": "Turn",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 1.25,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -123,7 +123,7 @@
       "street": "Turn",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 1.25,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -134,7 +134,7 @@
       "street": "Turn",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 1.0,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -145,7 +145,7 @@
       "street": "Turn",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 0.66,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -155,7 +155,7 @@
       "street": "Turn",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": false,
+      "previous_street_line": "checked_through",
       "fraction": 0.66,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -166,7 +166,7 @@
       "street": "Turn",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": false,
+      "previous_street_line": "checked_through",
       "fraction": 0.66,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -177,7 +177,7 @@
       "street": "Turn",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": false,
+      "previous_street_line": "checked_through",
       "fraction": 0.33,
       "sources": [
         "data: M4 turn 20 flops, all sizes at 0.1%"
@@ -187,7 +187,7 @@
       "street": "River",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "board_pairing": "FullHouse",
       "fraction": 0.66,
       "sources": [
@@ -198,7 +198,7 @@
       "street": "River",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "board_pairing": "TwoPair",
       "fraction": 0.66,
       "sources": [
@@ -209,7 +209,7 @@
       "street": "River",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 0.33,
       "sources": [
         "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
@@ -219,7 +219,7 @@
       "street": "River",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": false,
+      "previous_street_line": "checked_through",
       "board_pairing": "FullHouse",
       "fraction": 1.25,
       "sources": [
@@ -230,7 +230,7 @@
       "street": "River",
       "player": 0,
       "after_check": false,
-      "previous_street_bet": false,
+      "previous_street_line": "checked_through",
       "fraction": 0.33,
       "sources": [
         "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
@@ -240,7 +240,7 @@
       "street": "River",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "board_pairing": "FullHouse",
       "fraction": 1.25,
       "sources": [
@@ -251,7 +251,7 @@
       "street": "River",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "board_pairing": "Trips",
       "fraction": 1.25,
       "sources": [
@@ -262,7 +262,7 @@
       "street": "River",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "board_pairing": "Quads",
       "fraction": 0.33,
       "sources": [
@@ -273,7 +273,7 @@
       "street": "River",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": true,
+      "previous_street_line": "ip_bet_called",
       "fraction": 1.0,
       "sources": [
         "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
@@ -283,7 +283,7 @@
       "street": "River",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": false,
+      "previous_street_line": "checked_through",
       "board_pairing": "FullHouse",
       "fraction": 1.0,
       "sources": [
@@ -294,7 +294,7 @@
       "street": "River",
       "player": 1,
       "after_check": true,
-      "previous_street_bet": false,
+      "previous_street_line": "checked_through",
       "fraction": 0.66,
       "sources": [
         "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"

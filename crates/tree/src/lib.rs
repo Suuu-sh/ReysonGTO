@@ -17,6 +17,43 @@ pub enum Street {
     Turn,
     River,
 }
+/// Completed action line on the immediately preceding street.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviousStreetLine {
+    CheckedThrough,
+    IpBetCalled,
+    LeadCalled,
+    Raised,
+}
+
+/// Legacy true only says a wager occurred, so its exact line stays unknown.
+pub fn deserialize_previous_street_line<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PreviousStreetLine>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum History {
+        Line(PreviousStreetLine),
+        Legacy(bool),
+    }
+    Ok(match Option::<History>::deserialize(deserializer)? {
+        Some(History::Line(line)) => Some(line),
+        Some(History::Legacy(false)) => Some(PreviousStreetLine::CheckedThrough),
+        Some(History::Legacy(true)) | None => None,
+    })
+}
+
+impl PreviousStreetLine {
+    fn after_action(self, player: usize, action: &Action) -> Self {
+        match action {
+            Action::Raise(_) => Self::Raised,
+            Action::Bet(_) if player == 1 => Self::IpBetCalled,
+            Action::Bet(_) => Self::LeadCalled,
+            _ => self,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct SizeContext<'a> {
     pub board: &'a [u8],
@@ -24,8 +61,8 @@ pub struct SizeContext<'a> {
     pub player: usize,
     pub first_bet: bool,
     pub after_check: bool,
-    /// Any bet/raise on the immediately preceding street; unknown at standalone roots.
-    pub previous_street_bet: Option<bool>,
+    /// Exact preceding street line; unknown at standalone roots.
+    pub previous_street_line: Option<PreviousStreetLine>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub enum SizeRule {
@@ -106,14 +143,20 @@ impl SizeRule {
             for player in 0..2 {
                 for first_bet in [false, true] {
                     for after_check in [false, true] {
-                        for previous_street_bet in [None, Some(false), Some(true)] {
+                        for previous_street_line in [
+                            None,
+                            Some(PreviousStreetLine::CheckedThrough),
+                            Some(PreviousStreetLine::IpBetCalled),
+                            Some(PreviousStreetLine::LeadCalled),
+                            Some(PreviousStreetLine::Raised),
+                        ] {
                             let context = SizeContext {
                                 board,
                                 street,
                                 player,
                                 first_bet,
                                 after_check,
-                                previous_street_bet,
+                                previous_street_line,
                             };
                             let expected = self.fraction(&context);
                             if !expected.is_finite() || expected <= 0.0 {
@@ -155,8 +198,13 @@ impl SizeRule {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TreeConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_street_bet: Option<bool>,
+    #[serde(
+        default,
+        alias = "previous_street_bet",
+        deserialize_with = "deserialize_previous_street_line",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub previous_street_line: Option<PreviousStreetLine>,
     pub starting_pot: i64,
     pub effective_stack: i64,
     pub oop_can_lead_flop: bool,
@@ -174,7 +222,7 @@ pub struct TreeConfig {
 impl Default for TreeConfig {
     fn default() -> Self {
         Self {
-            previous_street_bet: None,
+            previous_street_line: None,
             starting_pot: 5_500,
             effective_stack: 97_500,
             oop_can_lead_flop: false,
@@ -244,7 +292,8 @@ struct State {
     stacks: [i64; 2],
     invested: [i64; 2],
     street_paid: [i64; 2],
-    previous_street_bet: Option<bool>,
+    street_line: PreviousStreetLine,
+    previous_street_line: Option<PreviousStreetLine>,
 }
 impl GameTree {
     /// Constructs an explicit arena for synthetic games.
@@ -300,10 +349,11 @@ impl GameTree {
             stacks: [config.effective_stack; 2],
             invested: [0; 2],
             street_paid: [0; 2],
-            previous_street_bet: if board.len() == 3 {
+            street_line: PreviousStreetLine::CheckedThrough,
+            previous_street_line: if board.len() == 3 {
                 None
             } else {
-                config.previous_street_bet
+                config.previous_street_line
             },
         };
         let mut tree = Self {
@@ -320,13 +370,13 @@ impl GameTree {
         Ok(tree)
     }
     /// Recover preceding-street action history, including pre-deal chance nodes.
-    pub fn previous_street_bet_at(&self, target: NodeId) -> Option<bool> {
+    pub fn previous_street_line_at(&self, target: NodeId) -> Option<PreviousStreetLine> {
         let previous = if self.nodes.get(self.root)?.board.len() == 3 {
             None
         } else {
-            self.config.previous_street_bet
+            self.config.previous_street_line
         };
-        let mut pending = vec![(self.root, previous, false)];
+        let mut pending = vec![(self.root, previous, PreviousStreetLine::CheckedThrough)];
         while let Some((id, previous, bet)) = pending.pop() {
             let node = self.nodes.get(id)?;
             let boundary = matches!(node.kind, NodeKind::Chance { .. });
@@ -335,19 +385,17 @@ impl GameTree {
             }
             match &node.kind {
                 NodeKind::Decision {
-                    actions, children, ..
+                    actions,
+                    children,
+                    player,
                 } => {
                     for (action, &child) in actions.iter().zip(children) {
-                        pending.push((
-                            child,
-                            previous,
-                            bet || matches!(action, Action::Bet(_) | Action::Raise(_)),
-                        ));
+                        pending.push((child, previous, bet.after_action(*player, action)));
                     }
                 }
                 NodeKind::Chance { children, .. } => {
                     for &child in children {
-                        pending.push((child, Some(bet), false));
+                        pending.push((child, Some(bet), PreviousStreetLine::CheckedThrough));
                     }
                 }
                 NodeKind::Terminal { .. } => {}
@@ -403,8 +451,9 @@ impl GameTree {
             }
             let mut next = s.clone();
             next.board.push(card);
-            next.previous_street_bet = Some(s.street_paid.iter().any(|&paid| paid > 0));
+            next.previous_street_line = Some(s.street_line);
             next.street_paid = [0; 2];
+            next.street_line = PreviousStreetLine::CheckedThrough;
             cards.push(card);
             children.push(if next.stacks[0] == 0 || next.stacks[1] == 0 {
                 self.finish(next)?
@@ -434,6 +483,7 @@ impl GameTree {
                     (s.street_paid[q] as f64 * self.config.raise_multiplier).round() as i64;
                 let spend = self.merged((target - s.street_paid[p]).max(due + 1), s.stacks[p]);
                 let mut raise = s.clone();
+                raise.street_line = PreviousStreetLine::Raised;
                 Self::spend(&mut raise, p, spend);
                 actions.push(Action::Raise(spend));
                 children.push(self.decision(raise, q, false)?);
@@ -460,7 +510,7 @@ impl GameTree {
                     player: p,
                     first_bet: true,
                     after_check: checked,
-                    previous_street_bet: s.previous_street_bet,
+                    previous_street_line: s.previous_street_line,
                 });
                 if !fraction.is_finite() || fraction <= 0.0 {
                     return Err("bet size must be finite and positive".into());
@@ -470,6 +520,7 @@ impl GameTree {
                     s.stacks[p],
                 );
                 let mut bet = s.clone();
+                bet.street_line = s.street_line.after_action(p, &Action::Bet(n));
                 Self::spend(&mut bet, p, n);
                 actions.push(Action::Bet(n));
                 children.push(self.decision(bet, q, false)?);
@@ -507,10 +558,10 @@ mod tests {
     #[test]
     fn previous_street_history_tracks_checks_bets_and_raises() {
         let cfg = TreeConfig {
-            previous_street_bet: Some(true),
+            previous_street_line: Some(PreviousStreetLine::IpBetCalled),
             allow_raises: false,
             bet_size: SizeRule::SuitInvariant(Arc::new(|c| {
-                if c.previous_street_bet == Some(true) {
+                if c.previous_street_line == Some(PreviousStreetLine::IpBetCalled) {
                     1.0
                 } else {
                     0.5
@@ -519,32 +570,94 @@ mod tests {
             ..config()
         };
         let tree = GameTree::build(vec![0, 5, 10], cfg).unwrap();
-        assert_eq!(tree.previous_street_bet_at(tree.root), None);
+        assert_eq!(tree.previous_street_line_at(tree.root), None);
         let follow = |id, index| actions(&tree, id).1[index];
         let xx = follow(follow(tree.root, 0), 0);
         let bc = follow(follow(follow(tree.root, 0), 1), 1);
-        for (chance, history) in [(xx, false), (bc, true)] {
-            assert_eq!(tree.previous_street_bet_at(chance), Some(history));
+        for (chance, history) in [
+            (xx, PreviousStreetLine::CheckedThrough),
+            (bc, PreviousStreetLine::IpBetCalled),
+        ] {
+            assert_eq!(tree.previous_street_line_at(chance), Some(history));
             let turn = match &tree.nodes[chance].kind {
                 NodeKind::Chance { children, .. } => children[0],
                 _ => panic!("chance"),
             };
-            assert_eq!(tree.previous_street_bet_at(turn), Some(history));
+            assert_eq!(tree.previous_street_line_at(turn), Some(history));
             let bet = actions(&tree, turn).0[1];
             assert_eq!(
                 bet,
                 Action::Bet(
-                    (tree.nodes[turn].pot as f64 * if history { 1.0 } else { 0.5 }).round() as i64
+                    (tree.nodes[turn].pot as f64
+                        * if history == PreviousStreetLine::IpBetCalled {
+                            1.0
+                        } else {
+                            0.5
+                        })
+                    .round() as i64
                 )
             );
             let river_chance = follow(follow(turn, 0), 0);
-            assert_eq!(tree.previous_street_bet_at(river_chance), Some(false));
+            assert_eq!(
+                tree.previous_street_line_at(river_chance),
+                Some(PreviousStreetLine::CheckedThrough)
+            );
         }
         let tree = GameTree::build(vec![0, 5, 10, 15], config()).unwrap();
         let bet = actions(&tree, tree.root).1[1];
         let raise = actions(&tree, bet).1[2];
         let call = actions(&tree, raise).1[1];
-        assert_eq!(tree.previous_street_bet_at(call), Some(true));
+        assert_eq!(
+            tree.previous_street_line_at(call),
+            Some(PreviousStreetLine::Raised)
+        );
+        let lead_call = actions(&tree, bet).1[1];
+        assert_eq!(
+            tree.previous_street_line_at(lead_call),
+            Some(PreviousStreetLine::LeadCalled)
+        );
+        let ip_bet = actions(&tree, actions(&tree, tree.root).1[0]).1[1];
+        let ip_call = actions(&tree, ip_bet).1[1];
+        assert_eq!(
+            tree.previous_street_line_at(ip_call),
+            Some(PreviousStreetLine::IpBetCalled)
+        );
+        let check_raise = actions(&tree, ip_bet).1[2];
+        let check_raise_call = actions(&tree, check_raise).1[1];
+        assert_eq!(
+            tree.previous_street_line_at(check_raise_call),
+            Some(PreviousStreetLine::Raised)
+        );
+        for (chance, line) in [
+            (lead_call, PreviousStreetLine::LeadCalled),
+            (check_raise_call, PreviousStreetLine::Raised),
+        ] {
+            let NodeKind::Chance { children, .. } = &tree.nodes[chance].kind else {
+                panic!("chance")
+            };
+            assert_eq!(tree.previous_street_line_at(children[0]), Some(line));
+        }
+    }
+
+    #[test]
+    fn fixed_sizing_is_unchanged_by_previous_street_line() {
+        let baseline = GameTree::build(vec![0, 5, 10, 15], config()).unwrap();
+        for line in [
+            PreviousStreetLine::CheckedThrough,
+            PreviousStreetLine::IpBetCalled,
+            PreviousStreetLine::LeadCalled,
+            PreviousStreetLine::Raised,
+        ] {
+            let tree = GameTree::build(
+                vec![0, 5, 10, 15],
+                TreeConfig {
+                    previous_street_line: Some(line),
+                    ..config()
+                },
+            )
+            .unwrap();
+            assert_eq!(format!("{:?}", tree.nodes), format!("{:?}", baseline.nodes));
+        }
     }
 
     #[test]
@@ -669,7 +782,7 @@ mod tests {
                     player: 0,
                     first_bet: true,
                     after_check: false,
-                    previous_street_bet: None,
+                    previous_street_line: None,
                 }),
                 fraction
             );

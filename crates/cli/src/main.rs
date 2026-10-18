@@ -276,7 +276,7 @@ impl SolveArgs {
             previous.clone()
         } else {
             TreeConfig {
-                previous_street_bet: None,
+                previous_street_line: None,
                 starting_pot: chips_at(5.5, units)?,
                 effective_stack: chips_at(97.5, units)?,
                 oop_can_lead_flop: preset == Preset::Benchmark,
@@ -353,7 +353,7 @@ impl SolveArgs {
                     player: 0,
                     first_bet: true,
                     after_check: false,
-                    previous_street_bet: None,
+                    previous_street_line: None,
                 })
             };
             config.bet_size = SizeRule::PerStreet {
@@ -877,7 +877,7 @@ mod tests {
                 player: 0,
                 first_bet: true,
                 after_check: false,
-                previous_street_bet: None,
+                previous_street_line: None,
             })
         })
     }
@@ -964,7 +964,7 @@ mod tests {
                     player,
                     first_bet: true,
                     after_check,
-                    previous_street_bet: None,
+                    previous_street_line: None,
                 }),
                 expected
             );
@@ -996,12 +996,12 @@ mod tests {
         assert!(resolve_reach_line(&tree, "X,B,C").is_ok());
         let turn_tree = tree::GameTree::build(vec![0, 5, 10, 15], tree.config.clone()).unwrap();
         assert_eq!(
-            turn_tree.previous_street_bet_at(resolve_reach_line(&turn_tree, "X,X").unwrap()),
-            Some(false)
+            turn_tree.previous_street_line_at(resolve_reach_line(&turn_tree, "X,X").unwrap()),
+            Some(tree::PreviousStreetLine::CheckedThrough)
         );
         assert_eq!(
-            turn_tree.previous_street_bet_at(resolve_reach_line(&turn_tree, "X,B,C").unwrap()),
-            Some(true)
+            turn_tree.previous_street_line_at(resolve_reach_line(&turn_tree, "X,B,C").unwrap()),
+            Some(tree::PreviousStreetLine::IpBetCalled)
         );
         for invalid in ["", "Z", "C", "X,X,X"] {
             assert!(resolve_reach_line(&tree, invalid).is_err());

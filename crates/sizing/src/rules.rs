@@ -17,7 +17,7 @@ pub struct Rule {
     pub player: Option<usize>,
     /// The first bet of the street (not a raise). Rules only size first bets; raises use the multiplier.
     pub after_check: Option<bool>,
-    pub previous_street_bet: Option<bool>,
+    pub previous_street_line: Option<tree::PreviousStreetLine>,
     pub height: Option<Height>,
     pub pairing: Option<Pairing>,
     /// Rank multiplicities of the entire current board; omitted means wildcard.
@@ -49,7 +49,7 @@ pub struct Situation {
     pub street: Street,
     pub player: usize,
     pub after_check: bool,
-    pub previous_street_bet: Option<bool>,
+    pub previous_street_line: Option<tree::PreviousStreetLine>,
     pub height: Height,
     pub pairing: Pairing,
     pub board_pairing: Option<BoardPairing>,
@@ -71,7 +71,7 @@ impl Situation {
             street: c.street,
             player: c.player,
             after_check: c.after_check,
-            previous_street_bet: c.previous_street_bet,
+            previous_street_line: c.previous_street_line,
             height: flop.height,
             pairing: flop.pairing,
             board_pairing: Some(board_pairing(&board)),
@@ -99,8 +99,8 @@ impl Rule {
         check!(street, s.street);
         check!(player, s.player);
         check!(after_check, s.after_check);
-        if let Some(value) = self.previous_street_bet {
-            if s.previous_street_bet != Some(value) {
+        if let Some(value) = self.previous_street_line {
+            if s.previous_street_line != Some(value) {
                 return None;
             }
             n += 1;
@@ -211,7 +211,7 @@ mod tests {
             player: 1,
             first_bet: true,
             after_check: true,
-            previous_street_bet: None,
+            previous_street_line: None,
         }))
     }
 
@@ -232,7 +232,7 @@ mod tests {
                 player: 0,
                 first_bet: true,
                 after_check: false,
-                previous_street_bet: None,
+                previous_street_line: None,
             });
             assert_eq!(situation.pairing, Pairing::Paired);
             assert_eq!(situation.board_pairing, Some(expected));
@@ -275,7 +275,11 @@ mod tests {
                     player,
                     first_bet: true,
                     after_check: player == 1,
-                    previous_street_bet: Some(history),
+                    previous_street_line: Some(if history {
+                        tree::PreviousStreetLine::IpBetCalled
+                    } else {
+                        tree::PreviousStreetLine::CheckedThrough
+                    }),
                 });
                 assert_eq!(situation.board_pairing, Some(pairing));
                 assert_eq!(
@@ -284,13 +288,19 @@ mod tests {
                     "{board} p{player} history={history}"
                 );
                 // Both unknown history and the opposite check context are unmatched.
-                assert_eq!(
-                    table.fraction(&Situation {
-                        previous_street_bet: None,
-                        ..situation
-                    }),
-                    0.66
-                );
+                for history in [
+                    None,
+                    Some(tree::PreviousStreetLine::LeadCalled),
+                    Some(tree::PreviousStreetLine::Raised),
+                ] {
+                    assert_eq!(
+                        table.fraction(&Situation {
+                            previous_street_line: history,
+                            ..situation
+                        }),
+                        0.66
+                    );
+                }
                 assert_eq!(
                     table.fraction(&Situation {
                         after_check: player != 1,
@@ -404,7 +414,11 @@ mod tests {
                     player,
                     first_bet: true,
                     after_check: player == 1,
-                    previous_street_bet: Some(history),
+                    previous_street_line: Some(if history {
+                        tree::PreviousStreetLine::IpBetCalled
+                    } else {
+                        tree::PreviousStreetLine::CheckedThrough
+                    }),
                 };
                 let situation = Situation::from_context(&context);
                 assert_eq!(situation.runout, Some(kind), "{board}");
@@ -413,13 +427,19 @@ mod tests {
                     expected[i],
                     "{board} p{player} history={history}"
                 );
-                assert_eq!(
-                    table.fraction(&Situation {
-                        previous_street_bet: None,
-                        ..situation
-                    }),
-                    0.66
-                );
+                for history in [
+                    None,
+                    Some(tree::PreviousStreetLine::LeadCalled),
+                    Some(tree::PreviousStreetLine::Raised),
+                ] {
+                    assert_eq!(
+                        table.fraction(&Situation {
+                            previous_street_line: history,
+                            ..situation
+                        }),
+                        0.66
+                    );
+                }
             }
         }
         for row in table

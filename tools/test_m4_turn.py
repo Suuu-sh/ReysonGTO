@@ -6,6 +6,7 @@ import time
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import m4_turn as turn
@@ -84,7 +85,78 @@ def test_select_flops_and_metrics(tmp_path):
     assert turn.read_metrics(report, 1, 1)['bettor_ev_bb'] == .01
 
 
+def choose_rule(table, context):
+    matches = [(sum(v is not None for k, v in row.items() if k not in ('fraction', 'sources')), i, row['fraction'])
+               for i, row in enumerate(table['rules'])
+               if all(v is None or context.get(k) == v for k, v in row.items() if k not in ('fraction', 'sources'))]
+    return min(matches, key=lambda r: (-r[0], r[1]))[2] if matches else table['default_fraction']
+
+
+def check_other_side_policy(test, module, street):
+    """Exercise real candidate build/identity wiring without invoking a solver."""
+    with tempfile.TemporaryDirectory() as directory:
+        d = Path(directory)
+        path = d/'full.json'
+        table = dict(version=1, candidates=[.33, .66, 1., 1.25], default_fraction=.5,
+                     rules=[dict(street='Flop', fraction=.33), dict(street='Turn', fraction=1.),
+                            dict(street='River', fraction=1.25),
+                            dict(street=street, player=1, after_check=True, runout='Blank',
+                                 previous_street_line='ip_bet_called', height='Low', fraction=.33),
+                            dict(street=street, player=0, after_check=False, fraction=1.)])
+        path.write_text(json.dumps(table))
+        args = SimpleNamespace(other_side_rules=path, out=d, binary=Path('unused'),
+                               coarse_target=5., fine_target=.5, river_target=.1, flop_target=1., turn_target=.5,
+                               lines=['XX', 'BC'], oop_range=Path('unused-oop'), ip_range=Path('unused-ip'),
+                               pot=2., stack=3.)
+        state = d/'state.json'
+        state.write_text('{}')
+        spot = dict(id='synthetic', bettor=1, line='BC', turn_line='BC', kind='Blank', river_kind='Blank')
+        identities, built = [], []
+        def attempt(directory, identity, deadline, build, validate):
+            identities.append(identity)
+            build(d)
+            built.append(json.loads((d/'rules.json').read_text()))
+            return dict(status='synthetic', identity=identity)
+        def candidate():
+            if street == 'Turn':
+                return module.candidate(args, spot, state, 'coarse', 125, 'same', 0)
+            return module.candidate(args, spot, state, 125, 'same', 0)
+        with patch.object(turn, 'run_attempt', side_effect=attempt), patch.object(turn, 'engine_args', return_value=[]):
+            result = candidate()
+            test.assertEqual(result['non_compared_sizing_policy']['mode'], 'supplied_full_table')
+            context = dict(street=street, player=1, after_check=True, runout='Blank',
+                           previous_street_line='ip_bet_called', height='Low')
+            test.assertEqual(choose_rule(built[-1], context), 1.25)
+            for other in [dict(context, player=0, after_check=False), dict(context, after_check=False),
+                          dict(context, previous_street_line='checked_through'), dict(context, runout='Overcard'),
+                          dict(context, street='Flop'), dict(context, street='River' if street=='Turn' else 'Turn')]:
+                test.assertEqual(choose_rule(built[-1], other), choose_rule(table, other))
+            test.assertEqual(built[-1]['rules'][-len(table['rules']):], table['rules'])
+            candidate_identity = identities[-1]
+            cards = dict(features={}, groups=[])
+            if street == 'Turn':
+                module.solve_flop(args, dict(flop='7c6d5d'), cards, 'same', 0)
+                test.assertEqual(built[-1], table)
+            else:
+                module.solve_source(args, '7c6d5d', cards, 'same', 0)
+                test.assertEqual(built[-1], table)
+                module.solve_source(args, '7c6d5d2h', cards, 'same', 0, state, 'turn')
+                test.assertEqual(built[-1], table)
+            table['default_fraction'] = .33
+            path.write_text(json.dumps(table))
+            candidate()
+            test.assertNotEqual(identities[-1], candidate_identity)
+            args.other_side_rules = None
+            result = candidate()
+            test.assertEqual(result['non_compared_sizing_policy']['mode'], 'legacy_default_66')
+            test.assertNotEqual(identities[-1], identities[-2])
+            test.assertEqual(built[-1], module.candidate_rules(125, 1))
+
+
 class RunnerTests(unittest.TestCase):
+    def test_other_side_policy(self):
+        check_other_side_policy(self, turn, 'Turn')
+
     def test_rules(self):
         test_rules_isolate_bettor_and_street()
 
