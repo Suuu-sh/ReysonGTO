@@ -3,7 +3,6 @@
   "candidates": [
     0.33,
     0.66,
-    1.0,
     1.25
   ],
   "default_fraction": 0.66,
@@ -12,27 +11,10 @@
       "street": "Flop",
       "player": 1,
       "after_check": true,
-      "height": "Low",
-      "pairing": "Unpaired",
       "connectivity": "Connected",
       "fraction": 0.66,
       "sources": [
-        "data/m4b training: 7c4d3h",
-        "7c6d5d",
-        "7c6d3c"
-      ]
-    },
-    {
-      "street": "Flop",
-      "player": 1,
-      "after_check": true,
-      "height": "TenEight",
-      "pairing": "Unpaired",
-      "connectivity": "Connected",
-      "fraction": 0.66,
-      "sources": [
-        "data/m4b training: 8c6d4c",
-        "8c5d4h"
+        "flop recheck: 50 flops, turn/river from the rule table, sizes 33/66/125 at 0.5%"
       ]
     },
     {
@@ -41,7 +23,39 @@
       "after_check": true,
       "fraction": 0.33,
       "sources": [
-        "data/m4b training: 65 of 120 boards best at 33%"
+        "flop recheck: 50 flops, turn/river from the rule table, sizes 33/66/125 at 0.5%"
+      ]
+    },
+    {
+      "street": "Turn",
+      "player": 0,
+      "after_check": false,
+      "previous_street_line": "checked_through",
+      "runout": "FlushComplete",
+      "fraction": 0.33,
+      "sources": [
+        "M4 turn joint re-measure: 20 flops, 324 spots, sizes 33/66/125 at 0.1%"
+      ]
+    },
+    {
+      "street": "Turn",
+      "player": 0,
+      "after_check": false,
+      "previous_street_line": "checked_through",
+      "runout": "StraightComplete",
+      "fraction": 0.33,
+      "sources": [
+        "M4 turn joint re-measure: 20 flops, 324 spots, sizes 33/66/125 at 0.1%"
+      ]
+    },
+    {
+      "street": "Turn",
+      "player": 0,
+      "after_check": false,
+      "previous_street_line": "checked_through",
+      "fraction": 1.25,
+      "sources": [
+        "M4 turn joint re-measure: 20 flops, 324 spots, sizes 33/66/125 at 0.1%"
       ]
     },
     {
@@ -49,33 +63,22 @@
       "player": 0,
       "after_check": false,
       "previous_street_line": "ip_bet_called",
+      "runout": "FlushComplete",
       "fraction": 1.25,
       "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ],
-      "runout": "FlushComplete"
+        "M4 turn joint re-measure: 20 flops, 324 spots, sizes 33/66/125 at 0.1%"
+      ]
     },
     {
       "street": "Turn",
       "player": 0,
       "after_check": false,
       "previous_street_line": "ip_bet_called",
+      "runout": "StraightComplete",
       "fraction": 1.25,
       "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ],
-      "runout": "Overcard"
-    },
-    {
-      "street": "Turn",
-      "player": 0,
-      "after_check": false,
-      "previous_street_line": "ip_bet_called",
-      "fraction": 1.0,
-      "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ],
-      "runout": "StraightComplete"
+        "M4 turn joint re-measure: 20 flops, 324 spots, sizes 33/66/125 at 0.1%"
+      ]
     },
     {
       "street": "Turn",
@@ -84,94 +87,8 @@
       "previous_street_line": "ip_bet_called",
       "fraction": 0.33,
       "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
+        "M4 turn joint re-measure: 20 flops, 324 spots, sizes 33/66/125 at 0.1%"
       ]
-    },
-    {
-      "street": "Turn",
-      "player": 0,
-      "after_check": false,
-      "previous_street_line": "checked_through",
-      "fraction": 0.66,
-      "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ],
-      "runout": "BoardPair"
-    },
-    {
-      "street": "Turn",
-      "player": 0,
-      "after_check": false,
-      "previous_street_line": "checked_through",
-      "fraction": 0.33,
-      "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ]
-    },
-    {
-      "street": "Turn",
-      "player": 1,
-      "after_check": true,
-      "previous_street_line": "ip_bet_called",
-      "fraction": 1.25,
-      "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ],
-      "runout": "Blank"
-    },
-    {
-      "street": "Turn",
-      "player": 1,
-      "after_check": true,
-      "previous_street_line": "ip_bet_called",
-      "fraction": 1.25,
-      "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ],
-      "runout": "FlushDraw"
-    },
-    {
-      "street": "Turn",
-      "player": 1,
-      "after_check": true,
-      "previous_street_line": "ip_bet_called",
-      "fraction": 1.0,
-      "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ],
-      "runout": "Overcard"
-    },
-    {
-      "street": "Turn",
-      "player": 1,
-      "after_check": true,
-      "previous_street_line": "ip_bet_called",
-      "fraction": 0.66,
-      "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ]
-    },
-    {
-      "street": "Turn",
-      "player": 1,
-      "after_check": true,
-      "previous_street_line": "checked_through",
-      "fraction": 0.66,
-      "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ],
-      "runout": "FlushComplete"
-    },
-    {
-      "street": "Turn",
-      "player": 1,
-      "after_check": true,
-      "previous_street_line": "checked_through",
-      "fraction": 0.66,
-      "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
-      ],
-      "runout": "StraightComplete"
     },
     {
       "street": "Turn",
@@ -180,29 +97,103 @@
       "previous_street_line": "checked_through",
       "fraction": 0.33,
       "sources": [
-        "data: M4 turn 20 flops, all sizes at 0.1%"
+        "M4 turn joint re-measure: 20 flops, 324 spots, sizes 33/66/125 at 0.1%"
+      ]
+    },
+    {
+      "street": "Turn",
+      "player": 1,
+      "after_check": true,
+      "previous_street_line": "ip_bet_called",
+      "fraction": 0.66,
+      "sources": [
+        "M4 turn joint re-measure: 20 flops, 324 spots, sizes 33/66/125 at 0.1%"
       ]
     },
     {
       "street": "River",
       "player": 0,
       "after_check": false,
-      "previous_street_line": "ip_bet_called",
+      "previous_street_line": "checked_through",
       "board_pairing": "FullHouse",
-      "fraction": 0.66,
+      "fraction": 1.25,
       "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
       ]
     },
     {
       "street": "River",
       "player": 0,
       "after_check": false,
-      "previous_street_line": "ip_bet_called",
+      "previous_street_line": "checked_through",
       "board_pairing": "TwoPair",
       "fraction": 0.66,
       "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
+      ]
+    },
+    {
+      "street": "River",
+      "player": 0,
+      "after_check": false,
+      "previous_street_line": "checked_through",
+      "board_pairing": "Quads",
+      "fraction": 0.66,
+      "sources": [
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
+      ]
+    },
+    {
+      "street": "River",
+      "player": 0,
+      "after_check": false,
+      "previous_street_line": "checked_through",
+      "fraction": 0.33,
+      "sources": [
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
+      ]
+    },
+    {
+      "street": "River",
+      "player": 1,
+      "after_check": true,
+      "previous_street_line": "checked_through",
+      "board_pairing": "FullHouse",
+      "fraction": 1.25,
+      "sources": [
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
+      ]
+    },
+    {
+      "street": "River",
+      "player": 1,
+      "after_check": true,
+      "previous_street_line": "checked_through",
+      "board_pairing": "TwoPair",
+      "fraction": 0.66,
+      "sources": [
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
+      ]
+    },
+    {
+      "street": "River",
+      "player": 1,
+      "after_check": true,
+      "previous_street_line": "checked_through",
+      "board_pairing": "Quads",
+      "fraction": 0.66,
+      "sources": [
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
+      ]
+    },
+    {
+      "street": "River",
+      "player": 1,
+      "after_check": true,
+      "previous_street_line": "checked_through",
+      "fraction": 0.33,
+      "sources": [
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
       ]
     },
     {
@@ -212,28 +203,7 @@
       "previous_street_line": "ip_bet_called",
       "fraction": 0.33,
       "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
-      ]
-    },
-    {
-      "street": "River",
-      "player": 0,
-      "after_check": false,
-      "previous_street_line": "checked_through",
-      "board_pairing": "FullHouse",
-      "fraction": 1.25,
-      "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
-      ]
-    },
-    {
-      "street": "River",
-      "player": 0,
-      "after_check": false,
-      "previous_street_line": "checked_through",
-      "fraction": 0.33,
-      "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
       ]
     },
     {
@@ -244,18 +214,7 @@
       "board_pairing": "FullHouse",
       "fraction": 1.25,
       "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
-      ]
-    },
-    {
-      "street": "River",
-      "player": 1,
-      "after_check": true,
-      "previous_street_line": "ip_bet_called",
-      "board_pairing": "Trips",
-      "fraction": 1.25,
-      "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
       ]
     },
     {
@@ -266,7 +225,7 @@
       "board_pairing": "Quads",
       "fraction": 0.33,
       "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
       ]
     },
     {
@@ -274,30 +233,9 @@
       "player": 1,
       "after_check": true,
       "previous_street_line": "ip_bet_called",
-      "fraction": 1.0,
-      "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
-      ]
-    },
-    {
-      "street": "River",
-      "player": 1,
-      "after_check": true,
-      "previous_street_line": "checked_through",
-      "board_pairing": "FullHouse",
-      "fraction": 1.0,
-      "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
-      ]
-    },
-    {
-      "street": "River",
-      "player": 1,
-      "after_check": true,
-      "previous_street_line": "checked_through",
       "fraction": 0.66,
       "sources": [
-        "data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"
+        "M4 river joint re-measure: 20 flops, 1824 spots, sizes 33/66/125 at 0.1%"
       ]
     }
   ]
