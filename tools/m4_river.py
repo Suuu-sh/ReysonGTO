@@ -190,12 +190,14 @@ def summarize(args, manifest, spots, failures, sources):
 
 
 def main(argv=None):
+    global SIZES
     parser = argparse.ArgumentParser(description=__doc__)
     for name, default in [('binary', ROOT/'target/release/cli'), ('sizing-binary', ROOT/'target/release/sizing'), ('out', ROOT/'data/m4-river'), ('report', ROOT/'docs/benchmarks/m4-river.md'), ('flop-rule', ROOT/'configs/sizing/srp-btn-vs-bb.json'), ('manifest', ROOT/'data/m4b/manifest.json'), ('oop-range', ROOT/'data/ranges/bb_call.json'), ('ip-range', ROOT/'data/ranges/btn_open.json')]:
         parser.add_argument('--'+name, type=Path, default=default)
     parser.add_argument('--other-side-rules', type=Path, help='full rules for all non-compared decisions')
     parser.add_argument('--flops', default='20')
     parser.add_argument('--lines', default='XX,BC')
+    parser.add_argument('--sizes', default=','.join(map(str, SIZES)), help='candidate bet sizes in percent of the pot')
     parser.add_argument('--turn-kinds', default=','.join(TURN_KINDS))
     for name, default in [('threads', 4), ('memory-mb', 16384), ('max-iters', 10000), ('max-turns', 3), ('per-kind', 1), ('seed', 20261015)]:
         parser.add_argument('--'+name, type=int, default=default)
@@ -203,6 +205,11 @@ def main(argv=None):
         parser.add_argument(*(['--river-target', '--target'] if name == 'river-target' else ['--'+name]), type=float, default=default)
     args = parser.parse_args(argv)
     args.lines = args.lines.split(',')
+    # Candidates are part of the run's identity through vars(args).
+    SIZES = tuple(int(x) for x in args.sizes.split(','))
+    turn.SIZES = SIZES
+    if len(SIZES) < 2 or len(set(SIZES)) != len(SIZES) or min(SIZES) <= 0:
+        parser.error('--sizes needs at least two distinct positive sizes')
     args.turn_kinds = args.turn_kinds.split(',')
     if not args.lines or len(set(args.lines)) != len(args.lines) or any(x not in LINES for x in args.lines):
         parser.error('--lines must contain unique XX and/or BC')
