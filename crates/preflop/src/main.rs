@@ -69,7 +69,7 @@ enum Command {
         heads_up: bool,
         #[arg(long)]
         equity_3way: Option<PathBuf>,
-        /// Omit per-node class arrays to keep large-tree smoke reports bounded.
+        /// Report only first-in nodes and responses to a lone opener, keeping large-tree reports bounded.
         #[arg(long)]
         summary_only: bool,
         /// Seats evaluated concurrently in a multiway report (each holds ~165 MB of caches).
