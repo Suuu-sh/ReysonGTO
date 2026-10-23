@@ -245,20 +245,29 @@ mod tests {
             serde_json::from_str(include_str!("../../../configs/sizing/srp-btn-vs-bb.json"))
                 .unwrap();
         for (board, pairing, expected) in [
+            // Order: OOP after a turn bet-call, OOP after checks, IP after bet-call, IP after checks.
             (
                 "As7d2c9hTs",
                 BoardPairing::Unpaired,
-                [0.33, 0.33, 1.0, 0.66],
+                [0.33, 0.33, 0.66, 0.33],
             ),
-            ("As7d2c7hTs", BoardPairing::OnePair, [0.33, 0.33, 1.0, 0.66]),
-            ("AsAd2c2hTs", BoardPairing::TwoPair, [0.66, 0.33, 1.0, 0.66]),
-            ("AsAdAc2hTs", BoardPairing::Trips, [0.33, 0.33, 1.25, 0.66]),
+            (
+                "As7d2c7hTs",
+                BoardPairing::OnePair,
+                [0.33, 0.33, 0.66, 0.33],
+            ),
+            (
+                "AsAd2c2hTs",
+                BoardPairing::TwoPair,
+                [0.33, 0.66, 0.66, 0.66],
+            ),
+            ("AsAdAc2hTs", BoardPairing::Trips, [0.33, 0.33, 0.66, 0.33]),
             (
                 "AsAdAc2h2s",
                 BoardPairing::FullHouse,
-                [0.66, 1.25, 1.25, 1.0],
+                [0.33, 1.25, 1.25, 1.25],
             ),
-            ("AsAdAcAhTs", BoardPairing::Quads, [0.33, 0.33, 0.33, 0.66]),
+            ("AsAdAcAhTs", BoardPairing::Quads, [0.33, 0.66, 0.33, 0.66]),
         ] {
             let ids: Vec<_> = board
                 .as_bytes()
@@ -315,10 +324,10 @@ mod tests {
             .iter()
             .filter(|r| r.street == Some(Street::River))
         {
-            assert_eq!(
-                row.sources,
-                ["data: M4 river 20 flops, 1824 spots, all sizes at 0.1%"]
-            );
+            assert!(row
+                .sources
+                .iter()
+                .any(|s| s.starts_with("M4 river joint re-measure")));
         }
         table
             .into_size_rule()
@@ -363,10 +372,10 @@ mod tests {
             serde_json::from_str(include_str!("../../../configs/sizing/srp-btn-vs-bb.json"))
                 .unwrap();
         t.validate().unwrap();
-        // Connected, unpaired, 8-high or lower: 66%. Everything else: 33%.
+        // Connected boards: 66%. Everything else: 33%.
         assert_eq!(fraction_on(&t, "7c6d5d", Street::Flop), 0.66);
         assert_eq!(fraction_on(&t, "8c5d4h", Street::Flop), 0.66);
-        assert_eq!(fraction_on(&t, "KcQdTh", Street::Flop), 0.33);
+        assert_eq!(fraction_on(&t, "KcQdTh", Street::Flop), 0.66);
         assert_eq!(fraction_on(&t, "7c7d6h", Street::Flop), 0.33);
         assert_eq!(fraction_on(&t, "AcKd4h", Street::Flop), 0.33);
         // Unknown turn and river histories retain the 66% fallback.
@@ -383,20 +392,21 @@ mod tests {
             serde_json::from_str(include_str!("../../../configs/sizing/srp-btn-vs-bb.json"))
                 .unwrap();
         let cases = [
-            ("Qh8d2c8s", RunoutCard::BoardPair, [0.33, 0.66, 0.66, 0.33]),
+            // Order: OOP after a flop bet-call, OOP after checks, IP after bet-call, IP after checks.
+            ("Qh8d2c8s", RunoutCard::BoardPair, [0.33, 1.25, 0.66, 0.33]),
             (
                 "Qh8h2c3h",
                 RunoutCard::FlushComplete,
-                [1.25, 0.33, 0.66, 0.66],
+                [1.25, 0.33, 0.66, 0.33],
             ),
-            ("Qh8d2cAs", RunoutCard::Overcard, [1.25, 0.33, 1.0, 0.33]),
+            ("Qh8d2cAs", RunoutCard::Overcard, [0.33, 1.25, 0.66, 0.33]),
             (
                 "Qh8d2cTc",
                 RunoutCard::StraightComplete,
-                [1.0, 0.33, 0.66, 0.66],
+                [1.25, 0.33, 0.66, 0.33],
             ),
-            ("Qh8d2c3h", RunoutCard::FlushDraw, [0.33, 0.33, 1.25, 0.33]),
-            ("Qh8h2c3s", RunoutCard::Blank, [0.33, 0.33, 1.25, 0.33]),
+            ("Qh8d2c3h", RunoutCard::FlushDraw, [0.33, 1.25, 0.66, 0.33]),
+            ("Qh8h2c3s", RunoutCard::Blank, [0.33, 1.25, 0.66, 0.33]),
         ];
         for (board, kind, expected) in cases {
             let ids: Vec<u8> = board
@@ -450,12 +460,24 @@ mod tests {
             assert!(row
                 .sources
                 .iter()
-                .any(|s| s == "data: M4 turn 20 flops, all sizes at 0.1%"));
+                .any(|s| s.starts_with("M4 turn joint re-measure")));
         }
         table
             .into_size_rule()
             .check_suit_invariance(20261018, 64)
             .unwrap();
+    }
+
+    #[test]
+    fn btn_vs_bb_table_uses_only_the_three_candidate_sizes() {
+        let table: RuleTable =
+            serde_json::from_str(include_str!("../../../configs/sizing/srp-btn-vs-bb.json"))
+                .unwrap();
+        assert_eq!(table.candidates, vec![0.33, 0.66, 1.25]);
+        for row in &table.rules {
+            assert!([0.33, 0.66, 1.25].contains(&row.fraction), "{row:?}");
+        }
+        assert!([0.33, 0.66, 1.25].contains(&table.default_fraction));
     }
 
     #[test]
