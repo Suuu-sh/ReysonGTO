@@ -537,7 +537,8 @@ impl PreflopSolver {
             approximation: (self.tree.config.players > 2).then(|| "independent class chance for >=3 active; exact pair blockers for active2; independent folded reach; three-way table when supplied, raw product-HU otherwise (not constant-sum); multiway realization is unlearned".into()),
             realization: self.realization.clone(),
             summary,
-            nodes: if summary_only { Vec::new() } else { nodes },
+            // Summaries keep only first-in and lone-opener response nodes (bounded).
+            nodes,
         }
     }
     fn collect_nodes(
@@ -634,9 +635,12 @@ impl PreflopSolver {
                 classes,
             });
             for (a, &child) in children.iter().enumerate() {
-                if summary_only
-                    && (actions[a] != Action::Fold || !history.iter().all(|a| a == "fold"))
-                {
+                // Summaries keep every node reached by at most one non-fold action:
+                // each first-in decision and every response to a lone opener
+                // (e.g. BB facing a BTN open after SB folds), which M6 needs as ranges.
+                let aggressive = history.iter().filter(|h| *h != "fold").count()
+                    + usize::from(actions[a] != Action::Fold);
+                if summary_only && aggressive > 1 {
                     continue;
                 }
                 let mut next = reach.clone();
